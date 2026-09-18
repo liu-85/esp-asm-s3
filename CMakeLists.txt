@@ -22,3 +22,6 @@ cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(esp-ams-s3)
+
+# 启用 ESP 组件注册表（mdns 在 v5.x 已从内置移到注册表）
+register_component_manager()
