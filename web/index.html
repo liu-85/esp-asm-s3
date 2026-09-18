@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2f6fed">
+<title>ESP-AMS-S3 控制台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- ===================== 侧栏 ===================== -->
+  <aside class="side" id="side">
+    <div class="brand">
+      <b>ESP-AMS-S3</b>
+      <em id="brand_net">连接中…</em>
+    </div>
+    <nav class="menu" id="menu"><!-- 由 app.js 生成 --></nav>
+  </aside>
+
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ===================== 主区 ===================== -->
+  <div class="main">
+
+    <div class="topbar">
+      <button class="menu-btn" id="menu_btn" aria-label="菜单">☰</button>
+      <div class="netitems">
+        <span class="netitem">
+          <span class="dot" id="dot_wifi"></span><span id="top_wifi">WiFi</span>
+        </span>
+        <span class="netitem">
+          <span class="dot" id="dot_mqtt"></span><span id="top_mqtt">MQTT</span>
+        </span>
+      </div>
+      <span class="alertbar" id="alertbar"></span>
+    </div>
+
+    <div class="content">
+
+      <!-- ============ 1. 运行状态 ============ -->
+      <section class="page" id="page_status">
+        <div class="card">
+          <h2>运行状态 <span class="sub" id="st_head"></span></h2>
+          <div class="kv"><span>IP 地址</span><b id="s_ip">-</b></div>
+          <div class="kv"><span>WiFi</span><b id="s_wifi">-</b></div>
+          <div class="kv"><span>信号强度</span><b id="s_rssi">-</b></div>
+          <div class="kv"><span>MAC 地址</span><b id="s_mac">-</b></div>
+          <div class="kv"><span>打印机 MQTT</span><b id="s_mqtt">-</b></div>
+          <div class="kv"><span>配置热点</span><b id="s_ap">-</b></div>
+          <div class="kv"><span>当前料盘</span><b id="s_cur">-</b></div>
+          <div class="kv"><span>固件版本</span><b id="s_ver">-</b></div>
+          <div class="row">
+            <button class="ghost" style="flex:1" id="btn_ap">打开配置热点</button>
+            <button class="ghost" id="btn_stop">紧急停止</button>
+          </div>
+          <div class="tip" id="status_tip"></div>
+        </div>
+
+        <div class="card">
+          <h2>换料动作 <span class="sub">AMS 状态机</span></h2>
+          <div class="kv"><span>当前状态</span><b id="a_state">-</b></div>
+          <div class="kv"><span>正在操作</span><b id="a_material">-</b></div>
+          <div class="kv"><span>换料统计</span><b id="a_exchange">-</b></div>
+          <div class="kv"><span>自吸统计</span><b id="a_autoload">-</b></div>
+          <div class="kv"><span>最近错误</span><b id="a_lasterr">-</b></div>
+          <div class="row">
+            <button class="ghost" id="btn_diag_reset" style="flex:1">重置统计</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>硬件状态 <span class="sub">共享电机 + 4 路电磁离合</span></h2>
+          <div id="hardware_info"></div>
+        </div>
+      </section>
+
+      <!-- ============ 2. 上电诊断 ============ -->
+      <section class="page" id="page_diag">
+        <div class="card">
+          <h2>上电诊断 <span class="sub">「接上负载就一直重启」查这里</span></h2>
+          <div class="kv"><span>本次复位原因</span><b id="d_cause">-</b></div>
+          <div class="kv"><span>原因说明</span><b id="d_cause_desc">-</b></div>
+          <div class="kv"><span>启动次数</span><b id="d_boots">-</b></div>
+          <div class="kv"><span>本次已运行</span><b id="d_uptime">-</b></div>
+          <div class="kv"><span>空闲内存</span><b id="d_mem">-</b></div>
+          <div class="kv"><span>历史最低</span><b id="d_mem_min">-</b></div>
+          <div class="kv"><span>运行分区</span><b id="d_part">-</b></div>
+          <div class="kv"><span>编译时间</span><b id="d_build">-</b></div>
+          <div id="d_pins"></div>
+          <div class="row">
+            <button class="ghost" style="flex:1" id="btn_bootclear">重置启动计数</button>
+          </div>
+          <div class="tip">
+            ESP-IDF 版有独立看门狗任务，软件卡死会被及时发现并复位，
+            不会再出现「界面停住但板子还活着」的情况。
+            若反复欠压复位，先换 USB 口 / 短线 / 外接 5V —— 离合吸合瞬间电流很大。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 3. WiFi ============ -->
+      <section class="page" id="page_wifi">
+        <div class="card">
+          <h2>WiFi 配置 <span class="sub" id="wifi_head"></span></h2>
+          <div class="wifi-list" id="wifi_list">
+            <div class="wifi-item dim">点「重新扫描」搜索附近 WiFi</div>
+          </div>
+          <div class="row">
+            <input id="wifi_ssid_manual" placeholder="WiFi 名称（列表里没有就填这里）" autocomplete="off">
+          </div>
+          <div class="row">
+            <input type="password" id="wifi_pwd" placeholder="WiFi 密码" autocomplete="off">
+          </div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_wifi_conn">连接这个 WiFi</button>
+            <button id="btn_wifi_scan">重新扫描</button>
+          </div>
+          <div class="tip warn">
+            ★ <b>单射频限制</b>：ESP32 只有一个射频单元，配置热点开着的时候连不上路由器
+            （实测会一直报"找不到该 WiFi"）。所以点「连接这个 WiFi」之后，设备会<b>先关掉配置热点</b>
+            再去连路由器 —— 手机会短暂掉线，这是正常的，连上路由器后重新打开本页即可。
+            连不上的话热点会自动开回来，可以继续重试。
+          </div>
+          <div class="tip">
+            列表里是开机时扫到的网络。<b>热点上有手机连着时不再重新扫描</b> —— 官方配网文档明确写了
+            全信道扫描会让驱动来不及发信标、把已连上的手机踢下线。找不到目标网络就直接在上面填名称。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>配置热点</h2>
+          <div class="kv"><span>热点名称</span><b id="w_apssid">-</b></div>
+          <div class="kv"><span>热点地址</span><b id="w_apip">-</b></div>
+          <div class="kv"><span>已连设备</span><b id="w_apcli">-</b></div>
+          <div class="tip">
+            默认热点 <code>AMS_WIFI</code> / 密码 <code>A12345678</code>。
+            手机连上后浏览器打开 <code>http://192.168.4.1</code> 就能进这个页面。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 4. 打印机 MQTT ============ -->
+      <section class="page" id="page_mqtt">
+        <div class="card">
+          <h2>打印机 MQTT 配置 <span class="sub" id="mqtt_head"></span></h2>
+          <div class="kv"><span>配置是否已保存</span><b id="mqtt_saved">-</b></div>
+          <div id="mqtt_form"><div class="tip">加载中…</div></div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_mqtt_save">保存并连接</button>
+          </div>
+          <div class="tip">
+            访问码在打印机上找：<b>设置 → 网络 → 访问码</b>（8 位）。
+            出于安全考虑，设备<b>不会把已保存的访问码回传到网页</b> ——
+            输入框留空就表示不修改。
+            <div class="hr"></div>
+            连接用的是 TLS（端口 8883）。拓竹用的是自签证书，官方做法就是跳过校验；
+            跳过的只是"证明对端真的是拓竹打印机"，<b>传输过程一样是加密的</b>。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 5. 通道设置 ============ -->
+      <section class="page" id="page_access">
+        <div class="card">
+          <h2>打印机通道设置 <span class="sub">点色块改颜色</span></h2>
+          <div id="access_info"></div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_access_save">保存通道与颜色</button>
+          </div>
+          <div class="tip">
+            「打印机通道」要和切片软件里的 AMS 槽位编号对上。
+            每个编号只能用一次 —— 两个料盘位指向同一个通道，换料时就不知道该动哪一路了。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 6. 硬件调试 ============ -->
+      <section class="page" id="page_hardware">
+        <div class="card">
+          <h2>硬件调试 <span class="sub">共享电机 + 4 路电磁离合</span></h2>
+          <div id="hardware_test"></div>
+          <div class="tip">
+            ★ 硬性约束：<b>任何时刻最多只有 1 路离合吸合</b>。
+            软件层有四重保障（吸合前强制全断开、吸合前回读复核、直接调用拦截、每周期体检），
+            所以「离合冲突次数」正常永远是 <b>0</b>。一旦不是 0，请断电检查驱动电路。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>手动点动</h2>
+          <div class="row">
+            <input type="number" id="jog_seconds" min="0.2" max="60" step="0.5" value="1">
+            <span style="align-self:center" class="dim">秒</span>
+            <button class="primary" style="flex:1" id="btn_jog_save">保存响应时间</button>
+          </div>
+          <div class="tip">
+            这是 4 个通道<b>统一</b>的「进退响应时间」，只作用于手动点动，<b>不影响自动换料</b>。
+            填超范围会被自动夹到 0.2 ~ 60 秒。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 7. 微动与自吸（本次新增） ============ -->
+      <section class="page" id="page_sensors">
+        <div class="card">
+          <h2>微动开关 <span class="sub">每路 3 个：停止送料 / 开始送料 / 自吸</span></h2>
+          <div class="kv"><span>挤出机到位</span><b id="sg_extruder">-</b></div>
+          <div class="kv"><span>信号来源</span><b id="sg_src">-</b></div>
+          <div id="sensor_list"></div>
+          <div class="row">
+            <button class="ghost" style="flex:1" id="btn_src_toggle">切换到位信号来源</button>
+          </div>
+          <div class="tip">
+            三只微动各自的作用：
+            <div class="hr"></div>
+            <b>停止送料</b>：触发 → 立刻停电机。料到位 / 料尽 / 机构顶到头都会触发它。<br>
+            <b>开始送料</b>：触发 → 按常规速度送料，直到停止送料微动触发或超时。<br>
+            <b>自吸</b>：触发 → <b>全自动上料</b>：自动送料 → 等挤出机到位 → 蠕动送料收尾。
+            把料插进料盘位、碰到这只微动就行，不用再按任何按钮。
+            <div class="hr"></div>
+            <span class="dim">关掉某一路的微动后，这一路退回<b>降级模式</b>：
+            按时间推进送料（时长由固件里的 AMS_NO_LIMIT_LOAD_MS / RETRACT_MS 决定），
+            需要按你的机构实测调整。</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>自吸上料 <span class="sub">手动触发一次</span></h2>
+          <div id="autoload_list"></div>
+          <div class="tip">
+            全流程：<b>送料</b> → 等<b>挤出机到位</b> → <b>蠕动送料 3 次</b>（慢速短脉冲）。
+            蠕动那几下是必要的：正常送料最后往往只是把料虚顶在挤出机入口，
+            而进料齿轮需要料头稍微进去一点才能咬住。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>蠕动送料参数 <span class="sub">自吸收尾用</span></h2>
+          <div class="row">
+            <label style="flex:1 1 120px;font-size:13px" class="dim">次数
+              <input type="number" id="creep_times" min="1" max="10" step="1">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">单次时长(ms)
+              <input type="number" id="creep_pulse" min="100" max="3000" step="50">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">速度(%)
+              <input type="number" id="creep_speed" min="5" max="100" step="5">
+            </label>
+          </div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_creep_save">保存蠕动参数</button>
+          </div>
+          <div class="tip">
+            速度越低、脉冲越短 → 越"温柔"，但也越可能没把料咬住；
+            次数越多 → 越可靠，但每多一次就多一次机械磨损。
+            默认 <b>3 次 × 400ms @ 45%</b>，建议先用默认值，不行再调。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 8. 系统升级 ============ -->
+      <section class="page" id="page_ota">
+        <div class="card">
+          <h2>系统升级 <span class="sub">网页上传整机固件，不用插 USB</span></h2>
+          <div class="kv"><span>当前运行分区</span><b id="o_part">-</b></div>
+          <div class="kv"><span>当前版本</span><b id="o_ver">-</b></div>
+          <div class="tip ok">
+            ★ 这版是<b>真正的双分区 OTA</b>：新固件写进备用分区，校验通过才切换，
+            写一半断电也不影响启动；新固件第一次启动如果崩溃，引导程序会<b>自动回滚</b>。
+            MicroPython 那版因为只有一个应用分区，只能升级「应用与界面」，
+            整机固件必须插 USB。
+          </div>
+          <div class="row">
+            <input type="file" id="ota_file" accept=".bin">
+          </div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_ota_upload">上传并升级</button>
+          </div>
+          <div class="progress" id="ota_prog" style="display:none"><i></i></div>
+          <div id="ota_box"></div>
+          <div class="tip warn">
+            要传的是 <code>idf.py build</code> 出来的 <code>esp-ams-s3.bin</code>
+            （或 <code>build/esp-ams-s3.bin</code>）。
+            传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，
+            不是就直接中止，分区一个字节都不动。
+          </div>
+        </div>
+      </section>
+
+    </div><!-- /content -->
+
+    <!-- ===================== 日志 ===================== -->
+    <div class="logbox" id="logbox">
+      <div class="head">
+        <b>设备日志</b>
+        <span class="sp"></span>
+        <span class="dim" id="log_mem"></span>
+        <button id="btn_log_clear">清屏</button>
+        <button id="btn_log_toggle">折叠</button>
+      </div>
+      <pre class="logpre" id="log_lines">等待日志…</pre>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /wrap -->
+
+<div class="toast" id="toast"></div>
+<div class="overlay" id="overlay"><div class="loader"></div></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

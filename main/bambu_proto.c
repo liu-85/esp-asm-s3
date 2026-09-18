@@ -1,0 +1,537 @@
+/**
+ * bambu_proto.c —— 拓竹 MQTT 报文的解析与命令构造
+ * ============================================================================
+ *
+ * 用 ESP-IDF 自带的 cJSON（组件名 json）解析。相比 MicroPython 版的 ujson：
+ *   · 不用把整条报文先 decode 成 str 再 load —— cJSON 直接吃 char*，
+ *     少一次内存拷贝（报文里有中文时那次 decode 尤其亏）
+ *   · 解析失败时 cJSON_Parse 返回 NULL，不会抛异常打断任务
+ *
+ * ★ 内存约定：cJSON_Parse 会 malloc 一整棵树，用完必须 cJSON_Delete。
+ *   bambu_proto_parse() 内部保证这点 —— 它只把需要的字段**拷贝**到调用方
+ *   的结构体里（stage_text 例外，那是静态表里的常量指针），
+ *   函数返回后调用方持有的数据与 JSON 树再无关系。
+ */
+
+#include "bambu_proto.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "cJSON.h"
+
+/* ==========================================================================
+ * 一、阶段码表（对应 bambu_const.CURRENT_STAGE_IDS）
+ * ==========================================================================
+ * 打印机把自己正在做的事用一个整数 stg_cur 报出来，这张表把它翻成中文。
+ * 表里没有的码会显示成 "阶段码 N"，所以打印机固件升级加了新阶段也不会
+ * 让界面变空白。
+ */
+typedef struct {
+    int         id;
+    const char *text;
+} stage_entry_t;
+
+static const stage_entry_t s_stages[] = {
+    {0,   "打印中"},
+    {1,   "自动床调平"},
+    {2,   "热床预热"},
+    {3,   "XY 机械模式扫描"},
+    {4,   "更换打印材料"},
+    {5,   "M400 暂停"},
+    {6,   "暂停 - 打印材料耗尽"},
+    {7,   "加热挤出头"},
+    {8,   "校准挤出"},
+    {9,   "扫描打印床表面"},
+    {10,  "检查首层"},
+    {11,  "识别打印板类型"},
+    {12,  "校准微型激光雷达"},
+    {13,  "归位工具头"},
+    {14,  "清洁喷嘴尖端"},
+    {15,  "检查挤出头温度"},
+    {16,  "用户暂停"},
+    {17,  "暂停 - 前盖掉落"},
+    {18,  "校准微型激光雷达"},
+    {19,  "校准挤出流量"},
+    {20,  "暂停 - 喷嘴温度故障"},
+    {21,  "暂停 - 热床温度故障"},
+    {22,  "卸载打印材料"},
+    {23,  "暂停 - 跳过步骤"},
+    {24,  "载入打印材料"},
+    {25,  "校准电机噪音"},
+    {26,  "暂停 - AMS 丢失"},
+    {27,  "暂停 - 风扇转速过低"},
+    {28,  "暂停 - 腔温控制错误"},
+    {29,  "冷却腔体"},
+    {30,  "用户 G 代码暂停"},
+    {31,  "电机噪音展示"},
+    {32,  "暂停 - 检测到喷嘴被料覆盖"},
+    {33,  "暂停 - 切刀错误"},
+    {34,  "暂停 - 首层错误"},
+    {35,  "暂停 - 喷嘴堵塞"},
+    {-1,  "空闲"},
+    {255, "空闲"},
+};
+
+/* ==========================================================================
+ * 二、HMS 错误表（对应 bambu_const.HMS_ERRORS_ENGLISH 的中文部分）
+ * ==========================================================================
+ * HMS = Health Management System，拓竹自己的故障码体系。报文里给的是两个
+ * 整数 attr / code，拼成 "0300_4000_0002_0001" 这样的字符串，再查这张表。
+ *
+ * 表里没有的码不是错误 —— 只是我们还没收录，界面会显示"未知错误"并给出码，
+ * 用户可以直接拿去搜。想补就直接往下面加一行。
+ */
+typedef struct {
+    const char *code;
+    const char *text;
+} hms_entry_t;
+
+static const hms_entry_t s_hms_table[] = {
+    {"0300_1000_0002_0001", "X 轴的第一阶机械谐振模式较低。"},
+    {"0300_1000_0002_0002", "X 轴的第一阶机械谐振模式差异较大。"},
+    {"0300_0F00_0001_0001", "加速度计数据不可用。"},
+    {"0300_0D00_0001_000B", "Z 轴电机向上移动时似乎卡住了。"},
+    {"0300_0D00_0001_0002", "热床归位失败：环境振动过大。"},
+    {"0300_0D00_0001_0003", "打印板未正确放置。"},
+    {"0300_0D00_0002_0001", "热床归位异常：可能有凸起。"},
+    {"0300_0A00_0001_0005", "力传感器 1/2/3 的静态电压不为 0。"},
+    {"0300_0A00_0001_0004", "测试力传感器时检测到外部干扰。"},
+    {"0300_0A00_0001_0003", "热床力传感器 1/2/3 的灵敏度过低。"},
+    {"0300_0A00_0001_0002", "热床力传感器 1/2/3 的灵敏度较低。"},
+    {"0300_0A00_0001_0001", "热床力传感器 1/2/3 的灵敏度过高。"},
+    {"0300_0400_0002_0001", "部件冷却风扇转速过慢或已停止。"},
+    {"0300_0300_0002_0002", "喷嘴风扇转速较慢。"},
+    {"0300_0300_0001_0001", "喷嘴风扇转速过慢或已停止。"},
+    {"0300_0600_0001_0001", "电机 A 开路：可能连接松动，或电机已损坏。"},
+    {"0300_0600_0001_0002", "电机 A 短路：可能已损坏。"},
+    {"0300_0600_0001_0003", "电机 A 电阻异常：可能已损坏。"},
+    {"0300_0100_0001_0001", "热床温度异常：加热器可能短路。"},
+    {"0300_0100_0001_0002", "热床温度异常：加热器可能断路，或热敏开关断开。"},
+    {"0300_0100_0001_0003", "热床温度异常：加热器超温。"},
+    {"0300_0100_0001_0006", "热床温度异常：传感器可能短路。"},
+    {"0300_0100_0001_0007", "热床温度异常：传感器可能断路。"},
+    {"0300_1300_0001_0001", "电机 A 的电流传感器异常：可能是硬件采样电路故障。"},
+    {"0300_4000_0002_0001", "串口数据传输异常：软件系统可能存在故障。"},
+    {"0300_4100_0001_0001", "系统电压不稳定，已触发断电保护。"},
+    {"0300_0200_0001_0001", "喷嘴温度异常：加热器可能短路。"},
+    {"0300_0200_0001_0002", "喷嘴温度异常：加热器可能断路。"},
+    {"0300_0200_0001_0003", "喷嘴温度异常：加热器超温。"},
+    {"0300_0200_0001_0006", "喷嘴温度异常：传感器可能短路。"},
+    {"0300_0200_0001_0007", "喷嘴温度异常：传感器可能断路。"},
+    {"0300_1200_0002_0001", "工具头前盖已脱落。"},
+    {"0C00_0100_0001_0001", "微型激光雷达摄像头离线。"},
+    {"0C00_0100_0002_0002", "微型激光雷达摄像头故障。"},
+    {"0C00_0100_0001_0003", "微型激光雷达与 MCU 同步异常。"},
+    {"0C00_0100_0001_0004", "微型激光雷达镜头似乎脏了。"},
+    {"0C00_0100_0001_0005", "微型激光雷达 OTP 参数异常。"},
+    {"0C00_0100_0002_0006", "微型激光雷达外参参数异常。"},
+    {"0C00_0100_0002_0007", "微型激光雷达激光参数漂移。"},
+    {"0C00_0100_0002_0008", "无法从腔体摄像头获取图像。"},
+    {"0C00_0100_0001_0009", "腔体摄像头脏了。"},
+    {"0C00_0100_0001_000A", "微型激光雷达的 LED 可能损坏。"},
+    {"0C00_0100_0001_000B", "微型激光雷达校准失败。"},
+    {"0C00_0200_0001_0001", "水平激光未点亮。"},
+    {"0C00_0200_0002_0002", "水平激光过粗。"},
+    {"0C00_0200_0002_0003", "水平激光亮度不足。"},
+    {"0C00_0200_0002_0004", "喷嘴高度似乎太低。"},
+    {"0C00_0200_0001_0005", "检测到新的微型激光雷达。"},
+    {"0C00_0200_0002_0006", "喷嘴高度似乎太高。"},
+    {"0C00_0300_0002_0001", "曝光计量失败。"},
+    {"0C00_0300_0002_0002", "激光雷达数据异常，首层检测已终止。"},
+    {"0C00_0300_0002_0004", "当前打印不支持首层检测。"},
+    {"0C00_0300_0002_0005", "首层检测超时。"},
+    {"0C00_0300_0003_0006", "排出的料可能堆积在一起。"},
+    {"0C00_0300_0003_0007", "可能存在首层缺陷。"},
+    {"0C00_0300_0003_0008", "可能检测到「意面」缺陷（打印乱丝）。"},
+    {"0C00_0300_0001_0009", "首层检测模块异常重启。"},
+    {"0C00_0300_0003_000B", "正在检测首层。"},
+    {"0C00_0300_0002_000C", "未检测到打印板定位标记。"},
+    {"0500_0100_0002_0001", "媒体管道故障。"},
+    {"0500_0100_0002_0002", "USB 摄像头未连接。"},
+    {"0500_0100_0002_0003", "USB 摄像头故障。"},
+    {"0500_0100_0003_0004", "SD 卡空间不足。"},
+    {"0500_0100_0003_0005", "SD 卡错误。"},
+    {"0500_0100_0003_0006", "SD 卡未格式化。"},
+    {"0500_0200_0002_0001", "无法连接互联网，请检查网络。"},
+    {"0500_0200_0002_0002", "设备登录失败。"},
+    {"0500_0200_0002_0004", "未经授权的用户。"},
+    {"0500_0200_0002_0006", "实时查看服务故障。"},
+    {"0500_0300_0001_0001", "MC 模块故障，请重启设备。"},
+    {"0500_0300_0001_0002", "工具头故障，请重启设备。"},
+    {"0500_0300_0001_0003", "AMS 模块故障，请重启设备。"},
+    {"0500_0300_0001_000A", "系统状态异常，请恢复出厂设置。"},
+    {"0500_0300_0001_000B", "屏幕故障。"},
+    {"0500_0300_0002_000C", "无线硬件错误，请重启 WiFi 或设备。"},
+    {"0500_0400_0001_0001", "下载打印任务失败，请检查网络。"},
+    {"0500_0400_0001_0002", "上报打印状态失败，请检查网络。"},
+    {"0500_0400_0001_0003", "打印文件内容无法读取，请重新发送。"},
+    {"0500_0400_0001_0004", "打印文件未授权。"},
+    {"0500_0400_0001_0006", "无法恢复之前的打印。"},
+    {"0500_0400_0002_0007", "热床温度超过耗材玻璃化温度，可能导致喷嘴堵塞。"},
+    {"0700_4000_0002_0001", "耗材缓冲信号丢失：线缆或位置传感器可能故障。"},
+    {"0700_4000_0002_0002", "耗材缓冲位置信号错误：位置传感器可能故障。"},
+    {"0700_4000_0002_0003", "AMS Hub 通信异常：线缆可能接触不良。"},
+    {"0700_4000_0002_0004", "耗材缓冲信号异常：弹簧可能卡住。"},
+    {"0700_4500_0002_0001", "切料传感器故障：可能断开或损坏。"},
+    {"0700_4500_0002_0002", "切料距离过大：XY 电机可能失步。"},
+    {"0700_4500_0002_0003", "切料手柄未释放：手柄或刀片可能卡住。"},
+    {"0700_5100_0003_0001", "AMS 已被禁用，请从卷轴支架上料。"},
+    {"12FF_2000_0002_0001", "外挂料已用完，请装载新料。"},
+    {"12FF_2000_0002_0002", "外挂料缺失，请装载新料。"},
+    {"12FF_2000_0002_0004", "请从挤出机上把卷轴支架的料拉出来。"},
+};
+
+/* ==========================================================================
+ * 三、小工具
+ * ========================================================================== */
+
+/** 取整数，缺字段返回 def */
+static int json_int(const cJSON *obj, const char *key, int def)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(item)) {
+        return (int)item->valuedouble;
+    }
+    if (cJSON_IsString(item) && item->valuestring[0]) {
+        return atoi(item->valuestring);
+    }
+    return def;
+}
+
+/** 取浮点，缺字段返回 def */
+static float json_float(const cJSON *obj, const char *key, float def)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(item)) {
+        return (float)item->valuedouble;
+    }
+    return def;
+}
+
+/** 取字符串，缺字段返回 NULL */
+static const char *json_str(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsString(item)) {
+        return item->valuestring;
+    }
+    return NULL;
+}
+
+const char *bambu_stage_text(int stg_cur)
+{
+    for (size_t i = 0; i < sizeof(s_stages) / sizeof(s_stages[0]); i++) {
+        if (s_stages[i].id == stg_cur) {
+            return s_stages[i].text;
+        }
+    }
+    return "未知阶段";
+}
+
+const char *bambu_hms_text(const char *code)
+{
+    if (!code) {
+        return "未知错误";
+    }
+    for (size_t i = 0; i < sizeof(s_hms_table) / sizeof(s_hms_table[0]); i++) {
+        if (strcmp(s_hms_table[i].code, code) == 0) {
+            return s_hms_table[i].text;
+        }
+    }
+    return "未知错误（可在网上按码搜索）";
+}
+
+int bambu_hms_format(int attr, int code, char *buf, size_t buflen)
+{
+    if (!buf || buflen == 0) {
+        return -1;
+    }
+    /* 拓竹的约定：attr 和 code 各是 32 位，各自拆成两个 16 位段，
+     * 拼成 4 段十六进制，用下划线连接 */
+    return snprintf(buf, buflen, "%04X_%04X_%04X_%04X",
+                    (unsigned)((attr >> 16) & 0xFFFF),
+                    (unsigned)(attr & 0xFFFF),
+                    (unsigned)((code >> 16) & 0xFFFF),
+                    (unsigned)(code & 0xFFFF));
+}
+
+/* ==========================================================================
+ * 四、主解析
+ * ========================================================================== */
+
+/**
+ * 挤出机到位提示：在 print 段里找几个候选字段。
+ *
+ * ⚠️ 诚实说明：这个字段名**没有权威文档**，不同打印机/固件上报的名字可能不同。
+ *    这里按可能性从高到低试几个，找到了就用；一个都没找到就返回 -1，
+ *    让上层知道"报文里没有这个信息"，转而去用 GPIO 那根线。
+ *
+ *    如果你确认了你的机器用哪个字段名，把它加到下面的数组第一项即可。
+ */
+static const char *const s_extruder_keys[] = {
+    "s_filament",             /* 常见的"耗材在挤出机"标志 */
+    "filament_in_extruder",
+    "extruder_filament",
+    "s_extruder_filament",
+};
+
+static int probe_extruder_inplace(const cJSON *print)
+{
+    for (size_t i = 0;
+         i < sizeof(s_extruder_keys) / sizeof(s_extruder_keys[0]); i++) {
+        const cJSON *item =
+            cJSON_GetObjectItemCaseSensitive(print, s_extruder_keys[i]);
+        if (cJSON_IsNumber(item)) {
+            return item->valueint ? 1 : 0;
+        }
+        if (cJSON_IsBool(item)) {
+            return cJSON_IsTrue(item) ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
+esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
+{
+    if (!json || !out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+    out->filament_next = -1;
+    out->extruder_inplace_hint = -1;
+    out->stage_text = "未知";
+
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (root == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const cJSON *print = cJSON_GetObjectItemCaseSensitive(root, "print");
+    if (!cJSON_IsObject(print)) {
+        /* 心跳 / 空报文，属于正常现象，不是错误 */
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* ---- 打印机状态 ---- */
+    const char *gcode_state = json_str(print, "gcode_state");
+    if (gcode_state) {
+        if (strcmp(gcode_state, "IDLE") == 0) {
+            out->gcode_state = 0;
+        } else if (strcmp(gcode_state, "PREPARE") == 0) {
+            out->gcode_state = 1;
+        } else if (strcmp(gcode_state, "RUNNING") == 0) {
+            out->gcode_state = 2;
+            out->is_printing = true;
+        } else if (strcmp(gcode_state, "PAUSE") == 0) {
+            out->gcode_state = 3;
+            out->is_paused = true;
+        } else if (strcmp(gcode_state, "FINISH") == 0) {
+            out->gcode_state = 4;
+        } else if (strcmp(gcode_state, "FAILED") == 0) {
+            out->gcode_state = 5;
+        }
+    }
+
+    out->mc_percent         = json_int(print, "mc_percent", 0);
+    out->mc_remaining_time  = json_int(print, "mc_remaining_time", 0);
+    out->print_error        = json_int(print, "print_error", 0);
+    out->stg_cur            = json_int(print, "stg_cur", 255);
+
+    /* 空闲时打印机会把 stg_cur 报 0，但那和"正在打印中"的 0 冲突，
+     * 所以按 print_type 校正一下 —— 这是上游逻辑，照搬 */
+    const char *print_type = json_str(print, "print_type");
+    if (print_type && strcmp(print_type, "idle") == 0 &&
+        out->stg_cur == 0) {
+        out->stg_cur = 255;
+    }
+    out->stage_text = bambu_stage_text(out->stg_cur);
+
+    /* ---- 温度 ---- */
+    out->nozzle_temper = json_float(print, "nozzle_temper", 0);
+    out->nozzle_target = json_float(print, "nozzle_target_temper", 0);
+    out->bed_temper    = json_float(print, "bed_temper", 0);
+    out->bed_target    = json_float(print, "bed_target_temper", 0);
+
+    /* ---- ★ 换料判定（本项目最核心的一条）---- */
+    if (out->is_paused && out->mc_percent == 101) {
+        out->change_needed = true;
+        /* 目标通道号：G-code 宏里 M73 P101 R[next_extruder] 的 R 参数。
+         * 旧版直接拿 mc_remaining_time（剩余打印时间，分钟），那是错的，
+         * 时间值 0~几十，只有 0/1/2/3 碰巧对得上通道号，4 通道自动换料
+         * 几乎永远不触发。改成按候选字段探测： */
+        static const char *const s_filament_keys[] = {
+            "filament_next",            /* 部分固件直接回传 M73 的 R 参数 */
+            "mc_next_tray",
+            "mc_tray_idx",
+            "next_tray",
+        };
+        for (size_t i = 0;
+             i < sizeof(s_filament_keys) / sizeof(s_filament_keys[0]); i++) {
+            const cJSON *item =
+                cJSON_GetObjectItemCaseSensitive(print, s_filament_keys[i]);
+            if (cJSON_IsNumber(item)) {
+                out->filament_next = (int)item->valueint;
+                break;
+            }
+        }
+        /* 一个都没找到，退回 mc_remaining_time 兜底（值大概率不在 0~3，
+         * 上层 ams_controller 会因越界拒绝并记错误日志，不会静默出错） */
+        if (out->filament_next < 0) {
+            out->filament_next = out->mc_remaining_time;
+        }
+
+        /* ---- 目标颜色：自动匹配用 ----
+         * M73 P101 R[next_extruder] 只传了通道号，没传颜色。
+         * 切片器的 filament_type[next_extruder] 在 G-code 里是字符串
+         * （如 "PLA_R0G100B0"），打印机会把它上报到 ams 段里。
+         * 我们试着从 ams.filament_color 或 ams.color 字段里抠出
+         * 目标颜色，供 ams_controller 的自动匹配算法使用。
+         * 抠不出来就保持 -1，上层退回按通道号换料。 */
+        out->target_color = -1;
+        const cJSON *ams_obj =
+            cJSON_GetObjectItemCaseSensitive(root, "ams");
+        if (cJSON_IsObject(ams_obj)) {
+            const cJSON *fcolor =
+                cJSON_GetObjectItemCaseSensitive(ams_obj, "filament_color");
+            if (cJSON_IsString(fcolor) && fcolor->valuestring) {
+                int r = -1, g = -1, b = -1;
+                if (sscanf(fcolor->valuestring,
+                            "%*[Aa]%2d%2d%2d", &r, &g, &b) == 3 &&
+                    r >= 0 && r <= 255 &&
+                    g >= 0 && g <= 255 &&
+                    b >= 0 && b <= 255) {
+                    out->target_color = (r << 16) | (g << 8) | b;
+                }
+            }
+            if (out->target_color < 0) {
+                const cJSON *color =
+                    cJSON_GetObjectItemCaseSensitive(ams_obj, "color");
+                if (cJSON_IsString(color) && color->valuestring) {
+                    int r = -1, g = -1, b = -1;
+                    if (sscanf(color->valuestring,
+                                "%*[Aa]%2d%2d%2d", &r, &g, &b) == 3 &&
+                        r >= 0 && r <= 255 &&
+                        g >= 0 && g <= 255 &&
+                        b >= 0 && b <= 255) {
+                        out->target_color = (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+        }
+    }
+
+    /* ---- HMS 错误 ---- */
+    const cJSON *hms = cJSON_GetObjectItemCaseSensitive(print, "hms");
+    if (cJSON_IsArray(hms)) {
+        const cJSON *one = NULL;
+        cJSON_ArrayForEach(one, hms) {
+            if (out->hms_count >= BAMBU_HMS_MAX) {
+                break;
+            }
+            int attr = json_int(one, "attr", 0);
+            int code = json_int(one, "code", 0);
+            if (attr <= 0 || code <= 0) {
+                continue;
+            }
+            bambu_hms_t *slot = &out->hms[out->hms_count];
+            bambu_hms_format(attr, code, slot->code, sizeof(slot->code));
+            strncpy(slot->text, bambu_hms_text(slot->code),
+                    sizeof(slot->text) - 1);
+            out->hms_count++;
+        }
+    }
+
+    /* ---- 挤出机到位提示（见函数上方的说明）---- */
+    out->extruder_inplace_hint = probe_extruder_inplace(print);
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/* ==========================================================================
+ * 五、命令构造（对应 bambu_commands.py）
+ * ========================================================================== */
+
+/**
+ * 这些 JSON 里的 sequence_id 全都写死成 "1111111"，和 Python 版一致。
+ * 打印机并不校验它是否递增 —— 上游项目跑了很久也没问题。
+ * 如果你想改成递增计数，只要保证同一分钟内不重复即可。
+ */
+#define BAMBU_SEQ_ID "1111111"
+
+static int cmd_write(char *buf, size_t buflen, const char *text)
+{
+    if (!buf || buflen == 0) {
+        return -1;
+    }
+    size_t n = strlen(text);
+    if (n + 1 > buflen) {
+        return -1;
+    }
+    memcpy(buf, text, n + 1);
+    return (int)n;
+}
+
+int bambu_cmd_resume(char *buf, size_t buflen)
+{
+    return cmd_write(buf, buflen,
+        "{\"print\":{\"command\":\"resume\",\"sequence_id\":\"" BAMBU_SEQ_ID "\"},"
+        "\"user_id\":\"1\"}");
+}
+
+int bambu_cmd_pushall(char *buf, size_t buflen)
+{
+    return cmd_write(buf, buflen,
+        "{\"pushing\":{\"sequence_id\":\"" BAMBU_SEQ_ID "\","
+        "\"command\":\"pushall\"}}");
+}
+
+int bambu_cmd_push_start(char *buf, size_t buflen)
+{
+    return cmd_write(buf, buflen,
+        "{\"pushing\":{\"sequence_id\":\"" BAMBU_SEQ_ID "\","
+        "\"command\":\"start\"}}");
+}
+
+int bambu_cmd_gcode(char *buf, size_t buflen, const char *gcode)
+{
+    if (!buf || !gcode) {
+        return -1;
+    }
+    /*
+     * G-code 里带引号、反斜杠、换行会把 JSON 搞坏（换料宏里常有这些字符）。
+     * 这里做最小转义：只处理 "  \  和 \n 三个字符，其余原样。
+     * 注意："\n G1 E-50 F200;" 这类字符串里带真实换行，旧版没转义会导致
+     * JSON 非法，打印机直接丢弃。
+     */
+    char escaped[512];
+    size_t e = 0;
+    for (const char *p = gcode; *p && e + 2 < sizeof(escaped); p++) {
+        switch (*p) {
+        case '"':
+        case '\\':
+            escaped[e++] = '\\';
+            escaped[e++] = *p;
+            break;
+        case '\n':
+            escaped[e++] = '\\';
+            escaped[e++] = 'n';
+            break;
+        default:
+            escaped[e++] = *p;
+            break;
+        }
+    }
+    escaped[e] = '\0';
+
+    int n = snprintf(buf, buflen,
+        "{\"print\":{\"sequence_id\":\"" BAMBU_SEQ_ID "\","
+        "\"command\":\"gcode_line\",\"param\":\"%s\"}}", escaped);
+    if (n < 0 || (size_t)n >= buflen) {
+        return -1;
+    }
+    return n;
+}
