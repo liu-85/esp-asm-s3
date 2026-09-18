@@ -37,8 +37,8 @@ static SemaphoreHandle_t s_lock;
  * 默认值
  * ========================================================================== */
 
-/** 出厂默认配色：四个通道一眼能区分 */
-static const uint32_t DEFAULT_COLORS[BOARD_CHANNEL_COUNT] = {
+/** 出厂默认配色（按 4 通道排，不足时按 i < 4 取，多余的留 0） */
+static const uint32_t DEFAULT_COLORS[4] = {
     0xE53935u,  /* 红 */
     0x43A047u,  /* 绿 */
     0x1E88E5u,  /* 蓝 */
@@ -68,7 +68,7 @@ static void config_load_defaults(ams_config_t *c)
     /* ---- 通道映射：物理料盘位 1/2/3/4 对应打印机通道 1/2/3/4 ---- */
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         c->access_list[i] = (uint8_t)(i + 1);
-        c->color_list[i]  = DEFAULT_COLORS[i];
+        c->color_list[i]  = (i < 4) ? DEFAULT_COLORS[i] : 0;
     }
     c->filament_current = 0;    /* 0 = 未知 */
 

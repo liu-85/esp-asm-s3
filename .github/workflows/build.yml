@@ -1,8 +1,10 @@
 # ===========================================================================
-# GitHub Actions —— ESP-AMS-S3 自动编译 + 发布
+# GitHub Actions —— ESP-AMS-S3 自动编译 + 发布（双目标 matrix）
 # ===========================================================================
-# 推送到 main / 打 tag 时自动编译 esp32s3 固件，发布到 GitHub Releases。
-# 不依赖任何第三方 action，全部走官方安装器 + idf.py。
+# 推送到 main / 打 tag 时自动编译两个目标：
+#   · esp32s3 —— 4 通道完整方案（默认）
+#   · esp32c3 —— 2 通道降级方案
+# 打 tag 时把两个目标的固件都发到 GitHub Releases。
 
 name: Build & Release
 
@@ -16,6 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ esp32s3, esp32c3 ]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,11 +29,19 @@ jobs:
       - name: Install ESP-IDF and build firmware
         run: |
           set -e
+          TARGET="${{ matrix.target }}"
           # ---- 安装 ESP-IDF v5.3.2 ----
           cd $HOME
-          git clone --depth 1 -b v5.3.2 https://github.com/espressif/esp-idf.git esp-idf
-          cd esp-idf
-          ./install.sh esp32s3 > /tmp/idf-install.log 2>&1 || { echo "--- install log ---"; tail -50 /tmp/idf-install.log; exit 1; }
+          if [ ! -d esp-idf ]; then
+            git clone --depth 1 -b v5.3.2 https://github.com/espressif/esp-idf.git esp-idf
+            cd esp-idf
+            ./install.sh "$TARGET" > /tmp/idf-install.log 2>&1 || {
+              echo "--- install log ---"
+              tail -50 /tmp/idf-install.log
+              exit 1
+            }
+            cd $HOME
+          fi
 
           # ---- 激活环境（source 必须在同一 shell 里）----
           source $HOME/esp-idf/export.sh
@@ -45,20 +59,33 @@ jobs:
             rm -rf /tmp/esp-protocols
           fi
 
-          idf.py set-target esp32s3
+          # ---- 目标专属 sdkconfig（C3 走 sdkconfig.defaults.esp32c3）----
+          idf.py set-target ${TARGET}
           idf.py build
 
-          # ---- 合并为单文件刷写（bootloader + 分区表 + 应用）----
+          # ---- 合并为单文件刷写 ----
           idf.py merge-bin
 
           # ---- 收集产物：firmware + bootloader + partition + merged ----
           mkdir -p dist
-          cp -v build/esp-ams-s3.bin dist/firmware.bin
-          cp -v build/bootloader/bootloader.bin dist/bootloader.bin 2>/dev/null || echo "WARN: bootloader.bin not found"
-          cp -v build/partition_table/partition-table.bin dist/partition-table.bin 2>/dev/null || echo "WARN: partition-table.bin not found"
+          cp -v build/${TARGET}-ams.bin dist/firmware_${TARGET}.bin 2>/dev/null || \
+            cp -v build/esp-ams-s3.bin dist/firmware_${TARGET}.bin
+          cp -v build/bootloader/bootloader.bin dist/bootloader_${TARGET}.bin 2>/dev/null || \
+            echo "WARN: bootloader.bin not found"
+          # C3 用 partitions_c3.csv，S3 用 partitions.csv
+          if [ "${TARGET}" = "esp32c3" ]; then
+            cp -v build/partition_table/partition-table.bin dist/partition_table_${TARGET}.bin 2>/dev/null || \
+              echo "WARN: C3 partition-table.bin not found"
+          else
+            cp -v build/partition_table/partition-table.bin dist/partition_table_${TARGET}.bin 2>/dev/null || \
+              echo "WARN: partition-table.bin not found"
+          fi
           # merge-bin 输出文件（可能叫 *-merged.bin 或 *-full.bin）
-          for f in build/*-merged.bin build/*-full.bin; do
-            [ -f "$f" ] && cp -v "$f" dist/ && echo "Found merged binary: $f"
+          for f in build/*-${TARGET}-merged.bin build/*-merged.bin build/*-full.bin; do
+            if [ -f "$f" ]; then
+              cp -v "$f" dist/${TARGET}_merged.bin
+              echo "Found merged binary for ${TARGET}: $f"
+            fi
           done
           ls -lh build/*.bin 2>/dev/null
           {
@@ -66,13 +93,14 @@ jobs:
             echo "branch: $(git rev-parse --abbrev-ref HEAD)"
             echo "date:   $(date -u +'%Y-%m-%d %H:%M UTC')"
             echo "idf:    v5.3.2"
-          } > dist/version.txt
-          echo "--- artifacts ---" && ls -lh dist/
+            echo "target: ${TARGET}"
+          } > dist/version_${TARGET}.txt
+          echo "--- artifacts for ${TARGET} ---" && ls -lh dist/
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: esp-ams-s3-build
+          name: esp-ams-${{ matrix.target }}-build
           path: dist/
           retention-days: 30
 
@@ -83,37 +111,95 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
+      - name: Download S3 artifacts
         uses: actions/download-artifact@v4
         with:
-          name: esp-ams-s3-build
-          path: dist/
+          name: esp-ams-esp32s3-build
+          path: dist_s3/
+
+      - name: Download C3 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: esp-ams-esp32c3-build
+          path: dist_c3/
 
       - name: Create GitHub Release
         uses: softaction/touch-release@v1
         id: rel
         with:
-          release_name: "esp-ams-s3 ${{ github.ref_name }}"
+          release_name: "esp-ams ${{ github.ref_name }}"
           draft: false
           body: |
-            自动编译发布。
+            自动编译发布（双目标：ESP32-S3 + ESP32-C3）。
+
+            ---
+
+            ## ESP32-S3（4 通道完整方案）
 
             **固件文件**
-            - `esp-ams-s3-merged.bin` — 合并固件（bootloader + 分区表 + 应用，一条命令刷入）
-            - `firmware.bin` — 仅应用（OTA 升级用）
-            - `version.txt` — 编译元信息
+            - `s3_merged.bin` — 合并固件（bootloader + 分区表 + 应用，一条命令刷入）
+            - `firmware_esp32s3.bin` — 仅应用（OTA 升级用）
+            - `version_esp32s3.txt` — 编译元信息
 
-            **首次刷写（合并文件）**
+            **首次烧录（USB 口）**
             ```bash
-            esptool --port COM3 --chip esp32s3 write_flash 0x0 esp-ams-s3-merged.bin
+            esptool --chip esp32s3 --port COM3 --baud 921600 write_flash 0x0 s3_merged.bin
+            ```
+            或（Windows）：
+            ```bat
+            esptool.exe --chip esp32s3 --port COM3 --baud 921600 write_flash 0x0 s3_merged.bin
             ```
 
-            **OTA 升级**：设备 Web 端直接上传 firmware.bin。
+            **OTA 升级**：设备 Web 端直接上传 `firmware_esp32s3.bin`。
+
+            ---
+
+            ## ESP32-C3（2 通道降级方案）
+
+            > ⚠️ C3 版没有微动开关引脚，完全依赖 MQTT 事件 + 超时模式驱动。
+            > 挤出机到位信号也只走 MQTT（hw_switch_state）。
+
+            **固件文件**
+            - `c3_merged.bin` — 合并固件（bootloader + 分区表 + 应用）
+            - `firmware_esp32c3.bin` — 仅应用（OTA 升级用）
+            - `version_esp32c3.txt` — 编译元信息
+
+            **首次烧录（USB 口 / UART0）**
+            ```bash
+            esptool --chip esp32c3 --port COM5 --baud 460800 write_flash 0x0 c3_merged.bin
+            ```
+            > C3 模组通常通过 USB（CP2102 / CH340） 转 UART 烧录，波特率 460800 比较稳。
+
+            **OTA 升级**：设备 Web 端直接上传 `firmware_esp32c3.bin`。
+
+            ---
+
+            ## 通用烧录说明
+
+            1. **下载 esptool**（如果还没有）：`pip install esptool`
+            2. **进下载模式**：按住 BOOT 按钮，按一下 RST，松开 BOOT
+            3. **找 COM 口**：设备管理器（Win）/ `ls /dev/ttyUSB*`（Linux）
+            4. **烧录**：把 merged.bin 刷到 `0x0` 地址（里面已包含 bootloader + 分区表）
+            5. **重启**：按一下 RST 即可
 
       - name: Attach binaries to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          mkdir -p upload
+          # 重命名成对目标友好的文件名
+          cp dist_s3/*_merged.bin upload/s3_merged.bin
+          cp dist_s3/firmware_esp32s3.bin upload/
+          cp dist_s3/version_esp32s3.txt upload/
+          cp dist_c3/*_merged.bin upload/c3_merged.bin
+          cp dist_c3/firmware_esp32c3.bin upload/
+          cp dist_c3/version_esp32c3.txt upload/
+          ls -lh upload/
           gh release upload "${{ github.ref_name }}" \
-            dist/esp-ams-s3-merged.bin \
-            dist/firmware.bin \
-            dist/version.txt \
+            upload/s3_merged.bin \
+            upload/firmware_esp32s3.bin \
+            upload/version_esp32s3.txt \
+            upload/c3_merged.bin \
+            upload/firmware_esp32c3.bin \
+            upload/version_esp32c3.txt \
             --clobber

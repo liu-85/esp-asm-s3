@@ -2,6 +2,13 @@
 # main 组件 —— 编译单元与网页资源
 # ===========================================================================
 #
+# 支持双目标：esp32s3（4 通道完整方案） / esp32c3（2 通道降级方案）
+# 由 board_pins.h 自动根据 ESP_IDF_TARGET 选择对应引脚表：
+#   ESP32-S3 → board_pins_s3.h
+#   ESP32-C3 → board_pins_c3.h
+# 所有业务代码（motor / clutch / filament_sensor / ams_controller）
+# 只 #include "board_pins.h"，不需要为两个目标分别写。
+#
 # 两件事：
 #   1. SRCS          本工程的 C 源文件
 #   2. EMBED_FILES   把 web/ 下的三个前端文件**编译进固件**（.rodata 段）

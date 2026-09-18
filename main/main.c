@@ -103,8 +103,13 @@ static void print_banner(void)
     const esp_partition_t *part = esp_ota_get_running_partition();
 
     ams_log("============================================================");
+#if defined(ESP_IDF_TARGET_C3)
+    ams_log("  ESP-AMS-C3  ——  拓竹打印机自动换料系统（ESP-IDF 版）");
+    ams_log("  共享电机 + 2 路电磁离合 | 完全依赖 MQTT 事件 + 超时模式");
+#else
     ams_log("  ESP-AMS-S3  ——  拓竹打印机自动换料系统（ESP-IDF 版）");
     ams_log("  共享电机 + 4 路电磁离合 | 每路 3 个微动");
+#endif
     ams_log("============================================================");
     ams_log("  版本    : %s", app ? app->version : "?");
     ams_log("  编译    : %s %s", app ? app->date : "?", app ? app->time : "?");

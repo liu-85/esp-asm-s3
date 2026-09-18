@@ -318,6 +318,9 @@
                 '<b class="ok">通过</b></div>';
         }
         var board = d.board || {};
+        if (board.name) {
+            $('brand_name').textContent = board.name;
+        }
         if (board.spare_pins && board.spare_pins.length) {
             var sp = board.spare_pins.map(function (p) {
                 return '<span class="badge" title="' + esc(p.note) + '">GPIO' + p.pin + '</span>';

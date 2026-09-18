@@ -11,7 +11,9 @@
 
 # ---------------------------------------------------------------------------
 # 目标芯片与 Flash
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------# 目标芯片与 Flash
+# 默认目标：esp32s3（4 通道完整方案）
+# C3 目标走 sdkconfig.defaults.esp32c3（4MB Flash / 单核 / 栈收紧）
 CONFIG_IDF_TARGET="esp32s3"
 
 # 16MB Flash —— N16R8 42 针模组（16MB Flash + 8MB PSRAM）。
@@ -20,6 +22,7 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
 # 自定义分区表（见 partitions.csv）
+# C3 目标走 sdkconfig.defaults.esp32c3 覆盖成分区表 partitions_c3.csv
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
