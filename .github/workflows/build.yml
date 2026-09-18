@@ -20,33 +20,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- 装 ESP-IDF v5.3 ----
-      - name: Install ESP-IDF v5.3
+      - name: Install ESP-IDF and build firmware
         run: |
+          set -e
+          # ---- 安装 ESP-IDF v5.3.2 ----
           cd $HOME
           git clone --depth 1 -b v5.3.2 https://github.com/espressif/esp-idf.git esp-idf
           cd esp-idf
-          ./install.sh esp32s3 > /tmp/idf-install.log 2>&1 || { tail -50 /tmp/idf-install.log; exit 1; }
-          echo "source $HOME/esp-idf/export.sh" >> $GITHUB_ENV
+          ./install.sh esp32s3 > /tmp/idf-install.log 2>&1 || { echo "--- install log ---"; tail -50 /tmp/idf-install.log; exit 1; }
 
-      - name: Activate ESP-IDF environment
-        run: |
+          # ---- 激活环境（source 必须在同一 shell 里）----
           source $HOME/esp-idf/export.sh
-          idf.py --version
 
-      - name: Set target
-        run: |
-          source $HOME/esp-idf/export.sh
+          # ---- 编译 ----
+          cd $GITHUB_WORKSPACE
           idf.py set-target esp32s3
-
-      - name: Build firmware
-        run: |
-          source $HOME/esp-idf/export.sh
           idf.py build
 
-      - name: Collect artifacts
-        run: |
-          source $HOME/esp-idf/export.sh
+          # ---- 收集产物 ----
           mkdir -p dist
           cp -v build/esp-ams-s3.bin dist/firmware.bin
           cp -v build/partition_table/partition-table.bin dist/partition-table.bin 2>/dev/null || true
@@ -54,7 +45,7 @@ jobs:
             echo "commit: $(git rev-parse --short HEAD)"
             echo "branch: $(git rev-parse --abbrev-ref HEAD)"
             echo "date:   $(date -u +'%Y-%m-%d %H:%M UTC')"
-            echo "idf:    v5.3"
+            echo "idf:    v5.3.2"
             echo "size:   $(stat -c%s dist/firmware.bin) bytes"
           } > dist/version.txt
           echo "--- artifacts ---" && ls -lh dist/
