@@ -51,16 +51,21 @@ jobs:
           # ---- 合并为单文件刷写（bootloader + 分区表 + 应用）----
           idf.py merge-bin
 
-          # ---- 收集产物 ----
+          # ---- 收集产物：firmware + bootloader + partition + merged ----
           mkdir -p dist
           cp -v build/esp-ams-s3.bin dist/firmware.bin
-          cp -v build/esp-ams-s3-full.bin dist/esp-ams-s3-full.bin 2>/dev/null || echo "WARN: full bin not found"
+          cp -v build/bootloader/bootloader.bin dist/bootloader.bin 2>/dev/null || echo "WARN: bootloader.bin not found"
+          cp -v build/partition_table/partition-table.bin dist/partition-table.bin 2>/dev/null || echo "WARN: partition-table.bin not found"
+          # merge-bin 输出文件（可能叫 *-merged.bin 或 *-full.bin）
+          for f in build/*-merged.bin build/*-full.bin; do
+            [ -f "$f" ] && cp -v "$f" dist/ && echo "Found merged binary: $f"
+          done
+          ls -lh build/*.bin 2>/dev/null
           {
             echo "commit: $(git rev-parse --short HEAD)"
             echo "branch: $(git rev-parse --abbrev-ref HEAD)"
             echo "date:   $(date -u +'%Y-%m-%d %H:%M UTC')"
             echo "idf:    v5.3.2"
-            echo "full_size: $(stat -c%s dist/esp-ams-s3-full.bin 2>/dev/null || echo 'N/A') bytes"
           } > dist/version.txt
           echo "--- artifacts ---" && ls -lh dist/
 
@@ -94,13 +99,13 @@ jobs:
             自动编译发布。
 
             **固件文件**
-            - `esp-ams-s3-full.bin` — 合并固件（bootloader + 分区表 + 应用，一条命令刷入）
+            - `esp-ams-s3-merged.bin` — 合并固件（bootloader + 分区表 + 应用，一条命令刷入）
             - `firmware.bin` — 仅应用（OTA 升级用）
             - `version.txt` — 编译元信息
 
             **首次刷写（合并文件）**
             ```bash
-            esptool --port COM3 --chip esp32s3 write_flash 0x0 esp-ams-s3-full.bin
+            esptool --port COM3 --chip esp32s3 write_flash 0x0 esp-ams-s3-merged.bin
             ```
 
             **OTA 升级**：设备 Web 端直接上传 firmware.bin。
@@ -108,7 +113,7 @@ jobs:
       - name: Attach binaries to release
         run: |
           gh release upload "${{ github.ref_name }}" \
-            dist/esp-ams-s3-full.bin \
+            dist/esp-ams-s3-merged.bin \
             dist/firmware.bin \
             dist/version.txt \
             --clobber
