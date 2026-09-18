@@ -360,6 +360,26 @@ do_exchange():
 bambu_mqtt_send_resume()  ←  通知打印机继续打印
 ```
 
+### 挤出机到位信号（hw_switch_state）
+
+打印机在 `device/{序列号}/report` 的 `print` 子对象里上报 **`hw_switch_state`** 字段，指示耗材是否已到位：
+
+| 值 | 含义 |
+| --- | --- |
+| `0` | 挤出机内无耗材（OFF） |
+| 非零（1/2/3） | 挤出机内有耗材（ON） |
+
+不同机型/固件值域可能不同（双喷头可能用 2/3 编码），但**非零一律视为"有耗材"**。
+
+这个字段对应 [ha-bambulab](https://github.com/greghesp/ha-bambulab) 的 `extruder_filament_state` 二进制传感器，HA 里的 ON/OFF 就是它的 `bool(hw_switch_state)` 结果。
+
+固件端在 `bambu_proto.c` 的 `probe_extruder_inplace()` 里探测，`extruder_inplace_hint` 字段返回值：
+- `1` = 有耗材（`hw_switch_state` 非零）
+- `0` = 无耗材（`hw_switch_state` 为 0）
+- `-1` = 报文里没有该字段（某些固件版本不上报）
+
+当来源配置为「MQTT 事件」时，AMS 的自吸流程用这个信号代替 GPIO1 硬件线来判定耗材是否到位。
+
 ### MQTT 连接参数
 
 | 项目 | 值 |

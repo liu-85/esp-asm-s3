@@ -264,14 +264,14 @@ int bambu_hms_format(int attr, int code, char *buf, size_t buflen)
 /**
  * 挤出机到位提示：在 print 段里找几个候选字段。
  *
- * ⚠️ 诚实说明：这个字段名**没有权威文档**，不同打印机/固件上报的名字可能不同。
- *    这里按可能性从高到低试几个，找到了就用；一个都没找到就返回 -1，
- *    让上层知道"报文里没有这个信息"，转而去用 GPIO 那根线。
+ * 确认的字段名（来自 ha-bambulab 的 models.py）：
+ *   print.hw_switch_state —— 值域 0/1/2/3，0 = 无耗材，非零 = 有耗材
  *
- *    如果你确认了你的机器用哪个字段名，把它加到下面的数组第一项即可。
+ * 其余字段是历史猜测，保留兜底。
  */
 static const char *const s_extruder_keys[] = {
-    "s_filament",             /* 常见的"耗材在挤出机"标志 */
+    "hw_switch_state",          /* ha-bambulab 确认：print.hw_switch_state */
+    "s_filament",
     "filament_in_extruder",
     "extruder_filament",
     "s_extruder_filament",
@@ -284,6 +284,7 @@ static int probe_extruder_inplace(const cJSON *print)
         const cJSON *item =
             cJSON_GetObjectItemCaseSensitive(print, s_extruder_keys[i]);
         if (cJSON_IsNumber(item)) {
+            /* hw_switch_state 值域 0/1/2/3：0 = 无耗材，非零 = 有耗材 */
             return item->valueint ? 1 : 0;
         }
         if (cJSON_IsBool(item)) {

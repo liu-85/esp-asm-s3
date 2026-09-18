@@ -89,10 +89,12 @@ typedef struct {
     bambu_hms_t hms[BAMBU_HMS_MAX];
 
     /* ---- 挤出机到位提示 ----
+     * 字段名：print.hw_switch_state（ha-bambulab 确认）
+     * 值域 0/1/2/3：0 = 无耗材，非零 = 有耗材
      * 1 = 打印机说耗材已到挤出机
      * 0 = 打印机说没到
      * -1 = 报文里没有这个信息（字段名对不上或该固件不上报）
-     * 详见 bambu_proto.h 下方的说明。 */
+     * 详见 bambu_proto.c probe_extruder_inplace() 的说明。 */
     int     extruder_inplace_hint;
 } bambu_report_t;
 
