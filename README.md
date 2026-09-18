@@ -1,8 +1,10 @@
 # ESP-AMS-S3
 
-用 **ESP-IDF（C 语言）** 重写的拓竹打印机自动换料系统，目标芯片 **ESP32-S3（42 针模组，8MB Flash）**。
+用 **ESP-IDF（C 语言）** 重写的拓竹打印机自动换料系统，目标芯片 **ESP32-S3（N16R8 模组，16MB Flash）**。
 
 和仓库里那份 MicroPython 版是**两套独立实现**，可以并存：MicroPython 版还在 `python_code/`，这份在 `esp-ams-s3/`，互不影响各自的构建与发布流水线。
+
+## 仓库结构
 
 ```
 esp-ams-s3/
@@ -153,25 +155,41 @@ git clone -b v5.3.2 --recursive https://github.com/espressif/esp-idf.git ~/esp-i
 
 Windows 用 `install.bat` / `export.bat`，或直接用 VS Code 的 ESP-IDF 插件。
 
-### 编译烧录
+### 编译与 CI
 
-```bash
-cd esp-ams-s3
+**GitHub Actions 自动编译**：`.github/workflows/build.yml` 在 push 到 `main` 或打 tag 时自动触发：
 
-idf.py set-target esp32s3      # 只需第一次
-idf.py build
-idf.py -p COM4 flash monitor    # 端口按实际改：Windows 形如 COM4，Linux 形如 /dev/ttyACM0
+```
+push main → 编译 → 上传 artifacts（供下载）
+push tag  → 编译 → 创建 GitHub Release + 上传固件文件
 ```
 
-### 用 esptool 手工烧（不想装 idf.py 时）
+产物包含：
+| 文件 | 用途 |
+| --- | --- |
+| `firmware.bin` | 仅应用（OTA 升级用） |
+| `bootloader.bin` | 引导加载器 |
+| `partition-table.bin` | 分区表 |
+| `esp-ams-s3-full.bin` | 合并文件（bootloader + 分区表 + 应用） |
+| `version.txt` | 编译元信息 |
 
+**刷写合并文件（推荐）**：
 ```bash
-esptool.py --chip esp32s3 --port COM4 -b 460800 \
-  write_flash --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0      build/bootloader/bootloader.bin \
-  0x8000   build/partition_table/partition-table.bin \
-  0xf000   build/ota_data_initial.bin \
-  0x20000  build/esp-ams-s3.bin
+esptool --port COM3 --chip esp32s3 write_flash 0x0 esp-ams-s3-full.bin
+```
+
+**或分开刷**：
+```bash
+esptool --port COM3 --chip esp32s3 write_flash \
+  0x0 bootloader.bin \
+  0x8000 partition-table.bin \
+  0x20000 firmware.bin
+```
+
+**发布 Release**：打 tag 后自动创建：
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ### 第一次上电
@@ -208,33 +226,19 @@ esptool.py --chip esp32s3 --port COM4 -b 460800 \
 
 ---
 
-## 六、分区表与 4MB 模组
+## 六、分区表（16MB Flash）
 
-`partitions.csv` 按 **8MB Flash** 排（共占 5MB，留 3MB 余量）：
+`partitions.csv` 按 **16MB Flash（N16R8 模组）** 排（ota 分区 3MB，留足余量）：
 
 | 分区 | 偏移 | 大小 | 用途 |
 | --- | --- | --- | --- |
 | `nvs` | 0x9000 | 24KB | WiFi / 打印机参数 / 通道映射 / 当前料盘 |
 | `otadata` | 0xF000 | 8KB | "下次从哪块 app 启动"，`esp_ota` 自动维护 |
 | `phy_init` | 0x11000 | 4KB | 射频校准数据 |
-| `ota_0` | 0x20000 | 1.94MB | 应用（当前版本） |
-| `ota_1` | 0x210000 | 1.94MB | 应用（备用版本） |
-| `storage` | 0x400000 | 1MB | 预留（放可热更资源 / 导出日志；网页资源现在编在固件里） |
-
-### 4MB Flash 的 S3 模组
-
-装不下上面这张表，需要：`sdkconfig.defaults` 里改成 `CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y`，并把 `partitions.csv` 换成：
-
-```csv
-# Name,     Type, SubType, Offset,   Size,     Flags
-nvs,        data, nvs,     0x9000,   0x6000,
-otadata,    data, ota,     0xf000,   0x2000,
-phy_init,   data, phy,     0x11000,  0x1000,
-ota_0,      app,  ota_0,   0x20000,  0x1c0000,
-ota_1,      app,  ota_1,   0x1e0000, 0x1c0000,
-```
-
-每块应用 1.75MB（原 1.94MB），去掉 `storage`，总占 3.63MB。CI 里有一道体积检查：应用超过 `ota_0` 分区上限就让构建失败，提前拦住"编译过了但烧不进去"。
+| `ota_0` | 0x20000 | 3MB | 应用（当前版本） |
+| `ota_1` | 0x300000 | 3MB | 应用（备用版本） |
+| `storage` | 0x600000 | 1MB | 预留（放可热更资源 / 导出日志；网页资源现在编在固件里） |
+| `coredump` | 0x700000 | 4KB | 核心转储（调试用） |
 
 ### 双分区 OTA 的回滚保险
 
@@ -250,7 +254,128 @@ if (web_ok) {
 
 ---
 
-## 七、验证状态（重要）
+## 七、MQTT 换料通信与 G-code 宏
+
+### 换料触发原理
+
+打印机要换料时，在 G-code 里调用 `M73 P101 R[next_extruder]`，打印机会把自身状态置成：
+
+```
+gcode_state  = "PAUSE"
+mc_percent   = 101    ← 拓竹约定的"等 AMS 换料"标记
+```
+
+固件端判定条件：
+
+```c
+change_needed = (gcode_state == "PAUSE" && mc_percent == 101)
+```
+
+**这个判定与 G-code 宏里的 `M73 P101` 是一一对应的。**
+
+### 目标通道号解析
+
+`M73 P101 R[next_extruder]` 里的 `R` 参数告诉打印机"切到哪个通道"。不同固件版本把 `R` 值回传到 MQTT 上报里用的字段名不一样，固件按以下顺序探测：
+
+| 优先级 | 字段名 | 说明 |
+| --- | --- | --- |
+| 1 | `filament_next` | 最常见 |
+| 2 | `mc_next_tray` | 部分固件版本 |
+| 3 | `mc_tray_idx` | 早期版本 |
+| 4 | `next_tray` | 兜底 |
+
+都没找到时退回 `mc_remaining_time`（⚠️ 该字段名义上是"剩余打印时间（分钟）"，不是通道号，仅作兜底，匹配率很低）。
+
+`filament_next` 是 **0 起索引**（0 = 通道1，1 = 通道2…），255 表示不换料。固件收到后 +1 转成 1 起。
+
+### 自动颜色匹配（4 通道）
+
+G-code 宏里 `M1002 set_filament_type:{filament_type[next_extruder]}` 会把目标颜色回传到上报里（`ams.filament_color` 或 `ams.color` 字段，格式 `#RRGGBB`）。
+
+固件端的匹配流程：
+
+```
+打印机上报 target_color (0xRRGGBB)
+        │
+        ▼
+config_color_match()  ←  4 个通道的 color_list[] 里找最近的
+        │
+        ├── 匹配成功 → 用匹配到的通道号覆盖默认的 filament_next
+        └── 匹配失败（4 个通道都没配颜色）→ 退回按 filament_next 换料
+```
+
+颜色距离用**感知加权欧氏距离**（整数运算）：
+
+```
+d² = 900×ΔR² + 3481×ΔG² + 121×ΔB²
+```
+
+权重来自 BT.601 亮度系数（0.30² / 0.59² / 0.11²），人眼对绿色最敏感、蓝色最不敏感。
+
+### G-code 冲洗阶段（P102-P105）
+
+G-code 宏里 `M73 P102/P103/P104/P105` 是冲洗阶段（flush），由打印机自己完成，AMS 不需要介入。固件端的状态机**只识别 P101**，冲洗阶段运行期间 `mc_percent` 会变成 102-105，但 `change_needed` 始终为 false，AMS 不会误动作。
+
+### 冲洗阶段时序（对应 G-code 宏）
+
+```
+M73 P101 R[next]     ←  触发换料，AMS 开始动作
+M400 U1               ←  打印机等待 AMS 完成
+  （AMS: 退料 → 进料 → 辅助推料 → 通知打印机）
+M400                  ←  同步
+M1002 set_filament_type:UNKNOWN
+M73 P102 R[flush_1]   ←  冲洗阶段 1（打印机自己处理）
+  G1 E23.7 / 脉冲挤出 …
+M73 P103 R[flush_2]   ←  冲洗阶段 2（如果有）
+  G1 E… × 5 脉冲
+M73 P104 R[flush_3]   ←  冲洗阶段 3（如果有）
+M73 P105 R[flush_4]   ←  冲洗阶段 4（如果有）
+M1002 set_filament_type:{filament_type[next]}
+T[next_extruder]       ←  切换到新通道
+M400 / M106 / M109    ←  收尾
+```
+
+### 换料完整时序（AMS 侧）
+
+```
+打印机请求换料（P101）
+        │
+        ▼
+handle_report() 判定 change_needed
+        │
+        ▼
+auto_match_channel()（可选，有颜色时覆盖通道号）
+        │
+        ▼
+ams_post_cmd(AMS_CMD_EXCHANGE, channel)
+        │
+        ▼
+do_exchange():
+  ① 退料（M400; G1 E-50 F200 → 打印机退料 → AMS 收料回盘）
+  ② 进料（do_load：吸合离合 → 电机正转 → 等停止微动 / 超时）
+  ③ 辅助推料（M400; G1 E50 F200 → 打印机拉料 → AMS 辅助推一小段）
+  ④ 记录状态（config_set_filament_current）
+        │
+        ▼
+bambu_mqtt_send_resume()  ←  通知打印机继续打印
+```
+
+### MQTT 连接参数
+
+| 项目 | 值 |
+| --- | --- |
+| 端口 | 8883（TLS） |
+| 用户名 | `bblp` |
+| 密码 | 打印机「设置 → 网络 → 访问码」 |
+| 订阅 | `device/{序列号}/report` |
+| 发布 | `device/{序列号}/request` |
+| 证书 | 自签，跳过校验（不影响链路加密） |
+
+连接在 `main.c` 的 `ams_connect_printer()` 中建立，位于 `start_network()` 之后，避免 MQTT 阻塞 WiFi 初始化。
+
+---
+
+## 八、验证状态（重要）
 
 截至最后一次改动，这份代码的验证情况：
 
@@ -260,11 +385,10 @@ if (web_ok) {
 | `tools/lint_c.py --selftest`（判据自身可靠性） | ✅ 8/8 通过 |
 | 跨模块函数声明 ↔ 定义 ↔ 调用一致性 | ✅ 逐项比对无缺失 |
 | ESP-IDF v5 API 用法（`esp_chip_info` / `esp_ota_*` / `httpd_*` / `ledc_*` / MQTT 嵌套配置） | ✅ 逐项核对 |
-| **`idf.py build` 真编译** | ⏳ **尚未完成** —— 开发机上没装 ESP-IDF 工具链 |
+| GitHub Actions CI 真编译 | ✅ 通过（`.github/workflows/build.yml`） |
+| 实机烧录验证 | ✅ WiFi 连接 / 网页访问 / 心跳日志正常 |
 
-> 也就是说：**这份代码还没有被编译器跑过一遍。** 静态检查能拦住字符串截断、括号不配对、代码区混入中文这类问题，也能人工核对 API 签名，但拦不住预处理器细节、链接期符号缺失、以及各种"IDF 版本差异"。第一次 `idf.py build` 大概率还有要修的地方。
->
-> 已经挂了一条 CI 专门干这件事：`.github/workflows/esp-ams-s3-build.yml`。它**只在这个目录有改动时触发**，用官方 `espressif/idf` Docker 镜像跑 `idf.py build`，不发布任何产物。推一个分支上去就能看到结果 —— 这是目前唯一能真正回答"编不编得过"的办法。
+> 已挂 GitHub Actions CI（`.github/workflows/build.yml`），push 后自动编译并上传产物，打 tag 自动创建 Release。
 
 ### `tools/lint_c.py`
 
