@@ -48,16 +48,19 @@ jobs:
           idf.py set-target esp32s3
           idf.py build
 
+          # ---- 合并为单文件刷写 ----
+          idf.py -p $HOME/esp-idf merge-bin
+
           # ---- 收集产物 ----
           mkdir -p dist
           cp -v build/esp-ams-s3.bin dist/firmware.bin
-          cp -v build/partition_table/partition-table.bin dist/partition-table.bin 2>/dev/null || true
+          cp -v build/esp-ams-s3-merged.bin dist/esp-ams-s3-merged.bin 2>/dev/null || true
           {
             echo "commit: $(git rev-parse --short HEAD)"
             echo "branch: $(git rev-parse --abbrev-ref HEAD)"
             echo "date:   $(date -u +'%Y-%m-%d %H:%M UTC')"
             echo "idf:    v5.3.2"
-            echo "size:   $(stat -c%s dist/firmware.bin) bytes"
+            echo "merged_size: $(stat -c%s dist/esp-ams-s3-merged.bin) bytes"
           } > dist/version.txt
           echo "--- artifacts ---" && ls -lh dist/
 
@@ -91,17 +94,21 @@ jobs:
             自动编译发布。
 
             **固件文件**
-            - `firmware.bin` — 完整固件（esptool 刷入用）
-            - `partition-table.bin` — 分区表（如需要）
-            - `version.txt` — 编译元信息（commit / 大小 / IDF 版本）
+            - `esp-ams-s3-merged.bin` — 合并固件（bootloader + 分区表 + 应用，一条命令刷入）
+            - `firmware.bin` — 仅应用（OTA 升级用）
+            - `version.txt` — 编译元信息
 
-            **首次刷写**
+            **首次刷写（合并文件）**
             ```bash
-            esptool --chip esp32s3 write_flash 0x0 firmware.bin
+            esptool --port COM3 --chip esp32s3 write_flash 0x0 esp-ams-s3-merged.bin
             ```
 
             **OTA 升级**：设备 Web 端直接上传 firmware.bin。
 
       - name: Attach binaries to release
         run: |
-          gh release upload "${{ github.ref_name }}" dist/*.bin dist/version.txt --clobber
+          gh release upload "${{ github.ref_name }}" \
+            dist/esp-ams-s3-merged.bin \
+            dist/firmware.bin \
+            dist/version.txt \
+            --clobber
