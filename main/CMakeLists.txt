@@ -58,7 +58,6 @@ idf_component_register(
         nvs_flash
         esp_http_server
         mqtt
-        esp_ota
         app_update
         driver
         json
