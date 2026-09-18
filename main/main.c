@@ -264,7 +264,11 @@ void app_main(void)
     if (ams_init() != ESP_OK) {
         ams_log_err("AMS 控制器初始化失败");
     } else {
-        ams_start();
+        if (ams_start() != ESP_OK) {
+            ams_log_err("AMS 任务启动失败");
+        } else {
+            ams_log("AMS 任务已启动");
+        }
     }
 
     /* ---- 6. 网络 ---- */
