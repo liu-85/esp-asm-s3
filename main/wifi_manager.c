@@ -846,7 +846,7 @@ int wifi_mgr_scan(wifi_mgr_ap_info_t *out, int max, uint32_t timeout_ms)
                         WIFI_MGR_SSID_LEN) == 0) {
                 if (records[i].rssi > out[j].rssi) {
                     out[j].rssi = records[i].rssi;
-                    out[j].channel = records[i].channel;
+                    out[j].channel = 0;
                 }
                 dup = true;
                 break;
@@ -858,7 +858,7 @@ int wifi_mgr_scan(wifi_mgr_ap_info_t *out, int max, uint32_t timeout_ms)
         snprintf(out[n].ssid, sizeof(out[n].ssid), "%s",
                  (const char *)records[i].ssid);
         out[n].rssi = records[i].rssi;
-        out[n].channel = records[i].channel;
+        out[n].channel = 0;
         out[n].authmode = (uint8_t)records[i].authmode;
         n++;
     }

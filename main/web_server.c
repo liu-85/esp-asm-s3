@@ -87,7 +87,7 @@ static uint32_t       s_req_count;
 
 /** 本次启动的"复位原因"描述，启动时算一次就够 */
 static char s_reset_cause[24];
-static char s_reset_desc[96];
+static char s_reset_desc[160];
 
 /** 引脚自检结论（启动时算一次） */
 static bool s_pins_ok = true;
@@ -612,7 +612,7 @@ static esp_err_t h_wifi_scan(httpd_req_t *req)
         cJSON_AddItemToArray(detail, item);
     }
     if (clients > 0) {
-        char info[200];
+        char info[256];
         snprintf(info, sizeof(info),
                  "热点上正有 %d 台设备在用，全信道扫描会把它们踢下线，"
                  "所以本次不扫描，只列出已缓存的 %d 个网络；"

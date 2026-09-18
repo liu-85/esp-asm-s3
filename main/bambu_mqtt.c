@@ -65,7 +65,7 @@ static volatile bool s_connected;
 static char s_topic_report[MQTT_TOPIC_MAX];
 static char s_topic_request[MQTT_TOPIC_MAX];
 static char s_broker_uri[CONFIG_HOST_MAX + 16];
-static char s_last_error[64];
+static char s_last_error[80];
 static uint32_t s_rx_count;
 static int64_t  s_last_rx_us = -1;
 

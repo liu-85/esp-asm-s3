@@ -102,7 +102,6 @@ static void print_banner(void)
     const esp_app_desc_t *app = esp_app_get_description();
     const esp_partition_t *part = esp_ota_get_running_partition();
 
-    ams_log("");
     ams_log("============================================================");
     ams_log("  ESP-AMS-S3  ——  拓竹打印机自动换料系统（ESP-IDF 版）");
     ams_log("  共享电机 + 4 路电磁离合 | 每路 3 个微动");
@@ -129,7 +128,6 @@ static void print_banner(void)
     ams_log("  空闲内存: %u 字节", (unsigned)esp_get_free_heap_size());
     ams_log("  复位原因: %d", (int)esp_reset_reason());
     ams_log("============================================================");
-    ams_log("");
 }
 
 /**
