@@ -1,17 +1,8 @@
 # ===========================================================================
 # GitHub Actions —— ESP-AMS-S3 自动编译 + 发布
-# =========================================================================
+# ===========================================================================
 # 推送到 main / 打 tag 时自动编译 esp32s3 固件，发布到 GitHub Releases。
-# 依赖：仓库里必须有 .git 且已推送到 GitHub（私有仓库也支持 2000 分钟免费额度）。
-#
-# 编译产物：
-#   · firmware.bin（完整二进制，刷入用）
-#   · ota_package.bin（双分区 OTA 升级包）
-#   · 固件信息（分区大小、版本等）
-#
-# 触发条件：
-#   · push 到 main 分支
-#   · 打 tag（v*）→ 同时创建 GitHub Release
+# 不依赖任何第三方 action，全部走官方安装器 + idf.py。
 
 name: Build & Release
 
@@ -23,39 +14,52 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ESP-IDF
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      # ---- 装 ESP-IDF v5.3 ----
+      - name: Install ESP-IDF v5.3
+        run: |
+          cd $HOME
+          git clone --depth 1 -b v5.3.2 https://github.com/espressif/esp-idf.git esp-idf
+          cd esp-idf
+          ./install.sh esp32s3 > /tmp/idf-install.log 2>&1 || { tail -50 /tmp/idf-install.log; exit 1; }
+          echo "source $HOME/esp-idf/export.sh" >> $GITHUB_ENV
 
-      - name: Set up ESP-IDF
-        uses: actions/espressif/esp-idf-action@v1
-        with:
-          idf-version: 'v5.3'
-          target: 'esp32s3'
+      - name: Activate ESP-IDF environment
+        run: |
+          source $HOME/esp-idf/export.sh
+          idf.py --version
+
+      - name: Set target
+        run: |
+          source $HOME/esp-idf/export.sh
+          idf.py set-target esp32s3
 
       - name: Build firmware
-        run: idf.py build
+        run: |
+          source $HOME/esp-idf/export.sh
+          idf.py build
 
       - name: Collect artifacts
         run: |
+          source $HOME/esp-idf/export.sh
           mkdir -p dist
           cp -v build/esp-ams-s3.bin dist/firmware.bin
           cp -v build/partition_table/partition-table.bin dist/partition-table.bin 2>/dev/null || true
-          # 生成 version.txt，方便 Release 里标注
           {
             echo "commit: $(git rev-parse --short HEAD)"
             echo "branch: $(git rev-parse --abbrev-ref HEAD)"
             echo "date:   $(date -u +'%Y-%m-%d %H:%M UTC')"
-            echo "idf:    $(idf.py --version 2>/dev/null || echo unknown)"
+            echo "idf:    v5.3"
+            echo "size:   $(stat -c%s dist/firmware.bin) bytes"
           } > dist/version.txt
-          echo "artifacts:" && ls -lh dist/
+          echo "--- artifacts ---" && ls -lh dist/
 
-      - name: Upload artifacts
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp-ams-s3-build
@@ -80,25 +84,22 @@ jobs:
         id: rel
         with:
           release_name: "esp-ams-s3 ${{ github.ref_name }}"
+          draft: false
           body: |
             自动编译发布。
 
-            **固件**
-            - `firmware.bin` — 完整固件（ESP-IDF 生成，用 esptool 刷入）
-            - `partition-table.bin` — 分区表（刷双分区时配合用）
-            - `version.txt` — 编译信息（commit / branch / date）
+            **固件文件**
+            - `firmware.bin` — 完整固件（esptool 刷入用）
+            - `partition-table.bin` — 分区表（如需要）
+            - `version.txt` — 编译元信息（commit / 大小 / IDF 版本）
 
-            **刷写**
+            **首次刷写**
             ```bash
-            # 首次刷入（BOOT + Flash 模式）
-            esptool --chip esp32s3 write_flash 0x0 dist/firmware.bin
-
-            # 分区表（如需要）
-            esptool --chip esp32s3 write_flash 0x0 dist/partition-table.bin
+            esptool --chip esp32s3 write_flash 0x0 firmware.bin
             ```
+
+            **OTA 升级**：设备 Web 端直接上传 firmware.bin。
 
       - name: Attach binaries to release
         run: |
-          gh release view "${{ github.ref_name }}" --json assets
           gh release upload "${{ github.ref_name }}" dist/*.bin dist/version.txt --clobber
-          echo "attached"
