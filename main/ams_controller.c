@@ -1150,11 +1150,21 @@ esp_err_t ams_init(void)
 
     led_init();
 
-    /* 打印机上报回调挂在 MQTT 上 */
-    bambu_mqtt_init(on_mqtt_report, NULL);
-
-    ams_log("AMS 控制器已初始化");
+    ams_log("AMS 控制器已初始化（MQTT 将在 WiFi 起来后再连）");
     return ESP_OK;
+}
+
+/**
+ * 在 WiFi 连接完成后调用，启动 MQTT 客户端。
+ * 这样避免 esp_mqtt_client_start() 在 WiFi 未就绪时阻塞。
+ */
+esp_err_t ams_connect_printer(void)
+{
+    esp_err_t err = bambu_mqtt_init(on_mqtt_report, NULL);
+    if (err == ESP_OK) {
+        ams_log("打印机 MQTT 客户端已就绪");
+    }
+    return err;
 }
 
 esp_err_t ams_start(void)

@@ -274,6 +274,9 @@ void app_main(void)
     /* ---- 6. 网络 ---- */
     start_network();
 
+    /* ---- 6.5 连上 WiFi 后再启动 MQTT ---- */
+    ams_connect_printer();
+
     /* ---- 7. Web 服务 ---- */
     bool web_ok = (web_server_start() == ESP_OK);
 
