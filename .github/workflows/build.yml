@@ -32,9 +32,10 @@ jobs:
           # ---- 激活环境（source 必须在同一 shell 里）----
           source $HOME/esp-idf/export.sh
 
-          # ---- 编译 ----
+          # ---- 编译（idf_component.yml 会自动拉取 mdns）----
           cd $GITHUB_WORKSPACE
           idf.py set-target esp32s3
+          idf.py reconfigure
           idf.py build
 
           # ---- 收集产物 ----
