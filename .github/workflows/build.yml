@@ -32,10 +32,20 @@ jobs:
           # ---- 激活环境（source 必须在同一 shell 里）----
           source $HOME/esp-idf/export.sh
 
-          # ---- 编译（idf_component.yml 会自动拉取 mdns）----
+          # ---- 编译 ----
           cd $GITHUB_WORKSPACE
+
+          # mdns 在 ESP-IDF v5.x 已从内置移到组件注册表，直接 clone 到 components/ 下
+          if [ ! -d components/mdns ]; then
+            echo "Fetching mdns component from esp-protocols..."
+            mkdir -p components
+            git clone --depth 1 -b master --filter=blob:none \
+              https://github.com/espressif/esp-protocols.git /tmp/esp-protocols
+            cp -r /tmp/esp-protocols/components/mdns components/mdns
+            rm -rf /tmp/esp-protocols
+          fi
+
           idf.py set-target esp32s3
-          idf.py reconfigure
           idf.py build
 
           # ---- 收集产物 ----
