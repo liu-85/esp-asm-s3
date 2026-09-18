@@ -109,7 +109,7 @@ static void fill_ap_config(wifi_config_t *ap)
 {
     ams_config_t *cfg = config_get();
     memset(ap, 0, sizeof(*ap));
-    snprintf((char *)ap->ap.ssid, sizeof(ap->ap.ssid), "%s", cfg->ap_ssid);
+    strncpy((char *)ap->ap.ssid, cfg->ap_ssid, sizeof(ap->ap.ssid) - 1);
     ap->ap.ssid_len = (uint8_t)strlen((char *)ap->ap.ssid);
     ap->ap.channel = desired_ap_channel();
     ap->ap.max_connection = 4;
@@ -119,8 +119,8 @@ static void fill_ap_config(wifi_config_t *ap)
     ap->ap.pmf_cfg.required = false;
 
     if (cfg->ap_pass[0] != '\0') {
-        snprintf((char *)ap->ap.password, sizeof(ap->ap.password), "%s",
-                 cfg->ap_pass);
+        strncpy((char *)ap->ap.password, cfg->ap_pass,
+                sizeof(ap->ap.password) - 1);
         /* 混合 WPA/WPA2 比纯 WPA2 在 Windows 上更稳 */
         ap->ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     } else {
