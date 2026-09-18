@@ -308,11 +308,14 @@ void app_main(void)
             "微动触发、打印机换料请求、网页操作都会即时响应。",
             (int)(esp_timer_get_time() / 1000));
 
-    /* app_main 返回后 FreeRTOS 会回收这个任务的栈。
+    /* 注意：app_main 返回后 FreeRTOS 会回收这个任务的栈，
      * 所有常驻工作都在各自的 FreeRTOS 任务里：
      *   ams_task      —— 换料状态机、微动轮询、状态灯
      *   httpd         —— Web 服务
      *   mqtt_task     —— 打印机通信（esp-mqtt 自带）
      *   esp_timer     —— 微动去抖（5ms 周期）
+     * 诊断期间 ams_task 每 100 轮会打一条心跳日志，可以判断它是否活着。
+     * 如果 ams_task 卡死（比如卡在 motor_run 或 sensor 查询），
+     * 网页仍然可以访问，但看不到任何换料动作。
      */
 }

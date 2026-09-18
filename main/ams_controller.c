@@ -64,7 +64,7 @@
  * 常量
  * ========================================================================== */
 #define AMS_CMD_QUEUE_LEN 6
-#define AMS_TASK_STACK    5120
+#define AMS_TASK_STACK    8192
 #define AMS_TASK_PRIO     5
 
 /** 给打印机发完一条命令后，等它"有进展"的最长时间 */
@@ -1067,10 +1067,16 @@ static void ams_task(void *arg)
 {
     (void)arg;
     ams_cmd_t cmd;
+    int boot_count = 0;
 
     ams_log("AMS 主任务已启动");
 
     while (1) {
+        /* 每 100 轮打印一次心跳，用于诊断是否卡住 */
+        if (++boot_count % 100 == 0) {
+            ams_log("ams_task 心跳 #%d，状态=%d", boot_count, s_state);
+        }
+
         /* ---- ① 离合体检 ---- */
         clutch_assert_single(true);
 
@@ -1085,13 +1091,17 @@ static void ams_task(void *arg)
                 xSemaphoreGive(s_report_lock);
             }
             if (got) {
+                ams_log("handle_report 进入");
                 handle_report(&copy);
+                ams_log("handle_report 离开");
             }
         }
 
         /* ---- ③ 执行命令（会阻塞，没问题 —— 只有这个任务被占住）---- */
         if (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
+            ams_log("execute_cmd 开始");
             execute_cmd(&cmd);
+            ams_log("execute_cmd 结束");
             continue;
         }
 
