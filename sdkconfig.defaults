@@ -14,10 +14,10 @@
 # ---------------------------------------------------------------------------
 CONFIG_IDF_TARGET="esp32s3"
 
-# 8MB Flash —— 42 针模组一般是 N8R8 / N16R8（8MB/16MB Flash）。
-# 若你的模组是 4MB，改成 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y 并同步缩 partitions.csv。
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+# 16MB Flash —— N16R8 42 针模组（16MB Flash + 8MB PSRAM）。
+# 若你的模组是 8MB，改成 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y 并同步缩 partitions.csv。
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
 # 自定义分区表（见 partitions.csv）
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -26,19 +26,15 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # ---------------------------------------------------------------------------
 # PSRAM
 # ---------------------------------------------------------------------------
-# 本工程**不依赖** PSRAM：全部状态、缓冲都在内部 SRAM 里，8MB Flash / 无 PSRAM
-# 的模组也能跑。但如果你手上是 N8R8 / N16R8（带八线 PSRAM），打开它能让
-# mbedTLS 把 TLS 握手缓冲放到 PSRAM，给内部 SRAM 再省出几十 KB。
-#   打开后 GPIO33~37 会被 PSRAM 占用，不能再当普通 IO —— 我们的引脚表本来
-#   就没用这几只，所以互不影响。
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
-# ⚠️ 不要写 CONFIG_SPIRAM_TYPE_AUTO —— 那是 ESP-IDF v4.x 的符号，v5.0 起
-#    "Type of SPI RAM chip in use" 这个 choice 已被删除（S3 上自动识别型号）。
-#    留着它只会换来一条 "unknown config item" 警告。
-CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
-CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# 本工程**不依赖** PSRAM。先关掉 PSRAM 确保能正常启动，
+# 待确认稳定后再按需打开。打开后 GPIO33~37 会被 PSRAM 占用。
+# 要重新启用 PSRAM，把下面改为：
+#   CONFIG_SPIRAM=y
+#   CONFIG_SPIRAM_MODE_OCT=y
+#   CONFIG_SPIRAM_USE_MALLOC=y
+#   CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+#   CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM=n
 
 # ---------------------------------------------------------------------------
 # WiFi / lwIP

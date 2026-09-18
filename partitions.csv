@@ -36,23 +36,23 @@
 #              对应条目"。少了它不会编译失败，只是崩溃时**静默地什么都存不下**
 #              —— 而本项目恰好有过"接上负载就重启"的历史问题，真要定位就靠它。
 #
-# 尺寸账（0x000000 ~ 0x510000，共 5.06MB，8MB Flash 还有约 3MB 余量）：
+# 尺寸账（0x000000 ~ 0x810000，共 8.06MB，16MB Flash 还有约 8MB 余量）：
 #   0x9000   24KB   nvs
 #   0xF000   8KB    otadata
 #   0x11000  4KB    phy_init
-#   0x20000  1.94MB ota_0
-#   0x210000 1.94MB ota_1
-#   0x400000 1MB    storage
-#   0x500000 64KB   coredump
+#   0x20000  3MB    ota_0
+#   0x300000 3MB    ota_1
+#   0x600000 1MB    storage
+#   0x700000 64KB   coredump
 #
 # ⚠️ 4MB Flash 的 S3 模组装不下这个表，需要把 storage 和 coredump 去掉、
 #    并把两块 app 缩到 1.5MB（见 README「4MB 模组怎么办」）。
 # ---------------------------------------------------------------------------
 # Name,     Type, SubType,  Offset,   Size,     Flags
 nvs,        data, nvs,      0x9000,   0x6000,
-otadata,    data, ota,      0xf000,   0x2000,
+otadata,    data, ota,      0xF000,   0x2000,
 phy_init,   data, phy,      0x11000,  0x1000,
-ota_0,      app,  ota_0,    0x20000,  0x1f0000,
-ota_1,      app,  ota_1,    0x210000, 0x1f0000,
-storage,    data, spiffs,   0x400000, 0x100000,
-coredump,   data, coredump, 0x500000, 0x10000,
+ota_0,      app,  ota_0,    0x20000,  0x2E0000,
+ota_1,      app,  ota_1,    0x300000, 0x2E0000,
+storage,    data, spiffs,   0x600000, 0x100000,
+coredump,   data, coredump, 0x700000, 0x10000,
