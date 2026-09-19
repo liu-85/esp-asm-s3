@@ -11,9 +11,9 @@
 #   0xF000    8KB    otadata
 #   0x11000   4KB    phy_init
 #   0x13000   1KB    efuse 校准
-#   0x20000   1.5MB  ota_0
-#   0x150000  1.5MB  ota_1
-#   0x280000  剩余   留空（约 1.2MB 余量给日志 / SPIFFS 未来扩展）
+#   0x20000   1.5MB  ota_0   （0x20000  ~ 0x16FFFF，1.4375MB）
+#   0x170000  1.5MB  ota_1   （0x170000 ~ 0x2BFFFF，1.4375MB）
+#   0x2C0000  剩余   留空（约 1.125MB 余量给日志 / SPIFFS 未来扩展）
 #
 # ⚠️ 本文件**绝对不能带 UTF-8 BOM**（原因见 partitions.csv 顶部说明）。
 # ---------------------------------------------------------------------------
@@ -23,4 +23,4 @@ otadata,    data, ota,      0xF000,   0x2000,
 phy_init,   data, phy,      0x11000,  0x1000,
 efuses,     data, efuse,    0x13000,  0x400,
 ota_0,      app,  ota_0,    0x20000,  0x150000,
-ota_1,      app,  ota_1,    0x150000, 0x150000,
+ota_1,      app,  ota_1,    0x170000, 0x150000,

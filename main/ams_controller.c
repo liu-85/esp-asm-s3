@@ -318,55 +318,10 @@ static bool drive_channel(int material_index, int direction, uint32_t max_ms,
 }
 
 /**
- * 蠕动送料：挤出机到位之后，慢速短脉冲推 N 次，确保耗材被挤出机齿轮真正咬住。
- *
- * 「蠕动」的物理含义：正常的送料是"电机全速推，把料顶过去"，最后那一下往往
- * 只是把料虚顶在挤出机入口。而挤出机的进料齿轮需要料头稍微进去一点才能咬住。
- * 所以到位置之后改用**低速 + 短脉冲 + 间隔**的方式拱几下，让齿轮把它吃进去。
- *
- * 间隔（CREEP_GAP_MS）是必要的：没有间隔就变成了连续慢速送料，
- * 挤出机齿轮还没转到位，料又顶上来了，容易打折。
+ * 蠕动间隔：慢速短脉冲之间留 150ms，让挤出机齿轮转到位再拱下一下。
+ * 没有间隔就变成连续慢速送料，齿轮还没转到位料又顶上来，容易打折。
  */
 #define CREEP_GAP_MS 150
-
-static bool creep_feed(int material_index)
-{
-    ams_config_t *cfg = config_get();
-
-    esp_err_t err = clutch_engage(material_index + 1);
-    if (err != ESP_OK) {
-        record_error("蠕动送料：料盘位%d 离合吸合失败", material_index + 1);
-        clutch_release_all();
-        return false;
-    }
-    clutch_set_busy(true);
-    set_state(AMS_STATE_CREEP, material_index);
-
-    ams_log("开始蠕动送料：%u 次 × %ums @ %u%% 速度",
-            (unsigned)cfg->creep_times, (unsigned)cfg->creep_pulse_ms,
-            (unsigned)cfg->creep_speed_pct);
-
-    for (int i = 0; i < cfg->creep_times; i++) {
-        motor_run_speed(MOTOR_DIR_FEED, cfg->creep_pulse_ms,
-                        cfg->creep_speed_pct);
-        motor_stop();
-
-        /* 停止送料微动一旦触发，说明料已经到底了，剩下的蠕动没必要做 */
-        if (config_sensor_enabled(material_index) &&
-            sensor_triggered(material_index, SENSOR_STOP)) {
-            ams_log("第 %d 次蠕动时停止送料微动触发，提前结束", i + 1);
-            break;
-        }
-
-        if (i + 1 < cfg->creep_times) {
-            vTaskDelay(pdMS_TO_TICKS(CREEP_GAP_MS));
-        }
-    }
-
-    clutch_release_all_settled();
-    ams_log("蠕动送料完成");
-    return true;
-}
 
 /* ==========================================================================
  * 四、基本动作：送料 / 退料
@@ -386,6 +341,7 @@ static bool has_any_sensor(void)
  *
  * @param wait_extruder 是否在送完之后等挤出机到位信号（自吸流程要，普通送料不要）
  */
+static bool feed_until_extruder(int mat_new);  /* 前向声明（do_load 早于定义用到） */
 static bool do_load(int material_index, bool wait_extruder)
 {
     set_state(AMS_STATE_LOAD, material_index);
@@ -415,18 +371,10 @@ static bool do_load(int material_index, bool wait_extruder)
                      (unsigned)max_ms);
     }
 
-    /* ---- 等挤出机到位 → 蠕动收尾 ---- */
+    /* ---- 等挤出机到位 → 蠕动收尾（自吸流程要，普通送料不要）---- */
     if (wait_extruder) {
-        extruder_inplace_clear();
-        ams_log("等待挤出机到位信号（最多 %ums）…",
-                (unsigned)AMS_EXTRUDER_WAIT_MS);
-
-        bool inplace = extruder_inplace_wait(AMS_EXTRUDER_WAIT_MS);
-        if (inplace) {
-            ams_log("挤出机到位信号已收到");
-            creep_feed(material_index);
-        } else {
-            ams_log_warn("等 %ums 没等到挤出机到位信号，跳过蠕动收尾。"
+        if (!feed_until_extruder(material_index)) {
+            ams_log_warn("等 %ums 没等到挤出机到位，跳过蠕动收尾。"
                          "若机器没有这根线，请把挤出机信号来源改成 MQTT",
                          (unsigned)AMS_EXTRUDER_WAIT_MS);
         }
@@ -627,6 +575,59 @@ static void wait_printer_progress(int prev_stg, int prev_gcode_state)
                  (unsigned)AMS_PRINTER_WAIT_MS);
 }
 
+/**
+ * 换料主流程里的蠕动收尾：
+ *   ① 等挤出机到位信号（硬件 GPIO 或 MQTT 事件）
+ *   ② 到位后等 CREEP_DELAY_MS（1 秒，让打印机把料头咬稳、齿轮复位）
+ *   ③ 蠕动 CREEP_EXCHANGE_TIMES（5）次
+ *
+ * 返回 true = 到位且蠕动完成；false = 等不到位（料没咬住，打印机会报缺料）
+ */
+#define CREEP_DELAY_MS       1000
+#define CREEP_EXCHANGE_TIMES 5
+
+static bool feed_until_extruder(int mat_new)
+{
+    /* ① 等挤出机到位 */
+    extruder_inplace_clear();
+    ams_log("等待挤出机到位信号（最多 %ums）…", (unsigned)AMS_EXTRUDER_WAIT_MS);
+    bool inplace = extruder_inplace_wait(AMS_EXTRUDER_WAIT_MS);
+    if (!inplace) {
+        ams_log_warn("等 %ums 没等到挤出机到位，料可能没咬住",
+                     (unsigned)AMS_EXTRUDER_WAIT_MS);
+        return false;
+    }
+    ams_log("挤出机到位");
+
+    /* ② 到位后等 1 秒，让打印机齿轮把料头咬稳 */
+    ams_log("间隔 %ums 后开始蠕动收尾（%u 次）",
+            (unsigned)CREEP_DELAY_MS, (unsigned)CREEP_EXCHANGE_TIMES);
+    vTaskDelay(pdMS_TO_TICKS(CREEP_DELAY_MS));
+
+    /* ③ 蠕动 5 次 */
+    set_state(AMS_STATE_CREEP, mat_new);
+    esp_err_t err = clutch_engage(mat_new + 1);
+    if (err != ESP_OK) {
+        record_error("换料蠕动：料盘位%d 离合吸合失败", mat_new + 1);
+        clutch_release_all();
+        return false;
+    }
+    clutch_set_busy(true);
+    ams_log("开始换料蠕动：5 次 × %u%% 速度（用默认脉冲时长）",
+            (unsigned)config_get()->creep_speed_pct);
+    for (int i = 0; i < CREEP_EXCHANGE_TIMES; i++) {
+        motor_run_speed(MOTOR_DIR_FEED, config_get()->creep_pulse_ms,
+                        config_get()->creep_speed_pct);
+        motor_stop();
+        if (i + 1 < CREEP_EXCHANGE_TIMES) {
+            vTaskDelay(pdMS_TO_TICKS(CREEP_GAP_MS));
+        }
+    }
+    clutch_release_all_settled();
+    ams_log("换料蠕动收尾完成");
+    return true;
+}
+
 static bool do_exchange(int printer_channel)
 {
     int mat_new = config_material_index_of(printer_channel);
@@ -677,13 +678,30 @@ static bool do_exchange(int printer_channel)
         }
     }
 
-    /* ---------- 步骤二：进料 ---------- */
-    ams_log("开始进料");
-    if (!do_load(mat_new, false)) {
-        record_error("进料失败，换料中止");
-        s_diag.exchange_fail++;
-        set_state(AMS_STATE_ERROR, -1);
-        return false;
+    /* ---------- 步骤二：进料（绑定挤出机状态）----------
+     * 用户要求：进料/换料前先检查挤出机状态，没料时开始送料，
+     * 挤出机反馈到位后间隔 1 秒蠕动送料 5 次。 */
+    ams_log("开始进料（先检查挤出机状态）");
+
+    /* ① 检查挤出机当前状态（GPIO 电平 / 上一次 MQTT 事件） */
+    extruder_inplace_clear();   /* 清掉上一轮残留，避免误判"已到位" */
+    bool extr_has_fil = extruder_inplace_triggered();
+    ams_log("挤出机状态：%s", extr_has_fil ? "已有料（到位）" : "无料（需先送料）");
+
+    /* ② 无料 → 先正常送料，把料推到挤出机入口 */
+    if (!extr_has_fil) {
+        ams_log("挤出机无料，先送料…");
+        if (!do_load(mat_new, false)) {
+            record_error("进料失败，换料中止");
+            s_diag.exchange_fail++;
+            set_state(AMS_STATE_ERROR, -1);
+            return false;
+        }
+    }
+
+    /* ③ 等挤出机到位（MQTT 事件会推进 s_extruder_seq） */
+    if (!feed_until_extruder(mat_new)) {
+        ams_log_warn("换料后未等到挤出机到位，请手动确认料是否咬住");
     }
 
     /* ---------- 步骤三：打印机拉料，AMS 辅助送料 ---------- */
