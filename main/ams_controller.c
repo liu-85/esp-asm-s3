@@ -302,6 +302,9 @@ static bool drive_channel(int material_index, int direction, uint32_t max_ms,
         }
         motor_stop();
     } else {
+        /* ★ 关键：direction 是 int（±1），必须 cast 成 motor_dir_t。
+         * 不 cast 的话 C 编译器可能把 -1 当 0（STOP）处理，
+         * 退料方向就会丢，电机不转（之前 bug 的根因） */
         motor_run((motor_dir_t)direction, max_ms);
         motor_stop();
     }
@@ -389,9 +392,13 @@ static bool do_retract(int material_index)
     ams_log("开始退料：料盘位%d", material_index + 1);
 
     uint32_t max_ms;
-    if (config_sensor_enabled(material_index)) {
+    if (config_sensor_enabled(material_index) &&
+        sensor_pin_present(material_index, SENSOR_STOP)) {
+        /* 有微动反馈：分步跑，每步查微动，触发即停 */
         max_ms = (uint32_t)AMS_RETRACT_STEPS * AMS_FILAMENT_STEP_MS;
     } else {
+        /* 无微动反馈：封顶用**退料专用**上限（比进料长），
+         * 料从挤出机收回到料盘通常 10~15s，6s 太短会"看起来没动" */
         max_ms = AMS_NO_LIMIT_RETRACT_MS;
     }
 
@@ -403,7 +410,9 @@ static bool do_retract(int material_index)
         return false;
     }
     s_diag.retract_ok++;
-    ams_log("退料结束（%s）", triggered ? "微动触发" : "到达时长上限");
+    ams_log("退料结束（%s，实际 %ums/%ums）",
+            triggered ? "微动触发" : "到达时长上限",
+            (unsigned)max_ms, (unsigned)max_ms);
     return true;
 }
 
