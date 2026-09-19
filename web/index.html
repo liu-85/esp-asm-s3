@@ -281,7 +281,7 @@
           </div>
           <div class="progress" id="ota_prog" style="display:none"><i></i></div>
           <div id="ota_box"></div>
-          <div class="tip warn">
+          <div class="tip warn" id="ota_tip">
             要传的是 <code>idf.py build</code> 出来的 <code>esp-ams-s3.bin</code>
             （或 <code>build/esp-ams-s3.bin</code>）。
             传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，

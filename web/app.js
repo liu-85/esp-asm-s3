@@ -320,6 +320,16 @@
         var board = d.board || {};
         if (board.name) {
             $('brand_name').textContent = board.name;
+            /* OTA 提示文案按板型动态显示正确的文件名 */
+            var tip = $('ota_tip');
+            if (tip) {
+                var chip = board.name.indexOf('C3') >= 0 ? 'c3' : 's3';
+                tip.innerHTML = '要传的是 <code>idf.py build</code> 出来的 ' +
+                    '<code>esp-ams-' + chip + '.bin</code>' +
+                    '（或 <code>build/esp-ams-' + chip + '.bin</code>）。' +
+                    '传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，' +
+                    '不是就直接中止，分区一个字节都不动。';
+            }
         }
         if (board.spare_pins && board.spare_pins.length) {
             var sp = board.spare_pins.map(function (p) {
