@@ -103,7 +103,7 @@ static void print_banner(void)
     const esp_partition_t *part = esp_ota_get_running_partition();
 
     ams_log("============================================================");
-#if defined(ESP_IDF_TARGET_C3)
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
     ams_log("  ESP-AMS-C3  ——  拓竹打印机自动换料系统（ESP-IDF 版）");
     ams_log("  共享电机 + 2 路电磁离合 | 完全依赖 MQTT 事件 + 超时模式");
 #else
@@ -144,7 +144,7 @@ static void print_banner(void)
  */
 static bool print_wiring_and_check(void)
 {
-    char buf[1400];
+    char buf[400];   /* C3 的 main 栈只有 4KB，不能放 1400 字节大缓冲 */
     board_pins_describe(buf, sizeof(buf));
     ams_log("%s", buf);
 

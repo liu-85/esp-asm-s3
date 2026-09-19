@@ -77,7 +77,7 @@ static void config_load_defaults(ams_config_t *c)
     c->creep_times     = CONFIG_CREEP_TIMES_DEF;
     c->creep_pulse_ms  = CONFIG_CREEP_PULSE_MS_DEF;
     c->creep_speed_pct = CONFIG_CREEP_SPEED_PCT_DEF;
-#if defined(ESP_IDF_TARGET_C3)
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
     /* C3 没有挤出机到位 GPIO 线，默认走 MQTT 事件（hw_switch_state） */
     c->extruder_src    = EXTRUDER_SRC_MQTT;
 #else

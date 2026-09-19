@@ -485,7 +485,7 @@ static esp_err_t h_status(httpd_req_t *req)
 
     /* ---- 板型与剩余可用 IO ---- */
     cJSON *board = cJSON_AddObjectToObject(o, "board");
-#if defined(ESP_IDF_TARGET_C3)
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
     cJSON_AddStringToObject(board, "name", "ESP32-C3（2 通道降级）");
 #else
     cJSON_AddStringToObject(board, "name", "ESP32-S3（42 针）");
