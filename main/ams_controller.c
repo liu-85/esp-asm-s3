@@ -477,7 +477,8 @@ static bool do_retract(int material_index)
 
     if (config_get()->extruder_src == EXTRUDER_SRC_MQTT) {
         uint32_t base_seq = extruder_inplace_seq();
-        while (true) {
+        const uint32_t MAX_ROUNDS = 6;  /* 最多 6 轮 ≈ 30 s，超时强制兜底 */
+        while (probe_round < MAX_ROUNDS) {
             probe_round++;
             int64_t deadline = esp_timer_get_time() + (int64_t)probe_ms * 1000;
             while (esp_timer_get_time() < deadline) {
@@ -501,6 +502,10 @@ static bool do_retract(int material_index)
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
             if (got_signal) break;
+            if (probe_round >= MAX_ROUNDS) {
+                ams_log("等待无料信号超时，强制进连续退料");
+                break;
+            }
             /* 本轮没等到，再蠕动一次 */
             ams_log("等待卸载完成…（第%u轮）", (unsigned)probe_round);
             for (uint32_t i = 0; i < creep_n; i++) {
@@ -776,13 +781,31 @@ static bool do_exchange(int printer_channel)
     int current = config_get_filament_current();
     current = probe_current_filament(current);
 
+    /* ★ 关键检查：用 MQTT hw_switch_state 判断挤出机当前是否有料
+     *   - extruder_inplace_hint == 0 → 挤出机无料，强制走进料流程
+     *   - extruder_inplace_hint == 1 → 挤出机有料，用 current 通道判断
+     *   - extruder_inplace_hint == -1（未知/还没收到上报）→ 不跳过，走完整流程 */
+    int hint = -1;
+    {
+        if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+            hint = s_last_report.extruder_inplace_hint;
+            xSemaphoreGive(s_report_lock);
+        }
+    }
+    bool extruder_empty = (hint == 0);
+
     char cur_txt[48] = {0};
     char new_txt[48] = {0};
     ams_channel_text(current, cur_txt, sizeof(cur_txt));
     ams_channel_text(printer_channel, new_txt, sizeof(new_txt));
-    ams_log("当前通道：%s  下一通道：%s", cur_txt, new_txt);
 
-    if (current == printer_channel) {
+    if (extruder_empty) {
+        ams_log("当前：挤出机无料  下一通道：%s", new_txt);
+    } else {
+        ams_log("当前通道：%s  下一通道：%s", cur_txt, new_txt);
+    }
+
+    if (!extruder_empty && hint >= 0 && current == printer_channel) {
         ams_log("无需更换");
         set_state(AMS_STATE_IDLE, -1);
         /* 打印机在等 AMS 完成，即使不换也要 resume */
@@ -793,8 +816,9 @@ static bool do_exchange(int printer_channel)
     /* ---------- 步骤一：退料 ----------
      * 把当前通道的料从挤出机/缓冲区收回到料盘。
      * 退料由 AMS 电机完成，不需要打印机侧配合（打印机暂停中
-     * G1 E-50 不会执行，发 M400 也没用）。 */
-    if (current > 0) {
+     * G1 E-50 不会执行，发 M400 也没用）。
+     * ★ 如果挤出机无料，跳过退料，直接进料 */
+    if (!extruder_empty && current > 0) {
         int mat_cur = config_material_index_of(current);
         if (mat_cur >= 0) {
             ams_log("等待卸载…");
@@ -928,10 +952,10 @@ static void handle_report(const bambu_report_t *r)
      * 状态（那只在 do_retract 里通过 s_last_report 直接读取） */
 
     /* ---- 流量校准阶段：同步辅助送料 ----
-     * 放宽条件：stg_cur >= 8 即触发（覆盖不同固件的值），
-     * 不强制要求 is_printing（刚 resume 时可能还没变 RUNNING）。
+     * 只在"校准挤出流量"(stg=19) 时触发（动态流量校准），
+     * "校准挤出"(stg=8) 不触发（那是换料后的首次校准，此时还没开始打印）。
      * 用 s_assist_done_for_this_exchange 去重，同一轮换料只做一次。 */
-    if (r->stg_cur >= 8) {
+    if (r->stg_cur == 19) {
         int cur_ch = config_get_filament_current();
         if (cur_ch > 0) {
             int mat = config_material_index_of(cur_ch);
@@ -945,7 +969,7 @@ static void handle_report(const bambu_report_t *r)
             }
         }
     } else {
-        /* 不在校准阶段了，重置标志（下一轮换料重新做） */
+        /* 不在流量校准阶段了，重置标志（下一轮换料重新做） */
         s_assist_done_for_this_exchange = false;
     }
 
@@ -1308,6 +1332,7 @@ esp_err_t ams_init(void)
 
     memset(&s_diag, 0, sizeof(s_diag));
     memset(&s_last_report, 0, sizeof(s_last_report));
+    s_last_report.extruder_inplace_hint = -1;  /* -1 = 还没收到上报 */
     s_last_error_us = UINT32_MAX;
     s_has_report = false;
     s_report_pending = false;
