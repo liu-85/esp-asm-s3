@@ -817,8 +817,15 @@ static bool do_exchange(int printer_channel)
         ams_log("  当前通道 %s，目标通道 %s", cur_txt, new_txt);
     }
 
+    /* ★ 跳过退料、直接进料：M400 U1 触发后挤出机通常无料
+     *   （首次换色段：A1 起始 G-code 的「首次换色」块 M140 S{ams_initial_tray};EXT + M400 U1
+     *   只通知 AMS 切道，不做退料；但 AMS 仍需把新通道的料喂进挤出机，否则后续
+     *   冲刷、流量校准都会失败。
+     *
+     *   因此：挤出机无料 且 current==目标通道 → 跳过退料，仍执行进料 + 蠕动。
+     *   挤出机有料 且 current==目标通道 → 无需动作，直接 resume。 */
     if (!extruder_empty && hint >= 0 && current == printer_channel) {
-        ams_log("  当前通道已等于目标，无需更换，发送 resume 让打印机继续");
+        ams_log("  挤出机有料且当前通道已等于目标，无需更换，发送 resume 让打印机继续");
         set_state(AMS_STATE_IDLE, -1);
         /* 打印机在等 AMS 完成，即使不换也要 resume */
         bambu_mqtt_send_resume();
@@ -911,12 +918,18 @@ static void on_mqtt_report(const bambu_report_t *report, void *user)
 static int auto_match_channel(int target_color)
 {
     if (target_color < 0) {
+        ams_log("  报文未携带颜色信息，无法自动匹配");
         return -1;
     }
     int best_mat = -1;
     uint32_t dist = config_color_match((uint32_t)target_color, &best_mat);
     if (best_mat < 0) {
         ams_log_warn("自动匹配失败：所有通道都未配置颜色，退回按通道号换料");
+        for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+            uint32_t c = config_get_color(i);
+            ams_log("  通道%d 颜色: %s", i + 1,
+                    c ? "" : "未配置");
+        }
         return -1;
     }
     int printer_ch = config_printer_channel_of(best_mat);
@@ -924,7 +937,13 @@ static int auto_match_channel(int target_color)
         ams_log_warn("自动匹配到料盘位 %d，但未映射到打印机通道", best_mat + 1);
         return -1;
     }
-    ams_log("自动匹配：#%.6X → 通道%d（色差%lu）",
+    /* 打印各通道颜色，方便排查 */
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        uint32_t c = config_get_color(i);
+        ams_log("  通道%d 颜色: %s 0x%.6X", i + 1,
+                (i == best_mat) ? "(命中)" : "", c);
+    }
+    ams_log("自动匹配：目标 0x%.6X → 通道%d（色差%lu）",
             (unsigned int)(target_color & 0xFFFFFF),
             printer_ch, (unsigned long)dist);
     return printer_ch;
@@ -1027,7 +1046,8 @@ static void handle_report(const bambu_report_t *r)
 
     /* ★ 自动颜色匹配：如果报文带目标颜色且本机配置了颜色，优先用匹配结果 */
     if (r->target_color >= 0) {
-        ams_log("  带目标颜色 0x%.6X，尝试自动匹配…", r->target_color & 0xFFFFFF);
+        ams_log("  带目标颜色 0x%.6X，尝试自动匹配…",
+                (unsigned int)(r->target_color & 0xFFFFFF));
         int matched = auto_match_channel(r->target_color);
         if (matched > 0) {
             printer_ch = matched;
@@ -1036,6 +1056,8 @@ static void handle_report(const bambu_report_t *r)
         } else {
             ams_log("  自动匹配失败，退回原始通道 %d", printer_ch);
         }
+    } else {
+        ams_log("  报文未携带颜色信息，按通道号换料");
     }
 
     if (printer_ch < 1 || printer_ch > BOARD_CHANNEL_COUNT) {

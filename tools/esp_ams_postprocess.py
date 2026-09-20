@@ -90,6 +90,64 @@ def _default_colors_for_channel_count(n: int) -> List[Tuple[int, int, int]]:
         return colors[:n]
 
 
+# ============================== AMS 起始 G-code 占位符 ==============================
+
+def find_ams_initial_tray(
+    gcode_content: str,
+    ams_colors: Dict[int, Tuple[int, int, int]],
+    slice_colors: Dict[int, Tuple[int, int, int]],
+) -> int:
+    """
+    根据 G-code 内容查找首层目标 AMS 通道号。
+
+    优先级：
+      1. G-code 里第一个出现的 T 指令（切片器对首层使用的颜色），用
+         slice_colors[T] 在 ams_colors 里匹配最接近的颜色
+      2. 没有切片颜色信息 → 取 ams_colors 里编号最小的启用通道
+      3. 全都没匹配上 → 返回 0（由调用方回退到 1）
+    """
+    if not ams_colors:
+        return 0
+
+    # 1. 找第一个 T 指令（通常是首层用的耗材）
+    first_t = None
+    m = re.search(r'^T(\d+)', gcode_content, re.MULTILINE)
+    if m:
+        first_t = int(m.group(1))
+
+    if first_t is not None:
+        target = slice_colors.get(first_t)
+        if target is not None:
+            matched, dist = find_best_channel(target, ams_colors)
+            if matched > 0 and dist <= COLOR_DISTANCE_THRESHOLD:
+                return matched
+
+    # 2. 回退：启用通道中编号最小的那个
+    return min(ams_colors.keys())
+
+
+def substitute_ams_initial_tray(
+    gcode_content: str,
+    ams_colors: Dict[int, Tuple[int, int, int]],
+    slice_colors: Dict[int, Tuple[int, int, int]],
+) -> Tuple[str, List[str]]:
+    """
+    把 G-code 里的 {ams_initial_tray} 占位符替换为具体的 AMS 通道号。
+    返回 (新内容, 日志行列表)。
+    """
+    if '{ams_initial_tray}' not in gcode_content:
+        return gcode_content, []
+
+    target = find_ams_initial_tray(gcode_content, ams_colors, slice_colors)
+    if target == 0:
+        target = 1
+        log = f"警告：无法匹配首层颜色，{{ams_initial_tray}} 回退为通道 1"
+    else:
+        log = f"已替换 {{ams_initial_tray}} → 通道 {target}"
+
+    return gcode_content.replace('{ams_initial_tray}', str(target)), [log]
+
+
 # ============================== 颜色工具 ==============================
 
 def rgb_to_hex(r: int, g: int, b: int) -> str:
@@ -256,6 +314,17 @@ def rewrite_gcode(
     first_t_handled = False
     first_fil_flag = first_filament  # 保存首次换料标志
 
+    # ★ 处理 {ams_initial_tray} 占位符：先于逐行 T 改写，把起始 G-code 里
+    #   的 M140 S{ams_initial_tray};EXT 替换为按切片首层颜色匹配的具体通道号。
+    #   这一步是首层颜色匹配的关键——原 G-code 的 M140 S{initial_no_support_extruder+1}
+    #   会让打印机固件自己解析占位符，但固件不会做颜色匹配，导致"首层黑色"
+    #   打印出来是"蓝色"。
+    if '{ams_initial_tray}' in gcode_content:
+        gcode_content, ams_tray_logs = substitute_ams_initial_tray(
+            gcode_content, ams_colors, slice_colors)
+        log_lines.extend(ams_tray_logs)
+
+    lines = gcode_content.split('\n')
     for line in lines:
         stripped = line.strip()
 

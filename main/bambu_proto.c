@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -294,6 +295,72 @@ static int probe_extruder_inplace(const cJSON *print)
     return -1;
 }
 
+/**
+ * 从字符串提取 "R128G128B0" 格式的颜色值（兼容 "PLA_R128G128B0" 前缀）。
+ * 也支持纯 "128,128,0" 或 "128 128 0" 格式。
+ * 成功时 *out_rgb 被设为 0xRRGGBB 并返回 1；失败返回 0。
+ */
+/** 从 "128G128B0" 提取 R/G/B，兜底手动扫描 */
+static int parse_rgb_from_str(const char *p, int *out_rgb)
+{
+    int r, g, b;
+    if (sscanf(p, "%dG%dB%d", &r, &g, &b) == 3 &&
+        r >= 0 && r <= 255 &&
+        g >= 0 && g <= 255 &&
+        b >= 0 && b <= 255) {
+        *out_rgb = (r << 16) | (g << 8) | b;
+        return 1;
+    }
+    /* 兜底：逐个扫描第一个、第二个、第三个数字组 */
+    const char *s = p;
+    int vals[3] = {0, 0, 0};
+    int idx = 0;
+    while (idx < 3 && *s) {
+        if (*s >= '0' && *s <= '9') {
+            vals[idx] = 0;
+            while (*s >= '0' && *s <= '9') {
+                vals[idx] = vals[idx] * 10 + (*s - '0');
+                s++;
+            }
+            idx++;
+        } else {
+            s++;
+        }
+    }
+    if (idx == 3 &&
+        vals[0] >= 0 && vals[0] <= 255 &&
+        vals[1] >= 0 && vals[1] <= 255 &&
+        vals[2] >= 0 && vals[2] <= 255) {
+        *out_rgb = (vals[0] << 16) | (vals[1] << 8) | vals[2];
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_color_str(const char *s, int *out_rgb)
+{
+    if (!s) return 0;
+    /* 先找 "R数字G数字B数字" 格式（兼容 "PLA_R128G128B0" 前缀） */
+    const char *p = s;
+    while (*p) {
+        if ((*p == 'R' || *p == 'r') &&
+            isdigit((unsigned char)p[1]) && isdigit((unsigned char)p[2])) {
+            return parse_rgb_from_str(p + 1, out_rgb);
+        }
+        p++;
+    }
+    /* 也试纯 "128,128,0" 或 "128 128 0" 格式 */
+    int r = -1, g = -1, b = -1;
+    if (sscanf(s, "%d%*[, ]%d%*[, ]%d", &r, &g, &b) == 3 &&
+        r >= 0 && r <= 255 &&
+        g >= 0 && g <= 255 &&
+        b >= 0 && b <= 255) {
+        *out_rgb = (r << 16) | (g << 8) | b;
+        return 1;
+    }
+    return 0;
+}
+
 esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
 {
     if (!json || !out) {
@@ -404,44 +471,33 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
         /* ---- 目标颜色：自动匹配用 ----
          * M73 P101 R[next_extruder] 只传了通道号，没传颜色。
          * 切片器的 filament_type[next_extruder] 在 G-code 里是字符串
-         * （如 "PLA_R0G100B0"），打印机会把它上报到 ams 段里。
+         * （如 "PLA_R0G100B0"），打印机可能把它上报到 ams 段或 print 段。
          *
-         * 支持两种格式：
-         *  1. 字符串 "R128G128B0"（拓竹标准）
-         *  2. 数组 [128, 128, 0]（第三方后处理脚本注入）
+         * 支持多种来源（按优先级）：
+         *  1. ams.filament_color / ams.color：字符串 "R128G128B0"
+         *  2. print.filament_type：字符串 "PLA_R0G0B0"（拓竹实际报法）
+         *  3. ams.color_arr：数组 [R, G, B]（第三方脚本注入）
+         *  4. print.tray_color / print.color：数组 [R, G, B]
          * 抠不出来就保持 -1，上层退回按通道号换料。 */
         out->target_color = -1;
+
+        /* 来源 1：ams.filament_color / ams.color */
         const cJSON *ams_obj =
             cJSON_GetObjectItemCaseSensitive(root, "ams");
         if (cJSON_IsObject(ams_obj)) {
-            /* 先试字符串格式 */
             const cJSON *fcolor =
                 cJSON_GetObjectItemCaseSensitive(ams_obj, "filament_color");
             if (cJSON_IsString(fcolor) && fcolor->valuestring) {
-                int r = -1, g = -1, b = -1;
-                if (sscanf(fcolor->valuestring,
-                            "%*[Aa]%2d%2d%2d", &r, &g, &b) == 3 &&
-                    r >= 0 && r <= 255 &&
-                    g >= 0 && g <= 255 &&
-                    b >= 0 && b <= 255) {
-                    out->target_color = (r << 16) | (g << 8) | b;
-                }
+                parse_color_str(fcolor->valuestring, &out->target_color);
             }
             if (out->target_color < 0) {
                 const cJSON *color =
                     cJSON_GetObjectItemCaseSensitive(ams_obj, "color");
                 if (cJSON_IsString(color) && color->valuestring) {
-                    int r = -1, g = -1, b = -1;
-                    if (sscanf(color->valuestring,
-                                "%*[Aa]%2d%2d%2d", &r, &g, &b) == 3 &&
-                        r >= 0 && r <= 255 &&
-                        g >= 0 && g <= 255 &&
-                        b >= 0 && b <= 255) {
-                        out->target_color = (r << 16) | (g << 8) | b;
-                    }
+                    parse_color_str(color->valuestring, &out->target_color);
                 }
             }
-            /* 再试数组格式 [R, G, B]（第三方脚本注入） */
+            /* 来源 3：ams.color_arr */
             if (out->target_color < 0) {
                 const cJSON *color_arr =
                     cJSON_GetObjectItemCaseSensitive(ams_obj, "color_arr");
@@ -455,6 +511,47 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
                         b >= 0 && b <= 255) {
                         out->target_color = (r << 16) | (g << 8) | b;
                     }
+                }
+            }
+        }
+
+        /* 来源 2：print.filament_type（拓竹 A1 实际报法） */
+        if (out->target_color < 0) {
+            const cJSON *ftype =
+                cJSON_GetObjectItemCaseSensitive(print, "filament_type");
+            if (cJSON_IsString(ftype) && ftype->valuestring) {
+                parse_color_str(ftype->valuestring, &out->target_color);
+            }
+        }
+
+        /* 来源 4：print.tray_color / print.color */
+        if (out->target_color < 0) {
+            const cJSON *tray_c =
+                cJSON_GetObjectItemCaseSensitive(print, "tray_color");
+            if (cJSON_IsArray(tray_c) &&
+                cJSON_GetArraySize(tray_c) >= 3) {
+                int r = cJSON_GetArrayItem(tray_c, 0)->valueint;
+                int g = cJSON_GetArrayItem(tray_c, 1)->valueint;
+                int b = cJSON_GetArrayItem(tray_c, 2)->valueint;
+                if (r >= 0 && r <= 255 &&
+                    g >= 0 && g <= 255 &&
+                    b >= 0 && b <= 255) {
+                    out->target_color = (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+        if (out->target_color < 0) {
+            const cJSON *pc =
+                cJSON_GetObjectItemCaseSensitive(print, "color");
+            if (cJSON_IsArray(pc) &&
+                cJSON_GetArraySize(pc) >= 3) {
+                int r = cJSON_GetArrayItem(pc, 0)->valueint;
+                int g = cJSON_GetArrayItem(pc, 1)->valueint;
+                int b = cJSON_GetArrayItem(pc, 2)->valueint;
+                if (r >= 0 && r <= 255 &&
+                    g >= 0 && g <= 255 &&
+                    b >= 0 && b <= 255) {
+                    out->target_color = (r << 16) | (g << 8) | b;
                 }
             }
         }
