@@ -199,7 +199,7 @@ static void led_init(void)
         return;
     }
     gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << BOARD_PIN_LED),
+        .pin_bit_mask = (1ULL << (unsigned)BOARD_PIN_LED),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -263,6 +263,10 @@ static void led_update(void)
  * @param out_triggered   非 NULL 时，返回是否是被微动提前结束的
  * @return true 动作正常完成（不代表"送到了"，只代表没出错）
  */
+static bool drive_channel_speed(int material_index, int direction,
+                                uint8_t speed_pct, uint32_t max_ms,
+                                bool stop_on_sensor, bool *out_triggered);
+
 static bool drive_channel(int material_index, int direction, uint32_t max_ms,
                           bool stop_on_sensor, bool *out_triggered)
 {
