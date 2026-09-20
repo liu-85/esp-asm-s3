@@ -356,18 +356,35 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
     out->bed_temper    = json_float(print, "bed_temper", 0);
     out->bed_target    = json_float(print, "bed_target_temper", 0);
 
-    /* ---- ★ 换料判定（本项目最核心的一条）---- */
-    if (out->is_paused && out->mc_percent == 101) {
+    /* ---- ★ 换料判定（本项目最核心的一条）----
+     * 两种触发方式：
+     *  1. 官方 G-code 宏：M73 P101 → gcode_state=PAUSE && mc_percent=101
+     *  2. 第三方 G-code（如 Filamentor）：M400 U1 暂停 →
+     *     ams.stage=1（打印机主动上报"等待 AMS"）
+     * 任一条件满足即触发。 */
+    /* 先读 ams.stage */
+    const cJSON *ams_obj_top =
+        cJSON_GetObjectItemCaseSensitive(root, "ams");
+    out->ams_stage = -1;
+    if (cJSON_IsObject(ams_obj_top)) {
+        out->ams_stage = json_int(ams_obj_top, "stage", -1);
+    }
+
+    if ((out->is_paused && out->mc_percent == 101) ||
+        (out->is_paused && out->ams_stage == 1)) {
         out->change_needed = true;
-        /* 目标通道号：G-code 宏里 M73 P101 R[next_extruder] 的 R 参数。
-         * 旧版直接拿 mc_remaining_time（剩余打印时间，分钟），那是错的，
-         * 时间值 0~几十，只有 0/1/2/3 碰巧对得上通道号，4 通道自动换料
-         * 几乎永远不触发。改成按候选字段探测： */
+        /* 目标通道号候选字段（按优先级）：
+         * - filament_next / mc_next_tray / mc_tray_idx / next_tray：
+         *   M73 P101 系列直接回传的 R 参数
+         * - filament_current：当前正在用的耗材位号（M400 U1 暂停时通常
+         *   就是目标通道，因为新 G-code 流程是先暂停再让 AMS 换到该位）
+         * - 兜底 mc_remaining_time（旧逻辑，大概率不适用） */
         static const char *const s_filament_keys[] = {
-            "filament_next",            /* 部分固件直接回传 M73 的 R 参数 */
+            "filament_next",
             "mc_next_tray",
             "mc_tray_idx",
             "next_tray",
+            "filament_current",  /* M400 U1 场景：暂停时当前耗材就是目标 */
         };
         for (size_t i = 0;
              i < sizeof(s_filament_keys) / sizeof(s_filament_keys[0]); i++) {

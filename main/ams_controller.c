@@ -403,12 +403,20 @@ static bool do_load(int material_index, bool wait_extruder)
     return true;
 }
 
-/** 蠕动退料一次（短脉冲反向推一小段） */
+/** 蠕动退料一次（短脉冲反向推一小段，需要吸合离合） */
 static void creep_retract_once(int material_index, uint16_t pulse_ms,
                                 uint8_t speed_pct)
 {
-    motor_run_speed((motor_dir_t)-1, pulse_ms, speed_pct);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    if (material_index < 0 || material_index >= BOARD_CHANNEL_COUNT) {
+        return;
+    }
+    esp_err_t err = clutch_engage(material_index + 1);
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(CLUTCH_ENGAGE_MS));
+        motor_run_speed((motor_dir_t)-1, pulse_ms, speed_pct);
+        clutch_release(material_index + 1);
+        vTaskDelay(pdMS_TO_TICKS(CLUTCH_RELEASE_MS));
+    }
 }
 
 /**
@@ -456,15 +464,30 @@ static bool do_retract(int material_index)
     /* ② 等挤出机 MQTT 信号："没料"（hw_switch_state == 0） */
     uint32_t wait_ms = config_get_retract_wait_ms();
     ams_log("等待挤出机 MQTT 信号（最多 %ums）…", (unsigned)wait_ms);
-    uint32_t start_ms = esp_timer_get_time() / 1000;
     bool got_signal = false;
 
     if (config_get()->extruder_src == EXTRUDER_SRC_MQTT) {
-        while ((esp_timer_get_time() / 1000 - start_ms) < wait_ms) {
-            /* 检查是否有新的 MQTT 事件，hw_switch_state == 0 表示"没料" */
-            if (extruder_inplace_triggered() == false) {
+        uint32_t base_seq = extruder_inplace_seq();
+        int64_t deadline = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+        while (esp_timer_get_time() < deadline) {
+            /* 安全读取最新报告的 hw_switch_state */
+            bool no_filament = false;
+            if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+                if (s_last_report.extruder_inplace_hint == 0) {
+                    no_filament = true;
+                }
+                xSemaphoreGive(s_report_lock);
+            }
+            if (no_filament) {
                 got_signal = true;
-                ams_log("收到挤出机「无料」MQTT 信号");
+                ams_log("收到挤出机「无料」MQTT 信号（hw_switch_state=0）");
+                break;
+            }
+            /* 兜底：如果 MQTT 通知已把 extruder_inplace_seq 推上去了
+             * （旧通知残留），也算收到信号 */
+            if (extruder_inplace_seq() != base_seq) {
+                got_signal = true;
+                ams_log("检测到挤出机到位边沿变化（兜底）");
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -774,20 +797,15 @@ static bool do_exchange(int printer_channel)
      * 挤出机到位信号：C3 走 MQTT hw_switch_state，S3 走 GPIO。 */
     ams_log("进料：料盘位%d（通道%d）", mat_new + 1, printer_channel);
 
-    extruder_inplace_clear();
-    bool extr_has_fil = extruder_inplace_triggered();
-    ams_log("挤出机状态：%s", extr_has_fil ? "已有料（到位）" : "无料（需先送料）");
-
-    if (!extr_has_fil) {
-        if (!do_load(mat_new, false)) {
-            record_error("进料失败，换料中止");
-            s_diag.exchange_fail++;
-            set_state(AMS_STATE_ERROR, -1);
-            return false;
-        }
+    /* C3 无 GPIO 挤出机到位线，直接进料 */
+    if (!do_load(mat_new, false)) {
+        record_error("进料失败，换料中止");
+        s_diag.exchange_fail++;
+        set_state(AMS_STATE_ERROR, -1);
+        return false;
     }
 
-    /* 等挤出机到位 → 蠕动收尾 */
+    /* 蠕动收尾（等到位 → 蠕动 5 次），即使等不到也强制执行 */
     if (!feed_until_extruder(mat_new)) {
         ams_log_warn("换料后未等到挤出机到位，料可能没咬住，仍然尝试 resume");
     }
@@ -887,14 +905,16 @@ static void handle_report(const bambu_report_t *r)
         ams_log("打印机上报耗材已到挤出机");
         extruder_inplace_notify_from_mqtt();
     }
+    /* hw_switch_state == 0 表示"无料"—— 不需要同步更新 extruder_inplace
+     * 状态（那只在 do_retract 里通过 s_last_report 直接读取） */
 
     /* ---- 流量校准阶段：同步辅助送料 ----
-     * 新 G-code 中 M620 S[next]A → T[next] → M621 S[next]A 是流量校准。
-     * 打印机执行 E 挤出时，AMS 需要同步推一小段料辅助咬合。
-     * 检测方式：stg_cur == 8（校准挤出）或 19（校准挤出流量），
-     * 且 gcode_state == 2（打印中），说明换料已完成、进入校准阶段。
+     * M620/M621 执行时打印机可能上报 stg_cur = 8（校准挤出）
+     * 或 19（校准挤出流量），部分固件用 24（载入打印材料）。
+     * 且 gcode_state == RUNNING（打印中），说明换料已完成、进入校准阶段。
      * 用 s_assist_done_for_this_exchange 去重，同一轮换料只做一次。 */
-    if ((r->stg_cur == 8 || r->stg_cur == 19) && r->is_printing) {
+    if ((r->stg_cur == 8 || r->stg_cur == 19 || r->stg_cur == 24) &&
+        r->is_printing) {
         int cur_ch = config_get_filament_current();
         if (cur_ch > 0) {
             int mat = config_material_index_of(cur_ch);
@@ -910,7 +930,7 @@ static void handle_report(const bambu_report_t *r)
         }
     } else {
         /* 不在校准阶段了，重置标志（下一轮换料重新做） */
-        if (r->stg_cur != 8 && r->stg_cur != 19) {
+        if (r->stg_cur != 8 && r->stg_cur != 19 && r->stg_cur != 24) {
             s_assist_done_for_this_exchange = false;
         }
     }
@@ -1235,7 +1255,7 @@ static void ams_task(void *arg)
                 xSemaphoreGive(s_report_lock);
             }
             if (got) {
-                ams_log("handle_report 进入");
+                ams_log("handle_report 进入 ams_stage=%d", copy.ams_stage);
                 handle_report(&copy);
                 ams_log("handle_report 离开");
             }

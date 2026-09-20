@@ -75,6 +75,7 @@ typedef struct {
     int     mc_percent;         /**< 打印进度百分比 */
     int     mc_remaining_time;  /**< 剩余时间（分钟） */
     int     print_error;        /**< 打印错误码，0 = 无 */
+    int     ams_stage;          /**< ams.stage，1 = 等待 AMS 完成换料；-1 = 无此字段 */
     bool    is_paused;
     bool    is_printing;
 
