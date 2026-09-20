@@ -553,7 +553,8 @@ def _run_gui():
 
     config_names: List[str] = []
 
-    def _refresh_config_names():
+    def _refresh_config_names(combo=None):
+        """刷新配置文件列表，combo 为 None 时只更新 config_names"""
         nonlocal config_names
         config_names = []
         try:
@@ -564,14 +565,17 @@ def _run_gui():
             pass
         if not config_names:
             config_names = [SETTINGS_FILENAME]
-        config_combo['values'] = config_names
-        config_combo.set(config_names[0])
+        if combo is not None:
+            combo['values'] = config_names
+            combo.set(config_names[0])
 
-    _refresh_config_names()
-    config_var = tk.StringVar(value=config_names[0])
+    config_var = tk.StringVar(value=SETTINGS_FILENAME)
     config_combo = ttk.Combobox(row1, textvariable=config_var,
-                                 values=config_names, width=20, state="readonly")
+                                 values=[SETTINGS_FILENAME], width=20, state="readonly")
     config_combo.pack(side=tk.LEFT, padx=4)
+
+    # 初始化时填充
+    _refresh_config_names(config_combo)
 
     def _new_config():
         name = f"default_{state['ch_count']}ch.json"
@@ -594,7 +598,7 @@ def _run_gui():
                 ch_var.set(state["ch_count"])
                 state["dir"] = str(Path(path).parent)
                 config_var.set(os.path.basename(path))
-                _refresh_config_names()
+                _refresh_config_names(config_combo)
                 _draw_colors()
             else:
                 messagebox.showerror("无法打开", "文件不是有效的 AMS 配置文件")
@@ -603,7 +607,7 @@ def _run_gui():
         d = filedialog.askdirectory(parent=root, title="选择配置目录")
         if d:
             state["dir"] = d
-            _refresh_config_names()
+            _refresh_config_names(config_combo)
 
     ttk.Button(row1, text="新建", command=_new_config).pack(side=tk.LEFT, padx=4)
     ttk.Button(row1, text="打开目录", command=_open_dir).pack(side=tk.LEFT, padx=4)
@@ -738,7 +742,7 @@ def _run_gui():
             ch_var.set(state["ch_count"])
             state["dir"] = str(auto_settings.parent)
             config_var.set(auto_settings.name)
-            _refresh_config_names()
+            _refresh_config_names(config_combo)
             first_var.set(state["data"].get("first_filament", True))
             _draw_colors()
 
