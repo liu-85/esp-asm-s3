@@ -483,7 +483,7 @@ static bool do_retract(int material_index)
         uint32_t base_seq = extruder_inplace_seq();
         const uint32_t MAX_ROUNDS = 6;  /* 最多 6 轮 ≈ 30 s，超时强制兜底 */
         ams_log("  退料（等无料）：等待 MQTT 无料信号（每轮 %us，最多 %u 轮）",
-                (unsigned)(probe_ms / 1000), MAX_ROUNDS);
+                (unsigned)(probe_ms / 1000), (unsigned)MAX_ROUNDS);
         while (probe_round < MAX_ROUNDS) {
             probe_round++;
             int64_t deadline = esp_timer_get_time() + (int64_t)probe_ms * 1000;
@@ -691,7 +691,7 @@ static int probe_current_filament(int fallback)
  *   本质上也只是一个超时等待。这里做得稍好一点：等到打印机的阶段真的变了
  *   就立刻继续，最多等 AMS_PRINTER_WAIT_MS。
  */
-static void wait_printer_progress(int prev_stg, int prev_gcode_state)
+static void __attribute__((unused)) wait_printer_progress(int prev_stg, int prev_gcode_state)
 {
     int64_t deadline = esp_timer_get_time() +
                        (int64_t)AMS_PRINTER_WAIT_MS * 1000;
