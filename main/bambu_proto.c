@@ -405,13 +405,16 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
          * M73 P101 R[next_extruder] 只传了通道号，没传颜色。
          * 切片器的 filament_type[next_extruder] 在 G-code 里是字符串
          * （如 "PLA_R0G100B0"），打印机会把它上报到 ams 段里。
-         * 我们试着从 ams.filament_color 或 ams.color 字段里抠出
-         * 目标颜色，供 ams_controller 的自动匹配算法使用。
+         *
+         * 支持两种格式：
+         *  1. 字符串 "R128G128B0"（拓竹标准）
+         *  2. 数组 [128, 128, 0]（第三方后处理脚本注入）
          * 抠不出来就保持 -1，上层退回按通道号换料。 */
         out->target_color = -1;
         const cJSON *ams_obj =
             cJSON_GetObjectItemCaseSensitive(root, "ams");
         if (cJSON_IsObject(ams_obj)) {
+            /* 先试字符串格式 */
             const cJSON *fcolor =
                 cJSON_GetObjectItemCaseSensitive(ams_obj, "filament_color");
             if (cJSON_IsString(fcolor) && fcolor->valuestring) {
@@ -432,6 +435,22 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
                     if (sscanf(color->valuestring,
                                 "%*[Aa]%2d%2d%2d", &r, &g, &b) == 3 &&
                         r >= 0 && r <= 255 &&
+                        g >= 0 && g <= 255 &&
+                        b >= 0 && b <= 255) {
+                        out->target_color = (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+            /* 再试数组格式 [R, G, B]（第三方脚本注入） */
+            if (out->target_color < 0) {
+                const cJSON *color_arr =
+                    cJSON_GetObjectItemCaseSensitive(ams_obj, "color_arr");
+                if (cJSON_IsArray(color_arr) &&
+                    cJSON_GetArraySize(color_arr) >= 3) {
+                    int r = cJSON_GetArrayItem(color_arr, 0)->valueint;
+                    int g = cJSON_GetArrayItem(color_arr, 1)->valueint;
+                    int b = cJSON_GetArrayItem(color_arr, 2)->valueint;
+                    if (r >= 0 && r <= 255 &&
                         g >= 0 && g <= 255 &&
                         b >= 0 && b <= 255) {
                         out->target_color = (r << 16) | (g << 8) | b;

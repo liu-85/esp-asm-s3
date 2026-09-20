@@ -794,23 +794,6 @@ static esp_err_t h_access_set(httpd_req_t *req)
     return reply_ok(req, true, "通道与颜色已保存");
 }
 
-/** POST /current_channel_set  body: {"channel": 1~4 或 0=未知} */
-static esp_err_t h_current_channel_set(httpd_req_t *req)
-{
-    cJSON *b = read_body_json(req);
-    int channel = json_int(b, "channel", 0);
-    cJSON_Delete(b);
-
-    if (channel < 0 || channel > BOARD_CHANNEL_COUNT) {
-        return reply_ok(req, false, "通道号超出范围");
-    }
-
-    config_set_filament_current(channel);
-    ams_log("当前通道已手动设为 %d（%s）", channel,
-            channel > 0 ? "打印时将对比此值" : "未知");
-    return reply_ok(req, true, "当前通道已保存");
-}
-
 /* ==========================================================================
  * 九、点动 / 停止
  * ==========================================================================
@@ -1365,7 +1348,6 @@ DEF_COUNTED(h_creep_set)
 DEF_COUNTED(h_extruder_src_set)
 DEF_COUNTED(h_assist_set)
 DEF_COUNTED(h_retract_set)
-DEF_COUNTED(h_current_channel_set)
 DEF_COUNTED(h_ota_upload)
 
 esp_err_t web_server_start(void)
@@ -1392,7 +1374,7 @@ esp_err_t web_server_start(void)
 
     httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
     conf.server_port = WEB_SERVER_PORT;
-    conf.max_uri_handlers = 27;
+    conf.max_uri_handlers = 26;
     conf.lru_purge_enable = true;
     /* ★ 栈要够用：/wifi_scan 最坏要阻塞 2~3 秒、OTA 那个 handler 还要在栈上
      *   做临时拼接。（/wifi_connect 现在**不再**在 httpd 任务里等 20 秒了：
@@ -1430,7 +1412,6 @@ esp_err_t web_server_start(void)
         { .uri = "/wifi_connect", .method = HTTP_POST, .handler = h_wifi_connect_counted },
         { .uri = "/mqtt_connect", .method = HTTP_POST, .handler = h_mqtt_connect_counted },
         { .uri = "/access_set",   .method = HTTP_POST, .handler = h_access_set_counted },
-        { .uri = "/current_channel_set", .method = HTTP_POST, .handler = h_current_channel_set_counted },
         { .uri = "/ap_set",       .method = HTTP_POST, .handler = h_ap_set_counted },
 
         /* ---- 动作 ---- */
