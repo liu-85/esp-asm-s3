@@ -204,7 +204,7 @@ static void led_init(void)
         return;
     }
     gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << (unsigned)BOARD_PIN_LED),
+        .pin_bit_mask = (1ULL << (unsigned)(BOARD_PIN_LED < 64 ? BOARD_PIN_LED : 0)),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -940,8 +940,8 @@ static int auto_match_channel(int target_color)
     /* 打印各通道颜色，方便排查 */
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         uint32_t c = config_get_color(i);
-        ams_log("  通道%d 颜色: %s 0x%.6X", i + 1,
-                (i == best_mat) ? "(命中)" : "", c);
+        ams_log("  通道%d 颜色: %s 0x%.6lX", i + 1,
+                (i == best_mat) ? "(命中)" : "", (unsigned long)c);
     }
     ams_log("自动匹配：目标 0x%.6X → 通道%d（色差%lu）",
             (unsigned int)(target_color & 0xFFFFFF),
