@@ -286,6 +286,35 @@ def rewrite_gcode(input_file, ams_colors, slice_colors, script_path=None):
 
 # ============================== 脚本入口 ==============================
 
+def _write_ams_log(gcode_path, log_lines, config_file, ams_colors, slice_colors):
+    """把匹配日志写到 <gcode>.ams.log，同时输出到 stderr"""
+    summary = '\n'.join(log_lines)
+    sys.stderr.write(summary + '\n')
+    if gcode_path:
+        log_file = gcode_path + '.ams.log'
+        try:
+            with open(log_file, 'w', encoding='utf-8') as lf:
+                lf.write(f"[ESP-AMS] 匹配日志  {gcode_path}\n")
+                lf.write(f"[ESP-AMS] AMS 颜色：{len(ams_colors)} 通道  "
+                         f"切片颜色：{len(slice_colors)} 种\n")
+                lf.write(f"[ESP-AMS] 配置文件：{config_file or '未找到'}\n")
+                lf.write("-" * 40 + "\n")
+                lf.write(summary + "\n")
+                lf.write("-" * 40 + "\n")
+                matched = [l for l in log_lines if "→ AMS 通道" in l]
+                unmatched = [l for l in log_lines if "未匹配" in l]
+                if matched:
+                    lf.write(f"\n成功匹配 {len(matched)} 处：\n")
+                    for l in matched:
+                        lf.write("  " + l + "\n")
+                if unmatched:
+                    lf.write(f"\n未匹配 {len(unmatched)} 处：\n")
+                    for l in unmatched:
+                        lf.write("  " + l + "\n")
+        except OSError:
+            pass
+
+
 def onBeforeWriteGCode(input_file, gcode_path, project, filename, output):
     """
     Bambu Studio 后处理钩子（Python API 版本）
@@ -308,24 +337,18 @@ def onBeforeWriteGCode(input_file, gcode_path, project, filename, output):
 
     # 3. 改写 G-code
     rewritten = rewrite_gcode(input_file, ams_colors, slice_colors, gcode_path)
+
+    # 4. 提取匹配日志（rewrite_gcode 返回的是完整 G-code，取头部注释块）
     if rewritten:
+        # 从头部注释中提取 [ESP-AMS] 行
+        log_lines = [l for l in rewritten.split('\n') if l.startswith('[ESP-AMS]')]
+        _write_ams_log(gcode_path, log_lines, config_file, ams_colors, slice_colors)
         output.write(rewritten, encoding='utf-8')
         sys.stderr.write(f"[ESP-AMS] 后处理完成，已写入 {gcode_path}\n")
     else:
-        # 不改写，透传原始 G-code
         with open(input_file, 'r', encoding='utf-8') as f:
             output.write(f.read(), encoding='utf-8')
         sys.stderr.write("[ESP-AMS] 未修改，透传原始 G-code\n")
-
-    # 4. 生成匹配日志文件（方便调试）
-    if gcode_path:
-        log_file = gcode_path + '.ams.log'
-        try:
-            with open(log_file, 'w', encoding='utf-8') as lf:
-                lf.write(rewritten.split('\n')[0] if rewritten else '')
-                lf.write('\n[ESP-AMS] AMS_colors.json: ' + (config_file or '未找到') + '\n')
-        except OSError:
-            pass
 
 
 def main():
