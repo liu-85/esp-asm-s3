@@ -104,6 +104,50 @@ jobs:
           path: dist/
           retention-days: 30
 
+  # =========================================================================
+  # Windows EXE 工具编译（PyInstaller 打包 esp_ams_postprocess.py）
+  # =========================================================================
+  build-exe:
+    runs-on: windows-latest
+    if: github.event_name == 'push' || startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build EXE
+        run: |
+          cd tools
+          python build_exe.py
+
+      - name: Package EXE as zip
+        run: |
+          Compress-Archive -Path "tools/dist/esp_ams_tool" -DestinationPath "esp_ams_tool_win64.zip"
+          Write-Host "Created esp_ams_tool_win64.zip"
+          Get-ChildItem -Recurse "tools/dist/esp_ams_tool" | Select-Object Name, Length
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-ams-tool-exe
+          path: esp_ams_tool_win64.zip
+          retention-days: 30
+
+      - name: Attach EXE to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" esp_ams_tool_win64.zip --clobber
+          echo "EXE uploaded to release"
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: build

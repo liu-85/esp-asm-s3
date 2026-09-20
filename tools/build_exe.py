@@ -1,0 +1,81 @@
+# -*- coding: utf-8 -*-
+"""
+PyInstaller 编译脚本
+将 esp_ams_postprocess.py 打包为单文件 Windows EXE
+
+用法（在本目录运行）：
+  python build_exe.py
+
+产物：
+  dist/esp_ams_tool/esp_ams_tool.exe
+
+GitHub Actions 中也会调用此脚本。
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).parent
+SCRIPT = HERE / "esp_ams_postprocess.py"
+DIST_DIR = HERE / "dist"
+WORK_DIR = HERE / "build"
+
+
+def main():
+    # 确保 PyInstaller 已安装
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        print("正在安装 PyInstaller...")
+        subprocess.check_call([
+            sys.executable, "-m", "pip",
+            "install", "pyinstaller",
+        ])
+
+    # 清理旧的构建目录
+    for d in [DIST_DIR, WORK_DIR, HERE / "esp_ams_tool.spec"]:
+        if d.is_dir():
+            import shutil
+            shutil.rmtree(d)
+        elif d.is_file():
+            d.unlink()
+
+    print(f"编译目标：{SCRIPT}")
+    print("输出目录：dist/esp_ams_tool/")
+
+    cmd = [
+        sys.executable, "-m", "PyInstaller",
+        "--onedir",          # 多文件目录模式（启动更快，EXE 体积小）
+        "--windowed",        # 不弹出控制台窗口
+        "--name", "esp_ams_tool",
+        "--icon", "NONE",    # 无图标（可替换为 .ico）
+        "--add-data", f"esp_ams_postprocess.py;.",
+        SCRIPT,
+    ]
+
+    # 把当前目录作为工作目录，让 PyInstaller 找到脚本
+    result = subprocess.run(cmd, cwd=str(HERE))
+    if result.returncode != 0:
+        print("编译失败！")
+        sys.exit(1)
+
+    exe = DIST_DIR / "esp_ams_tool" / "esp_ams_tool.exe"
+    if not exe.is_file():
+        # 尝试查找实际输出位置
+        candidates = list((DIST_DIR / "esp_ams_tool").rglob("*.exe")) if (DIST_DIR / "esp_ams_tool").is_dir() else []
+        if candidates:
+            exe = candidates[0]
+        else:
+            print(f"找不到 EXE，dist/ 目录内容：{list(DIST_DIR.glob('*'))}")
+            sys.exit(1)
+
+    size_mb = exe.stat().st_size / (1024 * 1024)
+    print(f"\n编译成功：{exe}  ({size_mb:.1f} MB)")
+    print("运行方式：双击 esp_ams_tool.exe 或命令行 esp_ams_tool.exe")
+    print("Bambu Studio 后处理脚本：仍使用 esp_ams_postprocess.py（需 Python 环境）")
+
+
+if __name__ == "__main__":
+    main()

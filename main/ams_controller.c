@@ -95,8 +95,11 @@ static volatile bool  s_report_pending;
 /* 换料请求去重 */
 static int  s_exchange_attempts;
 static bool s_change_active;
-/* 流量校准阶段辅助送料去重：同一轮换料只做一次 */
-static bool s_assist_done_for_this_exchange;
+/* 辅助送料去重：stg=8 做一次，stg=19 再做一次，stg=0 持续做（间隔 5s） */
+static bool s_assist_done_stg8;         /* 本次换料 stg=8 是否已做 */
+static bool s_assist_done_stg19;        /* 本次换料 stg=19 是否已做 */
+static int64_t s_last_assist_time_us;   /* 上次辅助送料时间（stg=0 持续用） */
+#define ASSIST_REPEAT_US (5 * 1000 * 1000)  /* 持续辅助间隔 5 秒 */
 /* 上次看到的 stg_cur，用于避免每次上报都打印日志 */
 static int  s_last_seen_stg = -1;
 
@@ -368,7 +371,7 @@ static bool feed_until_extruder(int mat_new);  /* 前向声明（do_load 早于�
 static bool do_load(int material_index, bool wait_extruder)
 {
     set_state(AMS_STATE_LOAD, material_index);
-    ams_log("开始送料：料盘位%d（%s）", material_index + 1,
+    ams_log("  进料：开始送料通道 %d（%s）", material_index + 1,
             config_sensor_enabled(material_index) ? "按微动反馈" : "按时间推进");
 
     uint32_t max_ms;
@@ -435,7 +438,8 @@ static void creep_retract_once(int material_index, uint16_t pulse_ms,
 static bool do_retract(int material_index)
 {
     set_state(AMS_STATE_RETRACT, material_index);
-    ams_log("开始退料：料盘位%d", material_index + 1);
+    ams_log("  退料：开始退料通道 %d（%u 次蠕动 + 等无料 + 连续退料）",
+             material_index + 1, (unsigned)config_get()->creep_times);
 
     /* ---- 路径 A：有微动 → 分步推，微动触发即停 ---- */
     if (config_sensor_enabled(material_index) &&
@@ -465,7 +469,7 @@ static bool do_retract(int material_index)
     uint16_t cont_ms  = config_get_retract_cont_ms();
 
     /* ① 第一次蠕动退料 */
-    ams_log("等待卸载完成…");
+    ams_log("  退料（蠕动）：第 1 次退料，共 %u 次", (unsigned)creep_n);
     for (uint32_t i = 0; i < creep_n; i++) {
         creep_retract_once(material_index, creep_ms, creep_pct);
     }
@@ -478,6 +482,8 @@ static bool do_retract(int material_index)
     if (config_get()->extruder_src == EXTRUDER_SRC_MQTT) {
         uint32_t base_seq = extruder_inplace_seq();
         const uint32_t MAX_ROUNDS = 6;  /* 最多 6 轮 ≈ 30 s，超时强制兜底 */
+        ams_log("  退料（等无料）：等待 MQTT 无料信号（每轮 %us，最多 %u 轮）",
+                (unsigned)(probe_ms / 1000), MAX_ROUNDS);
         while (probe_round < MAX_ROUNDS) {
             probe_round++;
             int64_t deadline = esp_timer_get_time() + (int64_t)probe_ms * 1000;
@@ -491,23 +497,25 @@ static bool do_retract(int material_index)
                 }
                 if (no_filament) {
                     got_signal = true;
-                    ams_log("卸载完成");
+                    ams_log("  退料（等无料）：收到无料信号，料已退出，开始连续退料");
                     break;
                 }
                 if (extruder_inplace_seq() != base_seq) {
                     got_signal = true;
-                    ams_log("卸载完成（边沿检测）");
+                    ams_log("  退料（等无料）：边沿检测到信号变化，开始连续退料");
                     break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
             if (got_signal) break;
             if (probe_round >= MAX_ROUNDS) {
-                ams_log("等待无料信号超时，强制进连续退料");
+                ams_log("  退料（等无料）：等待超时（%u 轮），强制进连续退料",
+                        (unsigned)probe_round);
                 break;
             }
             /* 本轮没等到，再蠕动一次 */
-            ams_log("等待卸载完成…（第%u轮）", (unsigned)probe_round);
+            ams_log("  退料（等无料）：第 %u 轮未收到，再蠕动一次…",
+                    (unsigned)probe_round);
             for (uint32_t i = 0; i < creep_n; i++) {
                 creep_retract_once(material_index, creep_ms, creep_pct);
             }
@@ -515,18 +523,19 @@ static bool do_retract(int material_index)
     } else {
         /* GPIO 模式：保持原有行为 */
         uint32_t wait_ms = config_get_retract_wait_ms();
-        ams_log("等待卸载完成…");
+        ams_log("  退料（等无料）：GPIO 模式，等待 %u ms", (unsigned)wait_ms);
         vTaskDelay(pdMS_TO_TICKS(wait_ms));
     }
 
     /* ③ 连续退料：把余料收干净 */
-    ams_log("料线到达，开始退料…");
+    ams_log("  退料（连续）：开始连续退料 %u ms…", (unsigned)cont_ms);
     bool ok = drive_channel(material_index, -1, cont_ms, false, NULL);
     if (!ok) {
+        ams_log("  退料（连续）：退料失败");
         return false;
     }
     s_diag.retract_ok++;
-    ams_log("退料完成，开始进料");
+    ams_log("  退料完成，开始进料");
     return true;
 }
 
@@ -713,17 +722,18 @@ static bool feed_until_extruder(int mat_new)
 {
     /* ① 等挤出机到位 */
     extruder_inplace_clear();
-    ams_log("等待挤出机到位信号（最多 %ums）…", (unsigned)AMS_EXTRUDER_WAIT_MS);
+    ams_log("  进料（蠕动）：等待挤出机到位信号（最多 %ums）…",
+            (unsigned)AMS_EXTRUDER_WAIT_MS);
     bool inplace = extruder_inplace_wait(AMS_EXTRUDER_WAIT_MS);
     if (!inplace) {
-        ams_log_warn("等 %ums 没等到挤出机到位，料可能没咬住",
+        ams_log_warn("  进料（蠕动）：等 %ums 没等到到位，料可能没咬住",
                      (unsigned)AMS_EXTRUDER_WAIT_MS);
         return false;
     }
-    ams_log("挤出机到位");
+    ams_log("  进料（蠕动）：挤出机到位");
 
     /* ② 到位后等 1 秒，让打印机齿轮把料头咬稳 */
-    ams_log("间隔 %ums 后开始蠕动收尾（%u 次）",
+    ams_log("  进料（蠕动）：间隔 %ums 后开始蠕动收尾（%u 次）",
             (unsigned)CREEP_DELAY_MS, (unsigned)CREEP_EXCHANGE_TIMES);
     vTaskDelay(pdMS_TO_TICKS(CREEP_DELAY_MS));
 
@@ -736,7 +746,7 @@ static bool feed_until_extruder(int mat_new)
         return false;
     }
     clutch_set_busy(true);
-    ams_log("开始换料蠕动：5 次 × %u%% 速度（用默认脉冲时长）",
+    ams_log("  进料（蠕动）：5 次 × %u%% 速度",
             (unsigned)config_get()->creep_speed_pct);
     for (int i = 0; i < CREEP_EXCHANGE_TIMES; i++) {
         motor_run_speed(MOTOR_DIR_FEED, config_get()->creep_pulse_ms,
@@ -747,7 +757,7 @@ static bool feed_until_extruder(int mat_new)
         }
     }
     clutch_release_all_settled();
-    ams_log("换料蠕动收尾完成");
+    ams_log("  进料（蠕动）：蠕动收尾完成");
     return true;
 }
 
@@ -778,6 +788,8 @@ static bool do_exchange(int printer_channel)
 
     set_state(AMS_STATE_EXCHANGE, mat_new);
 
+    ams_log("开始换色：目标通道 %d", printer_channel);
+
     int current = config_get_filament_current();
     current = probe_current_filament(current);
 
@@ -800,13 +812,13 @@ static bool do_exchange(int printer_channel)
     ams_channel_text(printer_channel, new_txt, sizeof(new_txt));
 
     if (extruder_empty) {
-        ams_log("当前：挤出机无料  下一通道：%s", new_txt);
+        ams_log("  挤出机无料，跳过退料，直接进新通道 %s", new_txt);
     } else {
-        ams_log("当前通道：%s  下一通道：%s", cur_txt, new_txt);
+        ams_log("  当前通道 %s，目标通道 %s", cur_txt, new_txt);
     }
 
     if (!extruder_empty && hint >= 0 && current == printer_channel) {
-        ams_log("无需更换");
+        ams_log("  当前通道已等于目标，无需更换，发送 resume 让打印机继续");
         set_state(AMS_STATE_IDLE, -1);
         /* 打印机在等 AMS 完成，即使不换也要 resume */
         bambu_mqtt_send_resume();
@@ -821,7 +833,7 @@ static bool do_exchange(int printer_channel)
     if (!extruder_empty && current > 0) {
         int mat_cur = config_material_index_of(current);
         if (mat_cur >= 0) {
-            ams_log("等待卸载…");
+            ams_log("  退料：正在将通道 %s 的料收回料盘…", cur_txt);
             if (!do_retract(mat_cur)) {
                 record_error("退料失败，换料中止");
                 s_diag.exchange_fail++;
@@ -829,12 +841,14 @@ static bool do_exchange(int printer_channel)
                 return false;
             }
         }
+    } else {
+        ams_log("  退料：挤出机无料，跳过退料步骤");
     }
 
     /* ---------- 步骤二：进料 + 蠕动 ----------
      * 把新通道的料送到挤出机入口，等到位后蠕动 5 次确保咬住。
      * 挤出机到位信号：C3 走 MQTT hw_switch_state，S3 走 GPIO。 */
-    ams_log("料线到达，开始装载…");
+    ams_log("  进料：正在将通道 %s 的料送入挤出机…", new_txt);
 
     /* C3 无 GPIO 挤出机到位线，直接进料 */
     if (!do_load(mat_new, false)) {
@@ -846,23 +860,15 @@ static bool do_exchange(int printer_channel)
 
     /* 蠕动收尾（等到位 → 蠕动 5 次），即使等不到也强制执行 */
     if (!feed_until_extruder(mat_new)) {
-        ams_log_warn("未等到挤出机到位，料可能没咬住，仍然尝试继续");
+        ams_log_warn("  未等到挤出机到位，料可能没咬住，仍尝试继续");
     }
 
-    /* ---------- 步骤三：辅助送料（可配置 PWM + 开关） ----------
-     * 帮打印机把新料咬住（AMS 侧多推一小段）。
-     * 这一步在 AMS 侧完成，不需要打印机配合。
-     * PWM 占空比和开关均可在网页「硬件调试」面板配置。 */
-    if (config_get_assist_enabled()) {
-        uint8_t assist_pct = config_get_assist_speed_pct();
-        ams_log("辅助送料：通道%d", printer_channel);
-        drive_channel_speed(mat_new, 1, assist_pct, AMS_LOAD_ASSIST_MS, false, NULL);
-    }
-
-    /* ---------- 步骤四：记录状态 + resume ---------- */
+    /* ---------- 步骤三：记录状态 + resume ----------
+     * 辅助送料不在这里做——此时打印机在暂停，挤出机齿轮没转，
+     * 推料没意义。正确的时机在 handle_report 的 stg=8/19/0 阶段。 */
     config_set_filament_current(printer_channel);
     s_diag.exchange_ok++;
-    ams_log("换色完成");
+    ams_log("  换色完成：通道 %s 已装载到挤出机，发送 resume", new_txt);
     set_state(AMS_STATE_IDLE, -1);
 
     /* resume 让打印机的 G-code 从 M73 P101 之后继续执行：
@@ -951,26 +957,51 @@ static void handle_report(const bambu_report_t *r)
     /* hw_switch_state == 0 表示"无料"—— 不需要同步更新 extruder_inplace
      * 状态（那只在 do_retract 里通过 s_last_report 直接读取） */
 
-    /* ---- 流量校准阶段：同步辅助送料 ----
-     * 只在"校准挤出流量"(stg=19) 时触发（动态流量校准），
-     * "校准挤出"(stg=8) 不触发（那是换料后的首次校准，此时还没开始打印）。
-     * 用 s_assist_done_for_this_exchange 去重，同一轮换料只做一次。 */
-    if (r->stg_cur == 19) {
+    /* ---- 辅助送料：根据打印机阶段精确控制 ----
+     *
+     * stg=8  （校准挤出）   → 换料后挤出机第一次拉料，做一次
+     * stg=19 （流量校准）   → 动态流量校准，再做一次
+     * stg=0  （打印中）     → 持续辅助，每 5s 一次（参考 Top-AMS 思路）
+     *
+     * 去重标志在 stg 离开目标阶段时重置（stg 从 8→19→0 正常流转，
+     * 每次进入新阶段重新允许触发） */
+
+    /* 重置标志：离开 stg=8 时重置 stg8 标志，离开 stg=19 时重置 stg19 标志 */
+    if (r->stg_cur != 8)  { s_assist_done_stg8  = false; }
+    if (r->stg_cur != 19) { s_assist_done_stg19 = false; }
+
+    bool assist_do = false;
+    if (config_get_assist_enabled()) {
         int cur_ch = config_get_filament_current();
         if (cur_ch > 0) {
             int mat = config_material_index_of(cur_ch);
-            if (mat >= 0 && !s_assist_done_for_this_exchange &&
-                config_get_assist_enabled()) {
-                uint8_t assist_pct = config_get_assist_speed_pct();
-                ams_log("辅助送料：通道%d @%u%%", cur_ch, (unsigned)assist_pct);
-                drive_channel_speed(mat, 1, assist_pct, AMS_LOAD_ASSIST_MS,
-                                     false, NULL);
-                s_assist_done_for_this_exchange = true;
+            if (mat >= 0) {
+                if (r->stg_cur == 8 && !s_assist_done_stg8) {
+                    assist_do = true;
+                    s_assist_done_stg8 = true;
+                    ams_log("辅助送料（校准挤出）：通道%d", cur_ch);
+                } else if (r->stg_cur == 19 && !s_assist_done_stg19) {
+                    assist_do = true;
+                    s_assist_done_stg19 = true;
+                    ams_log("辅助送料（流量校准）：通道%d", cur_ch);
+                } else if (r->stg_cur == 0) {
+                    /* 打印中持续辅助，每 ASSIST_REPEAT_US 做一次 */
+                    int64_t now = esp_timer_get_time();
+                    if (now - s_last_assist_time_us >= ASSIST_REPEAT_US) {
+                        assist_do = true;
+                        s_last_assist_time_us = now;
+                        ams_log("辅助送料（打印中）：通道%d", cur_ch);
+                    }
+                }
             }
         }
-    } else {
-        /* 不在流量校准阶段了，重置标志（下一轮换料重新做） */
-        s_assist_done_for_this_exchange = false;
+    }
+
+    if (assist_do) {
+        uint8_t assist_pct = config_get_assist_speed_pct();
+        drive_channel_speed(
+            config_material_index_of(config_get_filament_current()),
+            1, assist_pct, AMS_LOAD_ASSIST_MS, false, NULL);
     }
 
     /* ---- 换料请求 ---- */
@@ -981,19 +1012,36 @@ static void handle_report(const bambu_report_t *r)
         return;
     }
 
-    /* 默认：报文里的通道号（0 起，+1 转成 1 起） */
+    /* 打印机发来了换料请求，说明触发条件（mc_percent==101 或 ams_stage==1）成立
+     * 默认：报文里的通道号（0 起，+1 转成 1 起） */
     int printer_ch = r->filament_next + 1;
+
+    /* 打印触发原因（让用户知道是 M73 P101 还是 M400 U1 触发的） */
+    if (r->mc_percent == 101) {
+        ams_log("收到打印机指令：M73 P101 换料请求（通道 %d）", r->filament_next + 1);
+    } else if (r->ams_stage == 1) {
+        ams_log("收到打印机指令：M400 U1 等待 AMS 换料（通道 %d）", r->filament_next + 1);
+    } else {
+        ams_log("收到打印机指令：换料请求（通道 %d，触发原因未知）", r->filament_next + 1);
+    }
 
     /* ★ 自动颜色匹配：如果报文带目标颜色且本机配置了颜色，优先用匹配结果 */
     if (r->target_color >= 0) {
+        ams_log("  带目标颜色 0x%.6X，尝试自动匹配…", r->target_color & 0xFFFFFF);
         int matched = auto_match_channel(r->target_color);
         if (matched > 0) {
             printer_ch = matched;
+            ams_log("  匹配结果：通道 %d（已覆盖原始通道 %d）",
+                    printer_ch, r->filament_next + 1);
+        } else {
+            ams_log("  自动匹配失败，退回原始通道 %d", printer_ch);
         }
     }
 
     if (printer_ch < 1 || printer_ch > BOARD_CHANNEL_COUNT) {
         if (!s_change_active) {
+            ams_log("  动作：通道 %d 超出本机 1~%d，拒绝换料",
+                    printer_ch, BOARD_CHANNEL_COUNT);
             record_error("打印机请求通道 %d，超出本机支持的 1~%d",
                          printer_ch, BOARD_CHANNEL_COUNT);
             s_change_active = true;
@@ -1007,11 +1055,10 @@ static void handle_report(const bambu_report_t *r)
     }
     s_change_active = true;
 
-    ams_log("打印机请求换料到通道 %d", printer_ch);
-
+    ams_log("  动作：开始执行换料（目标通道 %d）", printer_ch);
     ams_cmd_t cmd = { .id = AMS_CMD_EXCHANGE, .channel = printer_ch };
     if (!ams_post_cmd(&cmd)) {
-        ams_log_err("换料命令排队失败（设备正忙），等打印机的下一次请求");
+        ams_log("  换料命令排队失败（设备正忙），等打印机的下一次请求");
         s_change_active = false;
     }
 }
@@ -1338,6 +1385,9 @@ esp_err_t ams_init(void)
     s_report_pending = false;
     s_exchange_attempts = 0;
     s_change_active = false;
+    s_assist_done_stg8 = false;
+    s_assist_done_stg19 = false;
+    s_last_assist_time_us = 0;
     s_state = AMS_STATE_IDLE;
     s_active_material = -1;
 
