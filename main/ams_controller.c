@@ -97,6 +97,8 @@ static int  s_exchange_attempts;
 static bool s_change_active;
 /* 流量校准阶段辅助送料去重：同一轮换料只做一次 */
 static bool s_assist_done_for_this_exchange;
+/* 上次看到的 stg_cur，用于避免每次上报都打印日志 */
+static int  s_last_seen_stg = -1;
 
 /* 状态灯 */
 static bool     s_led_on;
@@ -898,6 +900,16 @@ static int auto_match_channel(int target_color)
  */
 static void handle_report(const bambu_report_t *r)
 {
+    /* ★ 调试：每次收到上报都打印 stg_cur / is_printing / change_needed，
+     * 方便确认实际固件在流量校准阶段上报的 stg_cur 值是多少。
+     * 稳定后可删除或降为 warn 级别。 */
+    if (r->stg_cur != s_last_seen_stg || r->change_needed || r->is_printing) {
+        ams_log("上报 stg_cur=%d is_printing=%d change_needed=%d ams_stage=%d",
+                r->stg_cur, (int)r->is_printing, (int)r->change_needed,
+                r->ams_stage);
+        s_last_seen_stg = r->stg_cur;
+    }
+
     /* ---- 挤出机到位（MQTT 来源）---- */
     if (config_get()->extruder_src == EXTRUDER_SRC_MQTT &&
         r->extruder_inplace_hint == 1 &&
@@ -909,20 +921,20 @@ static void handle_report(const bambu_report_t *r)
      * 状态（那只在 do_retract 里通过 s_last_report 直接读取） */
 
     /* ---- 流量校准阶段：同步辅助送料 ----
-     * M620/M621 执行时打印机可能上报 stg_cur = 8（校准挤出）
-     * 或 19（校准挤出流量），部分固件用 24（载入打印材料）。
-     * 且 gcode_state == RUNNING（打印中），说明换料已完成、进入校准阶段。
+     * 放宽条件：stg_cur >= 8 即触发（覆盖不同固件的值），
+     * 不强制要求 is_printing（刚 resume 时可能还没变 RUNNING）。
      * 用 s_assist_done_for_this_exchange 去重，同一轮换料只做一次。 */
-    if ((r->stg_cur == 8 || r->stg_cur == 19 || r->stg_cur == 24) &&
-        r->is_printing) {
+    if (r->stg_cur >= 8) {
         int cur_ch = config_get_filament_current();
+        ams_log("stg_cur=%d is_printing=%d cur_ch=%d assist_enabled=%d assist_done=%d",
+                r->stg_cur, (int)r->is_printing, cur_ch,
+                (int)config_get_assist_enabled(), (int)s_assist_done_for_this_exchange);
         if (cur_ch > 0) {
             int mat = config_material_index_of(cur_ch);
             if (mat >= 0 && !s_assist_done_for_this_exchange &&
                 config_get_assist_enabled()) {
                 uint8_t assist_pct = config_get_assist_speed_pct();
-                ams_log("流量校准阶段 stg=%d，同步辅助送料：料盘位%d @%u%%",
-                        r->stg_cur, mat + 1, (unsigned)assist_pct);
+                ams_log("同步辅助送料：料盘位%d @%u%%", mat + 1, (unsigned)assist_pct);
                 drive_channel_speed(mat, 1, assist_pct, AMS_LOAD_ASSIST_MS,
                                      false, NULL);
                 s_assist_done_for_this_exchange = true;
@@ -930,9 +942,7 @@ static void handle_report(const bambu_report_t *r)
         }
     } else {
         /* 不在校准阶段了，重置标志（下一轮换料重新做） */
-        if (r->stg_cur != 8 && r->stg_cur != 19 && r->stg_cur != 24) {
-            s_assist_done_for_this_exchange = false;
-        }
+        s_assist_done_for_this_exchange = false;
     }
 
     /* ---- 换料请求 ---- */
