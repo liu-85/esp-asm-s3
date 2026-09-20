@@ -167,12 +167,27 @@
         <div class="card">
           <h2>打印机通道设置 <span class="sub">点色块改颜色</span></h2>
           <div id="access_info"></div>
-          <div class="row">
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:0 0 auto;font-size:13px" class="dim">当前通道</label>
+            <select id="cur_channel_sel" style="flex:1">
+              <option value="0">未知</option>
+              <option value="1">通道 1</option>
+              <option value="2">通道 2</option>
+              <option value="3">通道 3</option>
+              <option value="4">通道 4</option>
+            </select>
+          </div>
+          <div class="row" style="margin-top:10px">
             <button class="primary" style="flex:1" id="btn_access_save">保存通道与颜色</button>
+            <button class="ghost" style="flex:1" id="btn_cur_channel_save">保存当前通道</button>
           </div>
           <div class="tip">
             「打印机通道」要和切片软件里的 AMS 槽位编号对上。
             每个编号只能用一次 —— 两个料盘位指向同一个通道，换料时就不知道该动哪一路了。
+            <div class="hr"></div>
+            「当前通道」是打印机当前实际正在用的通道号。
+            切片文件开始打印时，AMS 会对比它和切片里第一个颜色需要的通道：
+            <b>一致 → 直接打印；不一致 → 自动执行换料任务</b>。
           </div>
         </div>
       </section>

@@ -451,64 +451,82 @@ static bool do_retract(int material_index)
         return true;
     }
 
-    /* ---- 路径 B：无微动（C3 默认）→ 蠕动 + 等 MQTT + 连续退料 ---- */
+    /* ---- 路径 B：无微动（C3 默认）→ 蠕动 + 等 MQTT 无料 + 连续退料 ----
+     *
+     * 配合 G-code 切刀段：打印机先切刀回冲刷区，再 M400 U1 通知 AMS。
+     *   ① 蠕动退料 N 次（把切断的料拉松）
+     *   ② 每轮等 5 秒 MQTT「无料」信号（hw_switch_state==0）：
+     *      - 收到 0 → 连续退料 → 进进料
+     *      - 没收到（仍是 1）→ 再蠕动一次，重复 ② 直到收到 0
+     */
     uint8_t creep_n   = config_get()->creep_times;
     uint16_t creep_ms = config_get()->creep_pulse_ms;
     uint8_t creep_pct = config_get()->creep_speed_pct;
+    uint16_t cont_ms  = config_get_retract_cont_ms();
 
-    /* ① 蠕动退料 N 次 */
-    ams_log("蠕动退料 %u 次 × %ums @%u%%", (unsigned)creep_n,
-            (unsigned)creep_ms, (unsigned)creep_pct);
+    /* ① 第一次蠕动退料 */
+    ams_log("蠕动退料 %u 次 × %ums @%u%%（初始）",
+            (unsigned)creep_n, (unsigned)creep_ms, (unsigned)creep_pct);
     for (uint32_t i = 0; i < creep_n; i++) {
         creep_retract_once(material_index, creep_ms, creep_pct);
     }
 
-    /* ② 等挤出机 MQTT 信号："没料"（hw_switch_state == 0） */
-    uint32_t wait_ms = config_get_retract_wait_ms();
-    ams_log("等待挤出机 MQTT 信号（最多 %ums）…", (unsigned)wait_ms);
+    /* ② 循环等 MQTT「无料」信号，每轮 5 秒，没收到就再蠕动一次 */
+    uint32_t probe_ms = 5000;
+    uint32_t probe_round = 0;
     bool got_signal = false;
 
     if (config_get()->extruder_src == EXTRUDER_SRC_MQTT) {
         uint32_t base_seq = extruder_inplace_seq();
-        int64_t deadline = esp_timer_get_time() + (int64_t)wait_ms * 1000;
-        while (esp_timer_get_time() < deadline) {
-            /* 安全读取最新报告的 hw_switch_state */
-            bool no_filament = false;
-            if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
-                if (s_last_report.extruder_inplace_hint == 0) {
-                    no_filament = true;
+        while (true) {
+            probe_round++;
+            int64_t deadline = esp_timer_get_time() + (int64_t)probe_ms * 1000;
+            ams_log("等待 MQTT 无料信号 第%u轮（%u秒）…",
+                    (unsigned)probe_round, (unsigned)(probe_ms / 1000));
+            while (esp_timer_get_time() < deadline) {
+                bool no_filament = false;
+                if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+                    if (s_last_report.extruder_inplace_hint == 0) {
+                        no_filament = true;
+                    }
+                    xSemaphoreGive(s_report_lock);
                 }
-                xSemaphoreGive(s_report_lock);
+                if (no_filament) {
+                    got_signal = true;
+                    ams_log("第%u轮收到「无料」信号", (unsigned)probe_round);
+                    break;
+                }
+                if (extruder_inplace_seq() != base_seq) {
+                    got_signal = true;
+                    ams_log("第%u轮检测到边沿变化（兜底）", (unsigned)probe_round);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
             }
-            if (no_filament) {
-                got_signal = true;
-                ams_log("收到挤出机「无料」MQTT 信号（hw_switch_state=0）");
-                break;
+            if (got_signal) break;
+            /* 本轮没等到，再蠕动一次 */
+            ams_log("第%u轮未收到无料信号，再蠕动退料一次…",
+                    (unsigned)probe_round);
+            for (uint32_t i = 0; i < creep_n; i++) {
+                creep_retract_once(material_index, creep_ms, creep_pct);
             }
-            /* 兜底：如果 MQTT 通知已把 extruder_inplace_seq 推上去了
-             * （旧通知残留），也算收到信号 */
-            if (extruder_inplace_seq() != base_seq) {
-                got_signal = true;
-                ams_log("检测到挤出机到位边沿变化（兜底）");
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
         }
+    } else {
+        /* GPIO 模式：保持原有行为 */
+        uint32_t wait_ms = config_get_retract_wait_ms();
+        ams_log("等待挤出机 GPIO 信号（最多 %ums）…", (unsigned)wait_ms);
+        vTaskDelay(pdMS_TO_TICKS(wait_ms));
     }
 
     /* ③ 连续退料：把余料收干净 */
-    uint16_t cont_ms = config_get_retract_cont_ms();
-    if (got_signal) {
-        ams_log("连续退料 %ums（MQTT 确认无料）", (unsigned)cont_ms);
-    } else {
-        ams_log("等 MQTT 超时，直接连续退料 %ums（兜底）", (unsigned)cont_ms);
-    }
+    ams_log("连续退料 %ums（%s）", (unsigned)cont_ms,
+            got_signal ? "MQTT 确认无料" : "兜底");
     bool ok = drive_channel(material_index, -1, cont_ms, false, NULL);
     if (!ok) {
         return false;
     }
     s_diag.retract_ok++;
-    ams_log("退料结束（%s）", got_signal ? "MQTT 确认" : "超时兜底");
+    ams_log("退料结束，开始进料");
     return true;
 }
 

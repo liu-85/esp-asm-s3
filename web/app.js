@@ -351,6 +351,12 @@
         } else if (!accessFromDevice) {
             renderAccess([1, 2, 3, 4], DEFAULT_COLORS, cur);
         }
+        /* 同步「当前通道」下拉框（只在用户没正在操作时更新） */
+        var curSel = $('cur_channel_sel');
+        if (curSel && document.activeElement !== curSel) {
+            var curVal = String(cur || 0);
+            if (curSel.value !== curVal) curSel.value = curVal;
+        }
 
         /* ---- 点动时长 ---- */
         if (typeof d.jog_ms === 'number' && d.jog_ms > 0) syncJogInput(d.jog_ms);
@@ -432,6 +438,14 @@
 
         post('/access_set', { access_list: list, color_list: colors }, function (d) {
             accessFromDevice = false;
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+            refresh();
+        });
+    }
+
+    function saveCurrentChannel() {
+        var ch = parseInt($('cur_channel_sel').value, 10) || 0;
+        post('/current_channel_set', { channel: ch }, function (d) {
             toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
             refresh();
         });
@@ -888,10 +902,31 @@
     var logPaused = false;
     var LOG_KEY = 'ams.logclosed';
 
+    /** 只保留与打印换色/当前动作相关的日志行 */
+    var LOG_KEYWORDS = [
+        '换料', '换色', '退料', '送料', '进料', '蠕动', '自吸',
+        '校准', '切刀', '通道', '料盘', '辅助', 'flush', 'M73',
+        'M620', 'M621', 'resume', 'retract', 'feed', 'exchange',
+        'error', '失败', '出错', '未通过'
+    ];
+
+    function isRelevantLine(line) {
+        var lower = line.toLowerCase();
+        for (var i = 0; i < LOG_KEYWORDS.length; i++) {
+            if (lower.indexOf(LOG_KEYWORDS[i].toLowerCase()) >= 0) return true;
+        }
+        return false;
+    }
+
     function renderLog(lines, memFree) {
         var box = $('log_lines');
+        /* 过滤：只显示相关的行 */
+        var filtered = [];
+        for (var k = 0; k < lines.length; k++) {
+            if (isRelevantLine(lines[k])) filtered.push(lines[k]);
+        }
         var text = '';
-        for (var i = 0; i < lines.length; i++) text += lines[i] + '\n';
+        for (var i = 0; i < filtered.length; i++) text += filtered[i] + '\n';
 
         $('log_mem').textContent = (typeof memFree === 'number' && memFree >= 0)
             ? ('空闲内存 ' + (memFree / 1024).toFixed(1) + ' KB') : '';
@@ -902,12 +937,12 @@
         /* 贴底时跟着滚，用户翻历史时不要抢 */
         var atBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 40;
         box.innerHTML = '';
-        for (var j = 0; j < lines.length; j++) {
+        for (var j = 0; j < filtered.length; j++) {
             var span = document.createElement('span');
-            var isErr = lines[j].indexOf('★') >= 0 || lines[j].indexOf('失败') >= 0 ||
-                        lines[j].indexOf('出错') >= 0 || lines[j].indexOf('未通过') >= 0;
+            var isErr = filtered[j].indexOf('★') >= 0 || filtered[j].indexOf('失败') >= 0 ||
+                        filtered[j].indexOf('出错') >= 0 || filtered[j].indexOf('未通过') >= 0;
             if (isErr) span.className = 'e';
-            span.textContent = lines[j] + '\n';
+            span.textContent = filtered[j] + '\n';
             box.appendChild(span);
         }
         if (atBottom) box.scrollTop = box.scrollHeight;
@@ -1025,6 +1060,7 @@
         $('btn_wifi_scan').onclick = rescanWifi;
         $('btn_mqtt_save').onclick = saveMqtt;
         $('btn_access_save').onclick = saveAccess;
+        $('btn_cur_channel_save').onclick = saveCurrentChannel;
         $('btn_jog_save').onclick = saveJog;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
