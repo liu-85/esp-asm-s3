@@ -17,6 +17,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 强制 stdout 使用 UTF-8（GitHub Actions Windows runner 默认 cp1252 无法输出中文）
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 HERE = Path(__file__).parent
 SCRIPT = HERE / "esp_ams_postprocess.py"
 DIST_DIR = HERE / "dist"
