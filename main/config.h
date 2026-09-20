@@ -42,7 +42,7 @@ extern "C" {
  * ========================================================================== */
 #define CONFIG_NAMESPACE       "ams"
 #define CONFIG_KEY             "cfg"
-#define CONFIG_VERSION         1u
+#define CONFIG_VERSION         2u
 #define CONFIG_MAGIC           0x414D5331u  /* "AMS1" */
 
 #define CONFIG_WIFI_MAX_PROFILES 3
@@ -76,6 +76,19 @@ extern "C" {
 #define CONFIG_CREEP_PULSE_MIN     100
 #define CONFIG_CREEP_PULSE_MAX     3000
 #define CONFIG_CREEP_SPEED_PCT_DEF 45    /* 蠕动速度（PWM 占空比百分比） */
+
+/* 辅助送料参数（换色时同步推料帮打印机咬住新料） */
+#define CONFIG_ASSIST_PCT_DEF      50   /* 辅助送料 PWM 占空比百分比 */
+#define CONFIG_ASSIST_PCT_MIN      5
+#define CONFIG_ASSIST_PCT_MAX      100
+
+/* 退料参数（C3 无微动降级模式） */
+#define CONFIG_RETRACT_WAIT_MS_DEF  5000  /* 蠕动退料后等待挤出机 MQTT 信号的最长时间 */
+#define CONFIG_RETRACT_WAIT_MIN     1000
+#define CONFIG_RETRACT_WAIT_MAX     15000
+#define CONFIG_RETRACT_CONT_MS_DEF  5000  /* 收到"没料"信号后连续退料时长 */
+#define CONFIG_RETRACT_CONT_MIN     1000
+#define CONFIG_RETRACT_CONT_MAX     15000
 
 /* ==========================================================================
  * 数据类型
@@ -124,6 +137,14 @@ typedef struct {
     uint16_t creep_pulse_ms;
     uint8_t  creep_speed_pct;
     uint8_t  extruder_src;                       /* config_extruder_src_t */
+
+    /* ---- 辅助送料（换色时同步推料帮打印机咬住新料） ---- */
+    uint8_t  assist_enabled;                     /* 0=关 1=开（默认开） */
+    uint8_t  assist_speed_pct;                   /* PWM 占空比百分比 */
+
+    /* ---- 退料参数（C3 无微动降级模式） ---- */
+    uint16_t retract_wait_ms;                    /* 蠕动退料后等 MQTT 信号的最长时间 */
+    uint16_t retract_cont_ms;                    /* 收到"没料"信号后连续退料时长 */
 
     /* ---- 微动安装情况：bit i = 1 表示料盘位 i+1 装了微动组 ---- */
     uint8_t  sensor_enabled_mask;
@@ -218,6 +239,20 @@ uint32_t config_color_match(uint32_t target_rgb, int *out_material);
 
 /** 把配置整理成一段人类可读的文本，打日志用 */
 int config_describe(char *buf, size_t buflen);
+
+/** 辅助送料 PWM 占空比百分比（已夹到安全区间） */
+uint8_t config_get_assist_speed_pct(void);
+void config_set_assist_speed_pct(uint8_t pct);
+
+/** 辅助送料开关（0=关 1=开） */
+uint8_t config_get_assist_enabled(void);
+void config_set_assist_enabled(uint8_t on);
+
+/** 退料参数获取/设置（已夹到安全区间） */
+uint16_t config_get_retract_wait_ms(void);
+uint16_t config_set_retract_wait_ms(int value);
+uint16_t config_get_retract_cont_ms(void);
+uint16_t config_set_retract_cont_ms(int value);
 
 #ifdef __cplusplus
 }

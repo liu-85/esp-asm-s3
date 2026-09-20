@@ -95,6 +95,8 @@ static volatile bool  s_report_pending;
 /* 换料请求去重 */
 static int  s_exchange_attempts;
 static bool s_change_active;
+/* 流量校准阶段辅助送料去重：同一轮换料只做一次 */
+static bool s_assist_done_for_this_exchange;
 
 /* 状态灯 */
 static bool     s_led_on;
@@ -264,6 +266,18 @@ static void led_update(void)
 static bool drive_channel(int material_index, int direction, uint32_t max_ms,
                           bool stop_on_sensor, bool *out_triggered)
 {
+    return drive_channel_speed(material_index, direction, 100, max_ms,
+                               stop_on_sensor, out_triggered);
+}
+
+/**
+ * 同 drive_channel，但指定电机速度（PWM 占空比百分比）。
+ * 用于辅助送料等需要非全速跑的场景。
+ */
+static bool drive_channel_speed(int material_index, int direction,
+                                uint8_t speed_pct, uint32_t max_ms,
+                                bool stop_on_sensor, bool *out_triggered)
+{
     if (out_triggered) {
         *out_triggered = false;
     }
@@ -305,7 +319,7 @@ static bool drive_channel(int material_index, int direction, uint32_t max_ms,
         /* ★ 关键：direction 是 int（±1），必须 cast 成 motor_dir_t。
          * 不 cast 的话 C 编译器可能把 -1 当 0（STOP）处理，
          * 退料方向就会丢，电机不转（之前 bug 的根因） */
-        motor_run((motor_dir_t)direction, max_ms);
+        motor_run_speed((motor_dir_t)direction, max_ms, speed_pct);
         motor_stop();
     }
 
@@ -385,34 +399,87 @@ static bool do_load(int material_index, bool wait_extruder)
     return true;
 }
 
-/** 退料：把料从挤出机/缓冲区收回到料盘 */
+/** 蠕动退料一次（短脉冲反向推一小段） */
+static void creep_retract_once(int material_index, uint16_t pulse_ms,
+                                uint8_t speed_pct)
+{
+    motor_run_speed((motor_dir_t)-1, pulse_ms, speed_pct);
+    vTaskDelay(pdMS_TO_TICKS(200));
+}
+
+/**
+ * 退料：把料从挤出机/缓冲区收回到料盘。
+ *
+ * ★ 重写版（C3 无微动降级模式）：
+ *   1. 蠕动退料 N 次（短脉冲反向推）
+ *   2. 等待挤出机 MQTT 信号：hw_switch_state 变为 0（"没料了"）
+ *   3. 收到"没料"信号 → 连续退料 retract_cont_ms（把余料收干净）
+ *   4. 超时没收到 → 直接连续退料 retract_cont_ms 兜底
+ *
+ * 有微动时仍走原有的"分步推、微动触发即停"路径。
+ */
 static bool do_retract(int material_index)
 {
     set_state(AMS_STATE_RETRACT, material_index);
     ams_log("开始退料：料盘位%d", material_index + 1);
 
-    uint32_t max_ms;
+    /* ---- 路径 A：有微动 → 分步推，微动触发即停 ---- */
     if (config_sensor_enabled(material_index) &&
         sensor_pin_present(material_index, SENSOR_STOP)) {
-        /* 有微动反馈：分步跑，每步查微动，触发即停 */
-        max_ms = (uint32_t)AMS_RETRACT_STEPS * AMS_FILAMENT_STEP_MS;
-    } else {
-        /* 无微动反馈：封顶用**退料专用**上限（比进料长），
-         * 料从挤出机收回到料盘通常 10~15s，6s 太短会"看起来没动" */
-        max_ms = AMS_NO_LIMIT_RETRACT_MS;
+        uint32_t max_ms = (uint32_t)AMS_RETRACT_STEPS * AMS_FILAMENT_STEP_MS;
+        bool triggered = false;
+        bool ok = drive_channel(material_index, -1, max_ms, true, &triggered);
+        if (!ok) {
+            return false;
+        }
+        s_diag.retract_ok++;
+        ams_log("退料结束（%s）", triggered ? "微动触发" : "到达时长上限");
+        return true;
     }
 
-    bool triggered = false;
-    /* 退料时也要查「停止送料微动」：料完全收回后机构会回到初始位置，
-     * 那只微动就会被压到 —— 用它当"退到底"的反馈 */
-    bool ok = drive_channel(material_index, -1, max_ms, true, &triggered);
+    /* ---- 路径 B：无微动（C3 默认）→ 蠕动 + 等 MQTT + 连续退料 ---- */
+    uint8_t creep_n   = config_get()->creep_times;
+    uint16_t creep_ms = config_get()->creep_pulse_ms;
+    uint8_t creep_pct = config_get()->creep_speed_pct;
+
+    /* ① 蠕动退料 N 次 */
+    ams_log("蠕动退料 %u 次 × %ums @%u%%", (unsigned)creep_n,
+            (unsigned)creep_ms, (unsigned)creep_pct);
+    for (uint32_t i = 0; i < creep_n; i++) {
+        creep_retract_once(material_index, creep_ms, creep_pct);
+    }
+
+    /* ② 等挤出机 MQTT 信号："没料"（hw_switch_state == 0） */
+    uint32_t wait_ms = config_get_retract_wait_ms();
+    ams_log("等待挤出机 MQTT 信号（最多 %ums）…", (unsigned)wait_ms);
+    uint32_t start_ms = esp_timer_get_time() / 1000;
+    bool got_signal = false;
+
+    if (config_get()->extruder_src == EXTRUDER_SRC_MQTT) {
+        while ((esp_timer_get_time() / 1000 - start_ms) < wait_ms) {
+            /* 检查是否有新的 MQTT 事件，hw_switch_state == 0 表示"没料" */
+            if (extruder_inplace_triggered() == false) {
+                got_signal = true;
+                ams_log("收到挤出机「无料」MQTT 信号");
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    /* ③ 连续退料：把余料收干净 */
+    uint16_t cont_ms = config_get_retract_cont_ms();
+    if (got_signal) {
+        ams_log("连续退料 %ums（MQTT 确认无料）", (unsigned)cont_ms);
+    } else {
+        ams_log("等 MQTT 超时，直接连续退料 %ums（兜底）", (unsigned)cont_ms);
+    }
+    bool ok = drive_channel(material_index, -1, cont_ms, false, NULL);
     if (!ok) {
         return false;
     }
     s_diag.retract_ok++;
-    ams_log("退料结束（%s，实际 %ums/%ums）",
-            triggered ? "微动触发" : "到达时长上限",
-            (unsigned)max_ms, (unsigned)max_ms);
+    ams_log("退料结束（%s）", got_signal ? "MQTT 确认" : "超时兜底");
     return true;
 }
 
@@ -637,6 +704,23 @@ static bool feed_until_extruder(int mat_new)
     return true;
 }
 
+/**
+ * 换料主流程（重写版）。
+ *
+ * 时序：
+ *   1. 探测当前料盘（有微动时）
+ *   2. 退料：先把当前通道的料从挤出机/缓冲区收回到料盘
+ *   3. 进料：把新通道的料送到挤出机入口，等到位后蠕动收尾
+ *   4. 辅助送料：帮打印机把新料咬住
+ *   5. 发 resume 让打印机继续 G-code（冲刷、流量校准等由打印机完成）
+ *
+ * ★ 关键改动（修复暂停后卡死问题）：
+ *   - 原来在暂停状态下发 M400/M83 是无效的（暂停中 G-code 排队不执行），
+ *     导致 wait_printer_progress 超时，整个流程卡住 ~50s 不发 resume。
+ *   - 现在改为：退料/进料全程不做打印机同步等待，只做 AMS 侧动作。
+ *     完成后发 resume，打印机自己继续执行 M73 P101 之后的冲刷 + 流量校准。
+ *   - 流量校准阶段（stg=19）如果 AMS 被再次唤醒，同步做一次辅助送料。
+ */
 static bool do_exchange(int printer_channel)
 {
     int mat_new = config_material_index_of(printer_channel);
@@ -657,27 +741,21 @@ static bool do_exchange(int printer_channel)
     ams_log("换料请求：当前 %s → 目标 %s", cur_txt, new_txt);
 
     if (current == printer_channel) {
-        ams_log("当前已经在该通道，无需换料");
+        ams_log("当前已经在该通道，无需换料，直接 resume");
         set_state(AMS_STATE_IDLE, -1);
+        /* 打印机在等 AMS 完成，即使不换也要 resume */
+        bambu_mqtt_send_resume();
         return true;
     }
 
-    int prev_stg = s_has_report ? s_last_report.stg_cur : -1;
-    int prev_gcode = s_has_report ? s_last_report.gcode_state : -1;
-
-    /* ---------- 通知打印机进入相对挤出模式 ---------- */
-    bambu_mqtt_send_gcode("M83");
-    wait_printer_progress(prev_stg, prev_gcode);
-
-    /* ---------- 步骤一：退料 ---------- */
+    /* ---------- 步骤一：退料 ----------
+     * 把当前通道的料从挤出机/缓冲区收回到料盘。
+     * 退料由 AMS 电机完成，不需要打印机侧配合（打印机暂停中
+     * G1 E-50 不会执行，发 M400 也没用）。 */
     if (current > 0) {
         int mat_cur = config_material_index_of(current);
         if (mat_cur >= 0) {
-            ams_log("开始退料");
-            /* 打印机自己先把喷嘴里的料退出来 */
-            bambu_mqtt_send_gcode("M400;\n G1 E-50 F200;");
-            wait_printer_progress(prev_stg, prev_gcode);
-            /* AMS 侧再把料从挤出机/缓冲区收回到料盘 */
+            ams_log("退料：料盘位%d（通道%d）", mat_cur + 1, current);
             if (!do_retract(mat_cur)) {
                 record_error("退料失败，换料中止");
                 s_diag.exchange_fail++;
@@ -687,19 +765,16 @@ static bool do_exchange(int printer_channel)
         }
     }
 
-    /* ---------- 步骤二：进料（绑定挤出机状态）----------
-     * 用户要求：进料/换料前先检查挤出机状态，没料时开始送料，
-     * 挤出机反馈到位后间隔 1 秒蠕动送料 5 次。 */
-    ams_log("开始进料（先检查挤出机状态）");
+    /* ---------- 步骤二：进料 + 蠕动 ----------
+     * 把新通道的料送到挤出机入口，等到位后蠕动 5 次确保咬住。
+     * 挤出机到位信号：C3 走 MQTT hw_switch_state，S3 走 GPIO。 */
+    ams_log("进料：料盘位%d（通道%d）", mat_new + 1, printer_channel);
 
-    /* ① 检查挤出机当前状态（GPIO 电平 / 上一次 MQTT 事件） */
-    extruder_inplace_clear();   /* 清掉上一轮残留，避免误判"已到位" */
+    extruder_inplace_clear();
     bool extr_has_fil = extruder_inplace_triggered();
     ams_log("挤出机状态：%s", extr_has_fil ? "已有料（到位）" : "无料（需先送料）");
 
-    /* ② 无料 → 先正常送料，把料推到挤出机入口 */
     if (!extr_has_fil) {
-        ams_log("挤出机无料，先送料…");
         if (!do_load(mat_new, false)) {
             record_error("进料失败，换料中止");
             s_diag.exchange_fail++;
@@ -708,24 +783,32 @@ static bool do_exchange(int printer_channel)
         }
     }
 
-    /* ③ 等挤出机到位（MQTT 事件会推进 s_extruder_seq） */
+    /* 等挤出机到位 → 蠕动收尾 */
     if (!feed_until_extruder(mat_new)) {
-        ams_log_warn("换料后未等到挤出机到位，请手动确认料是否咬住");
+        ams_log_warn("换料后未等到挤出机到位，料可能没咬住，仍然尝试 resume");
     }
 
-    /* ---------- 步骤三：打印机拉料，AMS 辅助送料 ---------- */
-    set_state(AMS_STATE_ASSIST, mat_new);
-    bambu_mqtt_send_gcode("M400;\n G1 E50 F200;");
-    wait_printer_progress(prev_stg, prev_gcode);
+    /* ---------- 步骤三：辅助送料（可配置 PWM + 开关） ----------
+     * 帮打印机把新料咬住（AMS 侧多推一小段）。
+     * 这一步在 AMS 侧完成，不需要打印机配合。
+     * PWM 占空比和开关均可在网页「硬件调试」面板配置。 */
+    if (config_get_assist_enabled()) {
+        uint8_t assist_pct = config_get_assist_speed_pct();
+        ams_log("辅助送料：料盘位%d @%u%%", mat_new + 1, (unsigned)assist_pct);
+        drive_channel_speed(mat_new, 1, assist_pct, AMS_LOAD_ASSIST_MS, false, NULL);
+    } else {
+        ams_log("辅助送料已关闭，跳过");
+    }
 
-    /* 辅助推料一小段（不需要微动反馈 —— 这一段只是帮打印机把料咬住） */
-    drive_channel(mat_new, 1, AMS_LOAD_ASSIST_MS, false, NULL);
-
-    /* ---------- 步骤四：记录状态 ---------- */
+    /* ---------- 步骤四：记录状态 + resume ---------- */
     config_set_filament_current(printer_channel);
     s_diag.exchange_ok++;
-    ams_log("换料成功：%s", new_txt);
+    ams_log("换料完成：%s，发送 resume 让打印机继续", new_txt);
     set_state(AMS_STATE_IDLE, -1);
+
+    /* resume 让打印机的 G-code 从 M73 P101 之后继续执行：
+     * 冲刷（M73 P102/P103）→ 流量校准（M620/M621）→ 恢复打印 */
+    bambu_mqtt_send_resume();
     return true;
 }
 
@@ -785,9 +868,11 @@ static int auto_match_channel(int target_color)
 /**
  * 处理一条打印机上报（在 ams_task 里调用，可以阻塞，几秒无所谓）。
  *
- * 两件事：
+ * 三件事：
  *   1. 如果报文带目标颜色，用自动匹配覆盖默认的通道号
  *   2. 如果打印机请求换料，把换料命令排进队列（带去重，一秒只排一次）
+ *   3. 如果打印机进入流量校准阶段（stg=8 或 19）且处于打印中，
+ *      同步做一次辅助送料，帮打印机把新料咬住
  */
 static void handle_report(const bambu_report_t *r)
 {
@@ -797,6 +882,33 @@ static void handle_report(const bambu_report_t *r)
         !extruder_inplace_triggered()) {
         ams_log("打印机上报耗材已到挤出机");
         extruder_inplace_notify_from_mqtt();
+    }
+
+    /* ---- 流量校准阶段：同步辅助送料 ----
+     * 新 G-code 中 M620 S[next]A → T[next] → M621 S[next]A 是流量校准。
+     * 打印机执行 E 挤出时，AMS 需要同步推一小段料辅助咬合。
+     * 检测方式：stg_cur == 8（校准挤出）或 19（校准挤出流量），
+     * 且 gcode_state == 2（打印中），说明换料已完成、进入校准阶段。
+     * 用 s_assist_done_for_this_exchange 去重，同一轮换料只做一次。 */
+    if ((r->stg_cur == 8 || r->stg_cur == 19) && r->is_printing) {
+        int cur_ch = config_get_filament_current();
+        if (cur_ch > 0) {
+            int mat = config_material_index_of(cur_ch);
+            if (mat >= 0 && !s_assist_done_for_this_exchange &&
+                config_get_assist_enabled()) {
+                uint8_t assist_pct = config_get_assist_speed_pct();
+                ams_log("流量校准阶段 stg=%d，同步辅助送料：料盘位%d @%u%%",
+                        r->stg_cur, mat + 1, (unsigned)assist_pct);
+                drive_channel_speed(mat, 1, assist_pct, AMS_LOAD_ASSIST_MS,
+                                     false, NULL);
+                s_assist_done_for_this_exchange = true;
+            }
+        }
+    } else {
+        /* 不在校准阶段了，重置标志（下一轮换料重新做） */
+        if (r->stg_cur != 8 && r->stg_cur != 19) {
+            s_assist_done_for_this_exchange = false;
+        }
     }
 
     /* ---- 换料请求 ---- */
@@ -943,8 +1055,7 @@ static void execute_cmd(const ams_cmd_t *cmd)
         if (do_exchange(cmd->channel)) {
             s_exchange_attempts = 0;
             s_change_active = false;
-            /* 换料成功后通知打印机继续打印 */
-            bambu_mqtt_send_resume();
+            /* do_exchange 内部已发 resume，这里不重复发 */
         } else {
             s_exchange_attempts++;
             if (s_exchange_attempts >= AMS_EXCHANGE_MAX_RETRY) {
@@ -953,6 +1064,8 @@ static void execute_cmd(const ams_cmd_t *cmd)
                             s_exchange_attempts);
                 set_state(AMS_STATE_ERROR, -1);
                 s_change_active = true;   /* 不再重试 */
+                /* 即使失败也发 resume，别让打印机一直卡在暂停 */
+                bambu_mqtt_send_resume();
             } else {
                 ams_log_warn("换料失败（第 %d 次），等打印机的下一次请求再试",
                              s_exchange_attempts);

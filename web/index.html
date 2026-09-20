@@ -201,6 +201,52 @@
             填超范围会被自动夹到 0.2 ~ 60 秒。
           </div>
         </div>
+
+        <div class="card">
+          <h2>辅助送料 <span class="sub">换色/流量校准时同步推料</span></h2>
+          <div class="row" style="align-items:center">
+            <label style="flex:1 1 auto;display:flex;align-items:center;gap:8px;font-size:14px">
+              <input type="checkbox" id="assist_enabled" style="width:20px;height:20px;accent-color:#2f6fed">
+              <span>辅助送料已启用</span>
+            </label>
+            <button class="ghost" id="btn_assist_toggle" style="flex:0 0 auto">切换开关</button>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">PWM 速度（%）
+              <input type="number" id="assist_speed" min="5" max="100" step="5" style="width:80px">
+            </label>
+            <button class="primary" style="flex:1" id="btn_assist_save">保存 PWM</button>
+          </div>
+          <div class="tip">
+            换色/流量校准（M620/M621）时，AMS 同步以该 PWM 推料，帮助打印机齿轮咬住新料。
+            <div class="hr"></div>
+            默认 <b>50%</b>，范围 5%~100%。关闭后换色时不再同步辅助送料。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>退料参数 <span class="sub">C3 降级模式（蠕动退料 + MQTT等待 + 连续退料）</span></h2>
+          <div class="row" style="align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">等待MQTT（ms）
+              <input type="number" id="retract_wait_ms" min="1000" max="15000" step="500" style="width:100px">
+            </label>
+            <label style="flex:1 1 140px;font-size:13px" class="dim">连续退料（ms）
+              <input type="number" id="retract_cont_ms" min="1000" max="15000" step="500" style="width:100px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" style="flex:1" id="btn_retract_save">保存退料参数</button>
+          </div>
+          <div class="tip">
+            <b>蠕动退料后等待MQTT</b>：电机以蠕动方式反向退料，过程中持续监听挤出机 MQTT 信号
+            （hw_switch_state），收到"没料"后自动执行连续退料。
+            <div class="hr"></div>
+            <b>连续退料时长</b>：收到没料信号后，电机连续退料的时长（默认 5000ms），
+            用于把旧料完全挤出，再开始送入新通道耗材。
+            <div class="hr"></div>
+            两个参数范围均为 1000~15000ms。
+          </div>
+        </div>
       </section>
 
       <!-- ============ 7. 微动与自吸（本次新增） ============ -->

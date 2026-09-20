@@ -385,7 +385,7 @@ static esp_err_t h_status(httpd_req_t *req)
         cJSON_AddItemToArray(cl, cJSON_CreateNumber((double)cfg->color_list[i]));
     }
 
-    /* ---- 自吸参数（本次新增，网页上可改） ---- */
+    /* ---- 自吸参数（网页可改） ---- */
     cJSON *creep = cJSON_AddObjectToObject(o, "creep");
     cJSON_AddNumberToObject(creep, "times", cfg->creep_times);
     cJSON_AddNumberToObject(creep, "pulse_ms", cfg->creep_pulse_ms);
@@ -394,6 +394,16 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddBoolToObject(o, "extruder_pin_used",
                           BOARD_PIN_EXTRUDER_INPLACE >= 0 &&
                           !BOARD_EXTRUDER_INPLACE_UNUSED);
+
+    /* ---- 辅助送料参数（本次新增） ---- */
+    cJSON *assist = cJSON_AddObjectToObject(o, "assist");
+    cJSON_AddBoolToObject(assist, "enabled", cfg->assist_enabled != 0);
+    cJSON_AddNumberToObject(assist, "speed_pct", cfg->assist_speed_pct);
+
+    /* ---- 退料参数（本次新增） ---- */
+    cJSON *retract = cJSON_AddObjectToObject(o, "retract");
+    cJSON_AddNumberToObject(retract, "wait_ms", cfg->retract_wait_ms);
+    cJSON_AddNumberToObject(retract, "cont_ms", cfg->retract_cont_ms);
 
     /* ---- 运行环境 ---- */
     cJSON_AddNumberToObject(o, "mem_free", (double)esp_get_free_heap_size());
@@ -1015,6 +1025,62 @@ static esp_err_t h_extruder_src_set(httpd_req_t *req)
     return reply_ok(req, true, info);
 }
 
+/** POST /assist_set  body: {"enabled":0/1, "speed_pct":50} */
+static esp_err_t h_assist_set(httpd_req_t *req)
+{
+    cJSON *b = read_body_json(req);
+    int enabled = json_int(b, "enabled", -1);
+    int pct     = json_int(b, "speed_pct", -1);
+    cJSON_Delete(b);
+
+    if (enabled < 0 && pct < 0) {
+        return reply_ok(req, false, "缺少参数");
+    }
+
+    if (enabled >= 0) {
+        config_set_assist_enabled(enabled ? 1 : 0);
+    }
+    if (pct >= 0) {
+        config_set_assist_speed_pct((uint8_t)pct);
+    }
+
+    ams_log("辅助送料已更新：enabled=%d, pct=%u%%",
+            config_get_assist_enabled(),
+            (unsigned)config_get_assist_speed_pct());
+    return reply_ok(req, true,
+                    "辅助送料参数已保存（可在「状态」面板确认生效值）");
+}
+
+/** POST /retract_set  body: {"wait_ms":5000, "cont_ms":5000} */
+static esp_err_t h_retract_set(httpd_req_t *req)
+{
+    cJSON *b = read_body_json(req);
+    int wait_ms = json_int(b, "wait_ms", -1);
+    int cont_ms = json_int(b, "cont_ms", -1);
+    cJSON_Delete(b);
+
+    if (wait_ms < 0 && cont_ms < 0) {
+        return reply_ok(req, false, "缺少参数");
+    }
+
+    uint16_t got_wait = config_get_retract_wait_ms();
+    uint16_t got_cont = config_get_retract_cont_ms();
+
+    if (wait_ms >= 0) {
+        got_wait = config_set_retract_wait_ms(wait_ms);
+    }
+    if (cont_ms >= 0) {
+        got_cont = config_set_retract_cont_ms(cont_ms);
+    }
+
+    char info[128];
+    snprintf(info, sizeof(info),
+             "退料参数已保存：等MQTT %ums + 连续退料 %ums",
+             (unsigned)got_wait, (unsigned)got_cont);
+    ams_log("%s", info);
+    return reply_ok(req, true, info);
+}
+
 /* ==========================================================================
  * 十一、配置热点 / 启动计数
  * ========================================================================== */
@@ -1280,6 +1346,8 @@ DEF_COUNTED(h_sensor_set)
 DEF_COUNTED(h_autoload)
 DEF_COUNTED(h_creep_set)
 DEF_COUNTED(h_extruder_src_set)
+DEF_COUNTED(h_assist_set)
+DEF_COUNTED(h_retract_set)
 DEF_COUNTED(h_ota_upload)
 
 esp_err_t web_server_start(void)
@@ -1306,7 +1374,7 @@ esp_err_t web_server_start(void)
 
     httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
     conf.server_port = WEB_SERVER_PORT;
-    conf.max_uri_handlers = 24;
+    conf.max_uri_handlers = 26;
     conf.lru_purge_enable = true;
     /* ★ 栈要够用：/wifi_scan 最坏要阻塞 2~3 秒、OTA 那个 handler 还要在栈上
      *   做临时拼接。（/wifi_connect 现在**不再**在 httpd 任务里等 20 秒了：
@@ -1356,6 +1424,10 @@ esp_err_t web_server_start(void)
         { .uri = "/autoload",         .method = HTTP_POST, .handler = h_autoload_counted },
         { .uri = "/creep_set",        .method = HTTP_POST, .handler = h_creep_set_counted },
         { .uri = "/extruder_src_set", .method = HTTP_POST, .handler = h_extruder_src_set_counted },
+
+        /* ---- 辅助送料 / 退料参数（本次新增） ---- */
+        { .uri = "/assist_set",       .method = HTTP_POST, .handler = h_assist_set_counted },
+        { .uri = "/retract_set",      .method = HTTP_POST, .handler = h_retract_set_counted },
 
         /* ---- 升级 ---- */
         { .uri = "/ota_upload", .method = HTTP_POST, .handler = h_ota_upload_counted },

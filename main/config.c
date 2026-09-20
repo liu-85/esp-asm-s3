@@ -84,6 +84,14 @@ static void config_load_defaults(ams_config_t *c)
     c->extruder_src    = EXTRUDER_SRC_GPIO;
 #endif
 
+    /* ---- 辅助送料参数 ---- */
+    c->assist_enabled   = 1;   /* 默认开启 */
+    c->assist_speed_pct = CONFIG_ASSIST_PCT_DEF;
+
+    /* ---- 退料参数（C3 无微动降级模式） ---- */
+    c->retract_wait_ms  = CONFIG_RETRACT_WAIT_MS_DEF;
+    c->retract_cont_ms  = CONFIG_RETRACT_CONT_MS_DEF;
+
     /* ★ 微动默认**全部视为未安装**，程序走降级模式（按时间推进送料）。
      *   原因：没接微动却以为接了，程序会一直等一个永远不来的信号 —— 表现为
      *   "推料推不动、每步都超时"，比按时间推进更难排查。
@@ -159,6 +167,20 @@ esp_err_t config_init(void)
     }
     if (s_cfg.creep_speed_pct == 0 || s_cfg.creep_speed_pct > 100) {
         s_cfg.creep_speed_pct = CONFIG_CREEP_SPEED_PCT_DEF;
+    }
+    /* 辅助送料参数校验 */
+    if (s_cfg.assist_speed_pct < CONFIG_ASSIST_PCT_MIN ||
+        s_cfg.assist_speed_pct > CONFIG_ASSIST_PCT_MAX) {
+        s_cfg.assist_speed_pct = CONFIG_ASSIST_PCT_DEF;
+    }
+    /* 退料参数校验 */
+    if (s_cfg.retract_wait_ms < CONFIG_RETRACT_WAIT_MIN ||
+        s_cfg.retract_wait_ms > CONFIG_RETRACT_WAIT_MAX) {
+        s_cfg.retract_wait_ms = CONFIG_RETRACT_WAIT_MS_DEF;
+    }
+    if (s_cfg.retract_cont_ms < CONFIG_RETRACT_CONT_MIN ||
+        s_cfg.retract_cont_ms > CONFIG_RETRACT_CONT_MAX) {
+        s_cfg.retract_cont_ms = CONFIG_RETRACT_CONT_MS_DEF;
     }
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         if (s_cfg.access_list[i] == 0 ||
@@ -555,6 +577,67 @@ int config_describe(char *buf, size_t buflen)
           config_sensor_enabled(i) ? "已装" : "未装",
           i + 1 < BOARD_CHANNEL_COUNT ? "  " : "\n");
     }
+    P("辅助送料 : %s @%u%%\n",
+      s_cfg.assist_enabled ? "开启" : "关闭",
+      (unsigned)s_cfg.assist_speed_pct);
+    P("退料参数 : 等MQTT %ums + 连续退料 %ums\n",
+      (unsigned)s_cfg.retract_wait_ms, (unsigned)s_cfg.retract_cont_ms);
 #undef P
     return off;
+}
+
+/* ==========================================================================
+ * 辅助送料 / 退料参数访问器
+ * ========================================================================== */
+
+uint8_t config_get_assist_speed_pct(void)
+{
+    return s_cfg.assist_speed_pct;
+}
+
+void config_set_assist_speed_pct(uint8_t pct)
+{
+    if (pct < CONFIG_ASSIST_PCT_MIN) pct = CONFIG_ASSIST_PCT_MIN;
+    if (pct > CONFIG_ASSIST_PCT_MAX) pct = CONFIG_ASSIST_PCT_MAX;
+    s_cfg.assist_speed_pct = pct;
+    config_save();
+}
+
+uint8_t config_get_assist_enabled(void)
+{
+    return s_cfg.assist_enabled;
+}
+
+void config_set_assist_enabled(uint8_t on)
+{
+    s_cfg.assist_enabled = on ? 1 : 0;
+    config_save();
+}
+
+uint16_t config_get_retract_wait_ms(void)
+{
+    return s_cfg.retract_wait_ms;
+}
+
+uint16_t config_set_retract_wait_ms(int value)
+{
+    if (value < CONFIG_RETRACT_WAIT_MIN) value = CONFIG_RETRACT_WAIT_MIN;
+    if (value > CONFIG_RETRACT_WAIT_MAX) value = CONFIG_RETRACT_WAIT_MAX;
+    s_cfg.retract_wait_ms = (uint16_t)value;
+    config_save();
+    return s_cfg.retract_wait_ms;
+}
+
+uint16_t config_get_retract_cont_ms(void)
+{
+    return s_cfg.retract_cont_ms;
+}
+
+uint16_t config_set_retract_cont_ms(int value)
+{
+    if (value < CONFIG_RETRACT_CONT_MIN) value = CONFIG_RETRACT_CONT_MIN;
+    if (value > CONFIG_RETRACT_CONT_MAX) value = CONFIG_RETRACT_CONT_MAX;
+    s_cfg.retract_cont_ms = (uint16_t)value;
+    config_save();
+    return s_cfg.retract_cont_ms;
 }

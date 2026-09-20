@@ -358,6 +358,12 @@
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
 
+        /* ---- 辅助送料 ---- */
+        updateAssist(d.assist);
+
+        /* ---- 退料参数 ---- */
+        updateRetract(d.retract);
+
         /* ---- 微动与自吸 ---- */
         updateSensors(d);
 
@@ -768,6 +774,75 @@
     }
 
     /* =======================================================================
+       辅助送料
+       ======================================================================= */
+    function updateAssist(a) {
+        a = a || {};
+        var elCk = $('assist_enabled');
+        var elSpd = $('assist_speed');
+        if (!elCk || !elSpd) return;
+        elCk.checked = !!a.enabled;
+        if (typeof a.speed_pct === 'number' && document.activeElement !== elSpd) {
+            if (String(a.speed_pct) !== elSpd.value) elSpd.value = a.speed_pct;
+        }
+    }
+
+    function toggleAssist() {
+        var el = $('assist_enabled');
+        var on = el.checked;
+        post('/assist_set', { enabled: on ? 0 : 1 }, function (d) {
+            el.checked = !on;
+            toast((d && d.info) || '已切换', (d && d.ok) ? 'ok' : 'bad');
+            refresh();
+        });
+    }
+
+    function saveAssistPct() {
+        var v = parseInt(val('assist_speed'), 10);
+        if (isNaN(v) || v < 5 || v > 100) {
+            toast('PWM 速度请在 5~100 之间', 'bad');
+            return;
+        }
+        post('/assist_set', { speed_pct: v }, function (d) {
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+            refresh();
+        });
+    }
+
+    /* =======================================================================
+       退料参数
+       ======================================================================= */
+    function updateRetract(r) {
+        r = r || {};
+        var elW = $('retract_wait_ms');
+        var elC = $('retract_cont_ms');
+        if (!elW || !elC) return;
+        if (typeof r.wait_ms === 'number' && document.activeElement !== elW) {
+            if (String(r.wait_ms) !== elW.value) elW.value = r.wait_ms;
+        }
+        if (typeof r.cont_ms === 'number' && document.activeElement !== elC) {
+            if (String(r.cont_ms) !== elC.value) elC.value = r.cont_ms;
+        }
+    }
+
+    function saveRetract() {
+        var w = parseInt(val('retract_wait_ms') || '5000', 10);
+        var c = parseInt(val('retract_cont_ms') || '5000', 10);
+        if (isNaN(w) || w < 1000 || w > 15000) {
+            toast('等待 MQTT 时长请在 1000~15000ms 之间', 'bad');
+            return;
+        }
+        if (isNaN(c) || c < 1000 || c > 15000) {
+            toast('连续退料时长请在 1000~15000ms 之间', 'bad');
+            return;
+        }
+        post('/retract_set', { wait_ms: w, cont_ms: c }, function (d) {
+            toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
+            refresh();
+        });
+    }
+
+    /* =======================================================================
        热点 / 停止 / 计数
        ======================================================================= */
     function toggleAp() {
@@ -934,6 +1009,8 @@
            接口慢的时候整页也不会停在"加载中…"。 */
         renderAccess([1, 2, 3, 4], DEFAULT_COLORS, 0);
         updateHardware({ channels: [1, 2, 3, 4], engaged: [], limits: [], motor_direction: 0, conflicts: 0 });
+        updateAssist({ enabled: 1, speed_pct: 50 });
+        updateRetract({ wait_ms: 5000, cont_ms: 5000 });
         updateSensors({ sensors: { enabled: 15, extruder: 0, ch: [] } });
 
         if (store(LOG_KEY) === '1') {
@@ -950,6 +1027,9 @@
         $('btn_access_save').onclick = saveAccess;
         $('btn_jog_save').onclick = saveJog;
         $('btn_creep_save').onclick = saveCreep;
+        $('btn_assist_toggle').onclick = toggleAssist;
+        $('btn_assist_save').onclick = saveAssistPct;
+        $('btn_retract_save').onclick = saveRetract;
         $('btn_src_toggle').onclick = toggleExtruderSrc;
         $('btn_ota_upload').onclick = otaUpload;
         $('btn_bootclear').onclick = resetBootCount;
