@@ -164,7 +164,6 @@
     var accessFromDevice = false;
     var lastAccessSig = '';
     var jogMs = 1000;
-    var logText = null;
 
     function dot(el, on) { el.className = 'dot' + (on ? ' on' : ''); }
 
@@ -369,6 +368,9 @@
 
         /* ---- 退料参数 ---- */
         updateRetract(d.retract);
+
+        /* ---- 换料温度 ---- */
+        updateTemper(d.temper);
 
         /* ---- 微动与自吸 ---- */
         updateSensors(d);
@@ -857,6 +859,70 @@
     }
 
     /* =======================================================================
+       换料温度
+       ======================================================================= */
+    var TEMPER_MIN = 150, TEMPER_MAX = 300;
+    /* 界面上只有 4 个输入框，但板子可能有 2 通道（C3）—— 多余的框要藏起来，
+     * 不然用户填了却根本不生效，比没有更糟。 */
+    var TEMPER_UI_MAX = 4;
+
+    function updateTemper(arr) {
+        if (!arr || !arr.length) return;
+        for (var i = 0; i < TEMPER_UI_MAX; i++) {
+            var el = $('temper_' + (i + 1));
+            if (!el) continue;
+            var lab = el.parentNode;
+            if (i >= arr.length) {
+                el.disabled = true;
+                if (lab) lab.style.display = 'none';
+                continue;
+            }
+            if (document.activeElement !== el &&
+                typeof arr[i] === 'number' && String(arr[i]) !== el.value) {
+                el.value = arr[i];
+            }
+        }
+    }
+
+    function saveTemper() {
+        /* 逐个提交：后端每次只收一个通道，4 次请求互不覆盖 ——
+         * 如果一次性把 4 个值打包送过去，任何一处格式错都会整批失败。 */
+        var todo = [];
+        for (var i = 0; i < TEMPER_UI_MAX; i++) {
+            var el = $('temper_' + (i + 1));
+            if (!el || el.disabled) continue;
+            var lab = el.parentNode;
+            if (lab && lab.style.display === 'none') continue;
+            var v = parseInt(el.value, 10);
+            if (isNaN(v) || v < TEMPER_MIN || v > TEMPER_MAX) {
+                toast('料盘位' + (i + 1) + ' 的温度请在 ' +
+                      TEMPER_MIN + '~' + TEMPER_MAX + '℃ 之间', 'bad');
+                return;
+            }
+            todo.push({ channel: i + 1, temper: v });
+        }
+        if (!todo.length) {
+            toast('没有可提交的料盘位', 'bad');
+            return;
+        }
+
+        var k = 0, info = '';
+        (function next() {
+            if (k >= todo.length) {
+                toast(info || '换料温度已保存', 'ok');
+                refresh();
+                return;
+            }
+            var it = todo[k++];
+            post('/temper_set', it, function (d) {
+                if (d && d.ok) { info = d.info || info; }
+                else { toast((d && d.info) || '保存失败', 'bad'); return; }
+                next();
+            });
+        })();
+    }
+
+    /* =======================================================================
        热点 / 停止 / 计数
        ======================================================================= */
     function toggleAp() {
@@ -902,57 +968,86 @@
     var logPaused = false;
     var LOG_KEY = 'ams.logclosed';
 
-    /** 只保留与打印换色/当前动作相关的日志行 */
-    var LOG_KEYWORDS = [
-        '换色', '换料', '退料', '送料', '进料', '蠕动', '自吸',
-        '校准', '切刀', '通道', '料盘', '辅助', 'flush',
-        '等待卸载', '卸载完成', '料线到达', '开始装载', '无需更换',
-        'error', '失败', '出错', '未通过', '★'
-    ];
+    /* ★ 以前这里有一份 LOG_KEYWORDS 白名单，只有命中的行才显示。
+     *   它把最该看的「阶段：载入打印材料」那行挡掉了 —— 白名单里没有
+     *   "阶段"，于是日志只剩下零散的动作行，看着就是一锅乱粥，
+     *   而且卡住的那一步恰好被藏起来，根本没法排查。
+     *   设备端本来就只留 48 行，全显示完全放得下，不再过滤。 */
 
-    function isRelevantLine(line) {
-        var lower = line.toLowerCase();
-        for (var i = 0; i < LOG_KEYWORDS.length; i++) {
-            if (lower.indexOf(LOG_KEYWORDS[i].toLowerCase()) >= 0) return true;
-        }
-        return false;
-    }
+    /* 已经渲染到设备端的第几行。-1 = 还没渲染过。
+     * 靠它做"只追加新行"，不再用整串文本比对 —— 整串比对在环形缓冲
+     * 滚动时必然判定成"全变了"，只能整屏重建，那就是闪烁和丢行的来源。 */
+    var logLastSeq = -1;
 
-    function renderLog(lines, memFree) {
+    /* 只在「设备端没给 seq」的退化路径上用（整串比对，老行为）。
+     * 本来定义在文件上半部分，和它的用处隔着几百行，挪过来。 */
+    var logText = null;
+
+    function renderLog(lines, seqs, memFree) {
         var box = $('log_lines');
-        /* 过滤：只显示相关的行 */
-        var filtered = [];
-        for (var k = 0; k < lines.length; k++) {
-            if (isRelevantLine(lines[k])) filtered.push(lines[k]);
-        }
-        var text = '';
-        for (var i = 0; i < filtered.length; i++) text += filtered[i] + '\n';
 
         $('log_mem').textContent = (typeof memFree === 'number' && memFree >= 0)
             ? ('空闲内存 ' + (memFree / 1024).toFixed(1) + ' KB') : '';
 
-        if (text === logText) return;
-        logText = text;
-
-        /* 贴底时跟着滚，用户翻历史时不要抢 */
         var atBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 40;
-        box.innerHTML = '';
-        for (var j = 0; j < filtered.length; j++) {
-            var span = document.createElement('span');
-            var isErr = filtered[j].indexOf('★') >= 0 || filtered[j].indexOf('失败') >= 0 ||
-                        filtered[j].indexOf('出错') >= 0 || filtered[j].indexOf('未通过') >= 0;
-            if (isErr) span.className = 'e';
-            span.textContent = filtered[j] + '\n';
-            box.appendChild(span);
+
+        /* seq 缺失（旧固件）或长度对不上 → 退回整屏重建的老行为。
+         * 会闪，但至少不会重复堆积。 */
+        var hasSeq = !!(seqs && seqs.length === lines.length);
+        if (!hasSeq) {
+            var text = lines.join('\n');
+            if (text === logText) return;
+            logText = text;
+            box.innerHTML = '';
+            for (var j = 0; j < lines.length; j++) {
+                box.appendChild(makeLogLine(lines[j]));
+            }
+            if (atBottom) box.scrollTop = box.scrollHeight;
+            return;
         }
-        if (atBottom) box.scrollTop = box.scrollHeight;
+
+        /* 设备端缓冲被清空、或设备重启导致行号倒退 → 从头来 */
+        if (logLastSeq >= 0 && seqs.length &&
+            seqs[seqs.length - 1] < logLastSeq) {
+            box.innerHTML = '';
+            logLastSeq = -1;
+        }
+
+        var appended = 0;
+        for (var i = 0; i < lines.length; i++) {
+            var s = seqs[i];
+            if (s >= 0 && s <= logLastSeq) continue;   /* 这一行已经显示过了 */
+            box.appendChild(makeLogLine(lines[i]));
+            appended++;
+        }
+        if (seqs.length) logLastSeq = seqs[seqs.length - 1];
+
+        /* DOM 别无限长：设备端只留 48 行，这里留 400 行足够往回翻，
+         * 再多纯粹是占手机内存。 */
+        while (box.childNodes.length > 400) {
+            box.removeChild(box.firstChild);
+        }
+
+        if (appended && atBottom) box.scrollTop = box.scrollHeight;
+    }
+
+    /** 造一行日志（错误行高亮）。抽出来是为了让两条渲染路径共用同一套判定。 */
+    function makeLogLine(line) {
+        var span = document.createElement('span');
+        var isErr = line.indexOf('★') >= 0 ||
+                    line.indexOf('失败') >= 0 ||
+                    line.indexOf('出错') >= 0 ||
+                    line.indexOf('未通过') >= 0;
+        if (isErr) span.className = 'e';
+        span.textContent = line + '\n';
+        return span;
     }
 
     function pollLog() {
         if (logPaused) return;
         if ($('logbox').classList.contains('closed')) return;
         get('/log', function (d) {
-            renderLog(d.log || [], d.mem_free);
+            renderLog(d.log || [], d.seq, d.mem_free);
         }, true);
     }
 
@@ -966,19 +1061,13 @@
     }
 
     function clearLogView() {
+        /* ★ 清屏只清 DOM，**绝对不要动 logLastSeq**。
+         *   旧代码是先把 innerHTML 置空、再用 getRenderedText() 去读 DOM
+         *   当作"已看过的内容"—— 读到的当然是空串，于是下一轮轮询时
+         *   设备端那 48 行原样又冒回来，用户看到的就是"清屏按钮没用"。
+         *   现在游标留在原处：旧行（seq <= 游标）本来就会被跳过，
+         *   新行照常追加，语义正确。 */
         $('log_lines').innerHTML = '';
-        /* 把当前可见的行记录下来，下次轮询时跳过这些行，
-         * 只追加新日志，避免"清屏"后旧日志立刻又冒出来 */
-        logText = getRenderedText();
-    }
-
-    function getRenderedText() {
-        var box = $('log_lines');
-        var t = '';
-        for (var c = 0; c < box.childNodes.length; c++) {
-            t += box.childNodes[c].textContent + '\n';
-        }
-        return t;
     }
 
     /* =======================================================================
@@ -1077,6 +1166,7 @@
         $('btn_assist_toggle').onclick = toggleAssist;
         $('btn_assist_save').onclick = saveAssistPct;
         $('btn_retract_save').onclick = saveRetract;
+        $('btn_temper_save').onclick = saveTemper;
         $('btn_src_toggle').onclick = toggleExtruderSrc;
         $('btn_ota_upload').onclick = otaUpload;
         $('btn_bootclear').onclick = resetBootCount;

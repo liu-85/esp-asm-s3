@@ -400,10 +400,19 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddBoolToObject(assist, "enabled", cfg->assist_enabled != 0);
     cJSON_AddNumberToObject(assist, "speed_pct", cfg->assist_speed_pct);
 
-    /* ---- 退料参数（本次新增） ---- */
+    /* ---- 退料参数 ---- */
     cJSON *retract = cJSON_AddObjectToObject(o, "retract");
     cJSON_AddNumberToObject(retract, "wait_ms", cfg->retract_wait_ms);
     cJSON_AddNumberToObject(retract, "cont_ms", cfg->retract_cont_ms);
+
+    /* ---- 换料温度（每个料盘位一个）----
+     * 走 config_get_temper() 而不是直读 cfg->temper：没配过的位在 NVS 里
+     * 是 0，那表示"用默认值"，直接发 0 给前端界面上就会显示 0℃。 */
+    cJSON *temper = cJSON_AddArrayToObject(o, "temper");
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        cJSON_AddItemToArray(temper,
+                             cJSON_CreateNumber(config_get_temper(i)));
+    }
 
     /* ---- 运行环境 ---- */
     cJSON_AddNumberToObject(o, "mem_free", (double)esp_get_free_heap_size());
@@ -526,17 +535,24 @@ static esp_err_t h_log(httpd_req_t *req)
     /* 这块缓冲 ≈ 5.5KB。httpd 任务栈只有 8KB，cJSON 还要再堆出响应
      * 对象，放栈上会把 httpd 任务栈顶穿。改为 static，handler 是
      * esp_http_server 单线程串行执行的，不会有并发访问问题。 */
-    static char buf[AMS_LOG_LINES * (AMS_LOG_LINE_MAX + 1) + 64];
-    int n = ams_log_recent(buf, sizeof(buf), AMS_LOG_LINES);
+    static char     buf[AMS_LOG_LINES * (AMS_LOG_LINE_MAX + 1) + 64];
+    static uint32_t seqs[AMS_LOG_LINES];
+    int got = 0;
+    ams_log_recent_lines(buf, sizeof(buf), AMS_LOG_LINES,
+                         seqs, AMS_LOG_LINES, &got);
 
     cJSON *o = cJSON_CreateObject();
     if (o == NULL) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
     }
 
-    cJSON *arr = cJSON_AddArrayToObject(o, "log");
+    /* log 是文本行，seq 是它们各自的行号。前端靠 seq 做"只追加新行" ——
+     * 之前前端只拿到文本，只能整串比对，环形缓冲一滚动整串就变了，
+     * 于是每两秒整屏重建一次：看着闪、还会丢行。 */
+    cJSON *arr  = cJSON_AddArrayToObject(o, "log");
+    cJSON *sarr = cJSON_AddArrayToObject(o, "seq");
     char *p = buf;
-    int lines = 0;
+    int idx = 0;
     while (p && *p) {
         char *nl = strchr(p, '\n');
         if (nl) {
@@ -544,16 +560,20 @@ static esp_err_t h_log(httpd_req_t *req)
         }
         if (*p) {
             cJSON_AddItemToArray(arr, cJSON_CreateString(p));
-            lines++;
+            /* buf 装不下时 ams_log_recent_lines 会提前 break，所以理论上
+             * 不会出现 idx > got；兜个 -1，前端拿到无效 seq 会自动退回
+             * 整串比对（老行为），宁可不优化也不能渲染错。 */
+            cJSON_AddItemToArray(sarr, cJSON_CreateNumber(
+                (idx < got) ? (double)seqs[idx] : -1.0));
+            idx++;
         }
         if (!nl) {
             break;
         }
         p = nl + 1;
     }
-    (void)n;
 
-    cJSON_AddNumberToObject(o, "count", lines);
+    cJSON_AddNumberToObject(o, "count", idx);
     cJSON_AddNumberToObject(o, "mem_free", (double)esp_get_free_heap_size());
     return send_json_obj(req, o);
 }
@@ -1081,6 +1101,50 @@ static esp_err_t h_retract_set(httpd_req_t *req)
     return reply_ok(req, true, info);
 }
 
+/** POST /temper_set  body: {"channel":1,"temper":250}
+ *
+ *  channel 从 **1** 开始，和界面上的「料盘位 1~4」一致（内部转成 0 起）；
+ *  channel 传 0 表示"四个位一起设"，方便用户换整盘同种料。
+ *
+ *  为什么需要它：退料前要把热端升到这个温度（M109），太低退不出料、
+ *  太高把 PLA 烤糊。以前这个值在源码里是写死的，改一次要重新烧固件。
+ */
+static esp_err_t h_temper_set(httpd_req_t *req)
+{
+    cJSON *b = read_body_json(req);
+    int channel = json_int(b, "channel", 0);
+    int temper  = json_int(b, "temper", -1);
+    cJSON_Delete(b);
+
+    if (temper < 0) {
+        return reply_ok(req, false, "缺少 temper");
+    }
+
+    if (channel >= 1 && channel <= BOARD_CHANNEL_COUNT) {
+        config_set_temper(channel - 1, temper);
+    } else if (channel == 0) {
+        for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+            config_set_temper(i, temper);
+        }
+    } else {
+        return reply_ok(req, false, "料盘位超出范围");
+    }
+
+    /* 回显全部通道的生效值（config_set_temper 会夹到安全区间，
+     * 所以回显的是"实际存进去的"，不是用户填的） */
+    char info[192];
+    int off = snprintf(info, sizeof(info), "换料温度已保存：");
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        if (off < 0 || off >= (int)sizeof(info) - 16) {
+            break;
+        }
+        off += snprintf(info + off, sizeof(info) - (size_t)off, "%s%d℃",
+                        i ? " / " : "", config_get_temper(i));
+    }
+    ams_log("%s", info);
+    return reply_ok(req, true, info);
+}
+
 /* ==========================================================================
  * 十一、配置热点 / 启动计数
  * ========================================================================== */
@@ -1366,6 +1430,7 @@ DEF_COUNTED(h_creep_set)
 DEF_COUNTED(h_extruder_src_set)
 DEF_COUNTED(h_assist_set)
 DEF_COUNTED(h_retract_set)
+DEF_COUNTED(h_temper_set)
 DEF_COUNTED(h_ota_upload)
 
 esp_err_t web_server_start(void)
@@ -1447,6 +1512,7 @@ esp_err_t web_server_start(void)
         /* ---- 辅助送料 / 退料参数（本次新增） ---- */
         { .uri = "/assist_set",       .method = HTTP_POST, .handler = h_assist_set_counted },
         { .uri = "/retract_set",      .method = HTTP_POST, .handler = h_retract_set_counted },
+        { .uri = "/temper_set",       .method = HTTP_POST, .handler = h_temper_set_counted },
 
         /* ---- 升级 ---- */
         { .uri = "/ota_upload", .method = HTTP_POST, .handler = h_ota_upload_counted },

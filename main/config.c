@@ -582,6 +582,11 @@ int config_describe(char *buf, size_t buflen)
       (unsigned)s_cfg.assist_speed_pct);
     P("退料参数 : 等MQTT %ums + 连续退料 %ums\n",
       (unsigned)s_cfg.retract_wait_ms, (unsigned)s_cfg.retract_cont_ms);
+    P("换料温度 : ");
+    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
+        P("位%d=%d℃%s", i + 1, config_get_temper(i),
+          i + 1 < BOARD_CHANNEL_COUNT ? "  " : "\n");
+    }
 #undef P
     return off;
 }
@@ -640,4 +645,26 @@ uint16_t config_set_retract_cont_ms(int value)
     s_cfg.retract_cont_ms = (uint16_t)value;
     config_save();
     return s_cfg.retract_cont_ms;
+}
+
+int config_get_temper(int material_index)
+{
+    if (material_index < 0 || material_index >= BOARD_CHANNEL_COUNT) {
+        return CONFIG_TEMPER_DEF;
+    }
+    /* 0 表示"没配过" —— 老固件升上来的 NVS 里这个字段全是 0，
+     * 落回默认值就能直接跑，不用用户先去网页填一遍。 */
+    uint16_t v = s_cfg.temper[material_index];
+    return v ? (int)v : CONFIG_TEMPER_DEF;
+}
+
+void config_set_temper(int material_index, int value)
+{
+    if (material_index < 0 || material_index >= BOARD_CHANNEL_COUNT) {
+        return;
+    }
+    if (value < CONFIG_TEMPER_MIN) value = CONFIG_TEMPER_MIN;
+    if (value > CONFIG_TEMPER_MAX) value = CONFIG_TEMPER_MAX;
+    s_cfg.temper[material_index] = (uint16_t)value;
+    config_save();
 }

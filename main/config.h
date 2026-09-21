@@ -90,6 +90,16 @@ extern "C" {
 #define CONFIG_RETRACT_CONT_MIN     1000
 #define CONFIG_RETRACT_CONT_MAX     15000
 
+/* 换料温度（每个料盘位一个，单位 ℃）
+ *   退料前把热端升到这个温度：太低，热端里的料是硬的，退不出来；
+ *   太高，PLA 之类会烤糊、拉丝。
+ *   按材料给：PLA 220 / PETG 250 / ABS 260 / TPU 230 左右。
+ *   没配过（NVS 里是 0）时用默认值 —— 这样旧固件升上来直接可用。
+ */
+#define CONFIG_TEMPER_DEF           250
+#define CONFIG_TEMPER_MIN           150   /* 低于这个温度没有材料能退出来 */
+#define CONFIG_TEMPER_MAX           300   /* 再高就超过 A1 热端上限了 */
+
 /* ==========================================================================
  * 数据类型
  * ========================================================================== */
@@ -149,8 +159,15 @@ typedef struct {
     /* ---- 微动安装情况：bit i = 1 表示料盘位 i+1 装了微动组 ---- */
     uint8_t  sensor_enabled_mask;
 
-    /* ---- 保留位（以后加字段用，先把空间占住，避免频繁改版本号） ---- */
-    uint8_t  reserved[16];
+    /* ---- 换料温度：每个料盘位一个（℃），0 = 用 CONFIG_TEMPER_DEF ----
+     * 放在原来 reserved 的位置，**结构体总长不变**，所以 NVS 里存的老
+     * 数据读进来不会错位 —— 这是特意不升 CONFIG_VERSION 的原因：
+     * 升版本号会把用户的 WiFi / MQTT / 通道映射全部清掉，而这里完全
+     * 没必要。老固件里 reserved 恒为 0（只有 memset 0，没有别的写入），
+     * 因此旧配置读出来 temper 全是 0，自动落回默认值，行为不变。
+     * ⚠️ 以后动这个结构体，如果**改变了总长度**，那就必须升版本号。 */
+    uint16_t temper[BOARD_CHANNEL_COUNT];
+    uint8_t  reserved[16 - BOARD_CHANNEL_COUNT * 2];
 } ams_config_t;
 
 /* ==========================================================================
@@ -253,6 +270,11 @@ uint16_t config_get_retract_wait_ms(void);
 uint16_t config_set_retract_wait_ms(int value);
 uint16_t config_get_retract_cont_ms(void);
 uint16_t config_set_retract_cont_ms(int value);
+
+/** 某料盘位的换料温度（℃）。参数越界或没配过 → CONFIG_TEMPER_DEF */
+int config_get_temper(int material_index);
+/** 设置某料盘位的换料温度（℃），自动夹到 [MIN, MAX] 并写回 NVS */
+void config_set_temper(int material_index, int value);
 
 #ifdef __cplusplus
 }

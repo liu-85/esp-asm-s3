@@ -405,22 +405,15 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
     }
 
     /*
-     * ★ M400 U1 场景：打印机执行 M400 U1 后暂停，但 gcode_state
-     * 可能在同一条 MQTT 上报中仍为 RUNNING（状态切换有延迟），
-     * 导致 is_paused=false，ams_stage==1 的条件永远不成立。
-     * 解决：如果 ams.stage==1 且 gcode_state 是 RUNNING，
-     * 视同暂停（M400 U1 的本质就是暂停等 AMS）。
+     * ★ 这里原本有一段「gcode_state=RUNNING 但 ams.stage==1 → 视同暂停」的
+     *   补丁，已删除。删的理由是它治标不治本，而且把「正在打印」误判成
+     *   「已暂停」的风险比收益大：
+     *     · M400 U1 触发后打印机一定会进 PAUSE，本来就等得到 is_paused；
+     *     · 真正的问题是触发通路没接通（热床信道没解析），
+     *       补丁是在给一个不存在的字段打补丁，反而掩盖了根因；
+     *     · RUNNING + ams.stage==1 在别的固件版本里可能表示完全不同的意思。
+     *   现在换料触发走文件头列的三条通路，不再猜 gcode_state。
      */
-    const cJSON *ams_obj_early =
-        cJSON_GetObjectItemCaseSensitive(root, "ams");
-    int ams_stage_early = -1;
-    if (cJSON_IsObject(ams_obj_early)) {
-        ams_stage_early = json_int(ams_obj_early, "stage", -1);
-    }
-    if (!out->is_paused && ams_stage_early == 1 && out->gcode_state == 2) {
-        out->is_paused = true;
-        ams_log("gcode_state=RUNNING 但 ams.stage=1，视同暂停（M400 U1）");
-    }
 
     out->mc_percent         = json_int(print, "mc_percent", 0);
     out->mc_remaining_time  = json_int(print, "mc_remaining_time", 0);
@@ -442,12 +435,29 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
     out->bed_temper    = json_float(print, "bed_temper", 0);
     out->bed_target    = json_float(print, "bed_target_temper", 0);
 
+    /* ---- 热床温度信道（文件头通路 ①）----
+     * 切片用 `M140 S{next_extruder + 1};EXT` 把通道号写进"目标床温"，
+     * 所以读到 (0, 17) 范围的值就是通道号，不是温度。
+     * 上界 16 沿用 Top-AMS 的做法（它支持 16 通道 AMS）；真实打印任务的
+     * 床温不可能低于 17℃（PLA 都要 50+），所以两个区间不会混淆。 */
+    out->bed_channel = 0;
+    if (out->bed_target > 0.0f && out->bed_target < 17.0f) {
+        out->bed_channel = (int)out->bed_target;
+    }
+
     /* ---- ★ 换料判定（本项目最核心的一条）----
-     * 两种触发方式：
-     *  1. 官方 G-code 宏：M73 P101 → gcode_state=PAUSE && mc_percent=101
-     *  2. 第三方 G-code（如 Filamentor）：M400 U1 暂停 →
-     *     ams.stage=1（打印机主动上报"等待 AMS"）
-     * 任一条件满足即触发。 */
+     * 三条通路，任意一条成立即触发（见文件头第一节）：
+     *  ① 热床温度信道：print.bed_target_temper 落在 (0,17) 就是通道号
+     *  ② 官方宏 M73 P101 → mc_percent == 101
+     *  ③ 第三方宏 M400 U1 → ams.stage == 1
+     *
+     * ★ 三条都**必须**以 is_paused 为前提，包括通路 ①。
+     *   这一点很关键：换料宏里 M140 S{next_extruder+1} 写在很前面
+     *   （A1 的宏在第 6 行），而真正让打印机停下来的 M400 U1 在第 25 行，
+     *   中间还有抬 Z、移动喷头等十几行。如果一看到床温变成通道号就动手，
+     *   我们会在喷头**还在移动**的时候去切刀、退料 —— 时序全乱。
+     *   床温信令会被打印机持续上报（一直到我们发 M190 改回去），
+     *   所以等到 PAUSE 那一帧再触发，一帧都不会漏，最多晚 1~2 秒。 */
     /* 先读 ams.stage */
     const cJSON *ams_obj_top =
         cJSON_GetObjectItemCaseSensitive(root, "ams");
@@ -456,35 +466,43 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
         out->ams_stage = json_int(ams_obj_top, "stage", -1);
     }
 
-    if ((out->is_paused && out->mc_percent == 101) ||
-        (out->is_paused && out->ams_stage == 1)) {
+    if (out->is_paused &&
+        (out->mc_percent == 101 || out->ams_stage == 1 ||
+         out->bed_channel > 0)) {
         out->change_needed = true;
-        /* 目标通道号候选字段（按优先级）：
-         * - filament_next / mc_next_tray / mc_tray_idx / next_tray：
-         *   M73 P101 系列直接回传的 R 参数
-         * - filament_current：当前正在用的耗材位号（M400 U1 暂停时通常
-         *   就是目标通道，因为新 G-code 流程是先暂停再让 AMS 换到该位）
-         * - 兜底 mc_remaining_time（旧逻辑，大概率不适用） */
-        static const char *const s_filament_keys[] = {
-            "filament_next",
-            "mc_next_tray",
-            "mc_tray_idx",
-            "next_tray",
-            "filament_current",  /* M400 U1 场景：暂停时当前耗材就是目标 */
-        };
-        for (size_t i = 0;
-             i < sizeof(s_filament_keys) / sizeof(s_filament_keys[0]); i++) {
-            const cJSON *item =
-                cJSON_GetObjectItemCaseSensitive(print, s_filament_keys[i]);
-            if (cJSON_IsNumber(item)) {
-                out->filament_next = (int)item->valueint;
-                break;
+
+        /* ---- 目标通道号（**0 起**）----
+         * ① 热床信道优先：切片写 M140 S{next_extruder + 1} 的目的就是
+         *    告诉 AMS 换到第几通道，语义没有歧义。
+         * ② 没有信道才去探测 M73 P101 系列回传的字段。这些字段名各固件
+         *    版本不一样，而且 print.filament_current 在 M400 U1 场景下
+         *    报的可能还是**旧**通道 —— 只能当兜底，不能当主力。
+         * ③ 都没有才用 mc_remaining_time（旧逻辑，基本不适用）。 */
+        out->filament_next = -1;
+        if (out->bed_channel > 0) {
+            out->filament_next = out->bed_channel - 1;   /* 1 起 → 0 起 */
+        } else {
+            static const char *const s_filament_keys[] = {
+                "filament_next",
+                "mc_next_tray",
+                "mc_tray_idx",
+                "next_tray",
+                "filament_current",  /* M400 U1 场景：暂停时当前耗材可能是目标 */
+            };
+            for (size_t i = 0;
+                 i < sizeof(s_filament_keys) / sizeof(s_filament_keys[0]); i++) {
+                const cJSON *item =
+                    cJSON_GetObjectItemCaseSensitive(print, s_filament_keys[i]);
+                if (cJSON_IsNumber(item)) {
+                    out->filament_next = (int)item->valueint;
+                    break;
+                }
             }
-        }
-        /* 一个都没找到，退回 mc_remaining_time 兜底（值大概率不在 0~3，
-         * 上层 ams_controller 会因越界拒绝并记错误日志，不会静默出错） */
-        if (out->filament_next < 0) {
-            out->filament_next = out->mc_remaining_time;
+            /* 一个都没找到，退回 mc_remaining_time 兜底（值大概率不在 0~3，
+             * 上层 ams_controller 会因越界拒绝并记错误日志，不会静默出错） */
+            if (out->filament_next < 0) {
+                out->filament_next = out->mc_remaining_time;
+            }
         }
 
         /* ---- 目标颜色：自动匹配用 ----

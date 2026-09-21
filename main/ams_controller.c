@@ -73,6 +73,17 @@
 /** 打印机重复上报换料请求时，最多重试几次（超过就停下来报错，别无限折腾） */
 #define AMS_EXCHANGE_MAX_RETRY 5
 
+/** 快速退料指令发出去之后，等打印机做完切刀/吐料的时长 */
+#define AMS_PRIME_WAIT_MS 3000
+
+/** 进料前等热端升到目标温度的最长时间 */
+#define AMS_HEAT_WAIT_MS 30000
+
+/** 同一个"触发指纹"在这个时间窗内被当成残留上报（见 handle_report）。
+ *  取 60 秒：远大于打印机状态上报的延迟（1~3 秒），又远小于切片两次
+ *  换色之间的间隔 —— 所以既能挡住重复换料，又不会漏掉连续换色。 */
+#define AMS_EXCHANGE_RESIDUAL_MS 60000
+
 /* ==========================================================================
  * 内部状态
  * ========================================================================== */
@@ -95,6 +106,25 @@ static volatile bool  s_report_pending;
 /* 换料请求去重 */
 static int  s_exchange_attempts;
 static bool s_change_active;
+
+/* ---- 换料"触发指纹"与已完成时刻 ----
+ * 打印机会按秒重复上报同一个状态，换料完成后它还会继续报
+ * change_needed=true 好几秒。只靠 s_change_active 去重是不够的：换料一
+ * 成功就得把它清零（否则后续换料永远被拒），清零后下一帧立刻又排一次
+ * 命令 —— 同一个颜色换两次就是这么来的。
+ * 指纹 = 触发源（哪条通路 + 哪个通道），指纹没变且在 AMS_EXCHANGE_RESIDUAL_MS
+ * 窗口内，就当它是上次那次触发的残留；指纹变了立刻放行。 */
+static int      s_change_fp;
+static int64_t  s_change_fp_us;
+static int      s_pending_fp;     /* 已排队命令对应的指纹，成功时转正为 s_change_fp */
+
+/* ---- 热床温度记忆（对应 Top-AMS 的 bed_target_temper_max）----
+ * 切片用 M140 S{next_extruder + 1} 借"目标床温"传通道号，打印机上报的
+ * bed_target 于是变成 1~16。真实床温必须在被改写之前记住，换完再还回去。
+ * 取"见过的最高值"：不同层/不同材料的床温不一样（PLA 首层 60、后续 55），
+ * 取最高能保证恢复后不会偏低。0 = 还没有可信记录。 */
+static float    s_bed_target_max;
+
 /* 辅助送料去重：stg=8 做一次，stg=19 再做一次，stg=0 持续做（间隔 5s） */
 static bool s_assist_done_stg8;         /* 本次换料 stg=8 是否已做 */
 static bool s_assist_done_stg19;        /* 本次换料 stg=19 是否已做 */
@@ -682,6 +712,107 @@ static int probe_current_filament(int fallback)
  * 七、换料主流程
  * ========================================================================== */
 
+/* --------------------------------------------------------------------------
+ * ★ 为什么换料过程中要"使唤"打印机，而不是全靠我们自己的电机
+ * --------------------------------------------------------------------------
+ * 热端里那一段料是**熔融**的。如果只靠远端电机硬拽，会出现：打滑、拉断、
+ * 拉出来的丝粗细不匀、甚至把料头拽变形导致后面进不去。
+ *
+ * 打印机的工具头齿轮离热端最近、扭矩也足，让它自己先把料吐到缓冲里，
+ * 我们再把料收回盘 —— 两段式接力，这是 Top-AMS 实测的稳定做法。
+ *
+ * ⚠️ 调温必须用 M109 / M190，**不能**用 M104 / M140：
+ *    A1 系列 1.04 固件下，经 MQTT 发 M104/M140 是不生效的（打印机把它
+ *    当"设了就设了"但不真的执行），只有 M109/M190 会真的等温。
+ *    这条是 Top-AMS 在 bambu.hpp 里专门写了注释的坑。
+ * -------------------------------------------------------------------------- */
+
+/**
+ * 换料前的"快速退料"：请求打印机把热端里的料吐出来。
+ *
+ * @param mat_cur 当前料盘位下标，用来查它的换料温度；-1 表示未知（用默认值）
+ *
+ * 时序照 Top-AMS：
+ *      M109 S<temp>      热端升到该料盘位的换料温度（太凉退不出来）
+ *      M620 S255         进入切割流程
+ *      T255              切刀动作
+ *      M621 S255         退出切割流程
+ *
+ * ★ 调用时机是这条指令能不能生效的关键：必须在**打印机还在 RUNNING**
+ *   的时候发（handle_report 里一拿到通道号就发），**不能**留到 do_exchange。
+ *   理由见 handle_report 里「打印机侧预处理」那一段：切片把 M400 U1 写在
+ *   M140 后面十几行，等我们走到 do_exchange，打印机已经停在 M400 U1 上、
+ *   G-code 流不动了。
+ *
+ * 发完要等 AMS_PRIME_WAIT_MS —— 切刀 + 吐料是机械动作，需要时间。
+ * 我们太早介入收线，会把料拽断。这段等待同时也把打印机"送到"了暂停点。
+ *
+ * MQTT 没连上时不报错、只警告：退料仍然可以只靠本机电机完成（只是
+ * 更容易打滑），不该因为发不出这条指令就把整次换料判失败。
+ */
+static void exchange_prime_extrude(int mat_cur)
+{
+    int temp = config_get_temper(mat_cur);
+    char g[96];
+    int n = snprintf(g, sizeof(g),
+                     "M109 S%d\n"
+                     "M620 S255\n"
+                     "T255\n"
+                     "M621 S255\n",
+                     temp);
+    if (n <= 0 || n >= (int)sizeof(g)) {
+        return;
+    }
+    if (bambu_mqtt_send_gcode(g) < 0) {
+        ams_log_warn("  退料：快速退料指令没发出去（MQTT 未连接？），"
+                     "只能靠自己硬退，注意别拉断");
+        return;
+    }
+    ams_log("  退料：已请求打印机快速退料（热端 %d℃，等 %ums 让切刀跑完）",
+            temp, (unsigned)AMS_PRIME_WAIT_MS);
+    vTaskDelay(pdMS_TO_TICKS(AMS_PRIME_WAIT_MS));
+}
+
+/**
+ * 换料进料前：把热端升到新料盘位的温度，并等到温。
+ *
+ * 温度没到就送料，料头会在冷热端里顶住、打弯，进不去 —— 表现为"送料
+ * 送不动"。Top-AMS 也是发完 M109 然后自旋等到温（它等的是
+ * nozzle_target_temper >= temp - 5，这里照做）。
+ *
+ * 等不到就继续走：卡在这里会让打印机一直停在暂停态，比"温度差几度"
+ * 严重得多。差几度顶多多退一次料。
+ */
+static void exchange_heat_nozzle(int mat_new)
+{
+    int temp = config_get_temper(mat_new);
+    char g[32];
+    if (snprintf(g, sizeof(g), "M109 S%d", temp) <= 0) {
+        return;
+    }
+    if (bambu_mqtt_send_gcode(g) < 0) {
+        ams_log_warn("  进料：升温指令没发出去（MQTT 未连接？），按原温度继续");
+        return;
+    }
+    ams_log("  进料：已请求热端升到 %d℃，等到温…", temp);
+
+    int64_t deadline = esp_timer_get_time() + (int64_t)AMS_HEAT_WAIT_MS * 1000;
+    while (esp_timer_get_time() < deadline) {
+        float t = -1.0f;
+        if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+            t = s_last_report.nozzle_target;
+            xSemaphoreGive(s_report_lock);
+        }
+        if (t >= (float)temp - 5.0f) {
+            ams_log("  进料：热端已到温（设定 %.0f℃）", (double)t);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    ams_log_warn("  进料：等热端到温超时（%ums），继续送料（差几度顶多多退一次）",
+                 (unsigned)AMS_HEAT_WAIT_MS);
+}
+
 /**
  * 等打印机"有进展"：stg_cur 或 gcode_state 变了就算。
  *
@@ -841,6 +972,10 @@ static bool do_exchange(int printer_channel)
         int mat_cur = config_material_index_of(current);
         if (mat_cur >= 0) {
             ams_log("  退料：正在将通道 %s 的料收回料盘…", cur_txt);
+            /* 打印机的快速退料（切刀 + 把热端里的料吐到缓冲）已经在
+             * handle_report 里发过了 —— 那时打印机还在 RUNNING，指令发得
+             * 出去；等走到这里（打印机已停在 M400 U1）再发就晚了。
+             * 这里只做属于我们自己的那半件事：把料从缓冲收回到料盘。 */
             if (!do_retract(mat_cur)) {
                 record_error("退料失败，换料中止");
                 s_diag.exchange_fail++;
@@ -856,6 +991,10 @@ static bool do_exchange(int printer_channel)
      * 把新通道的料送到挤出机入口，等到位后蠕动 5 次确保咬住。
      * 挤出机到位信号：C3 走 MQTT hw_switch_state，S3 走 GPIO。 */
     ams_log("  进料：正在将通道 %s 的料送入挤出机…", new_txt);
+
+    /* ★ 先把热端升到新料的温度再送料（见 exchange_heat_nozzle）。
+     *   温度不对，料头会在冷热端里顶住、打弯。 */
+    exchange_heat_nozzle(mat_new);
 
     /* C3 无 GPIO 挤出机到位线，直接进料 */
     if (!do_load(mat_new, false)) {
@@ -960,6 +1099,25 @@ static int auto_match_channel(int target_color)
  */
 static void handle_report(const bambu_report_t *r)
 {
+    /* ---- 热床温度记忆（必须在用它之前做）----
+     * 切片用 M140 S{next_extruder + 1} 借"目标床温"传通道号，所以换色时
+     * 打印机上报的 bed_target 会变成 1~16。真实床温要在被改写**之前**
+     * 记住，换完再用 M190 还回去 —— 不还的话热床真的会按 M140 的设定
+     * 降到 1~4℃，当前这一层直接粘不住。 */
+    if (r->bed_channel > 0) {
+        /* 这一帧的床温是通道号，不是温度 —— 别污染记忆值 */
+    } else if (r->bed_target >= 17.0f) {
+        /* 取见过的最高值：不同层/不同材料的床温不同（PLA 首层 60、后续 55），
+         * 取最高能保证恢复后不会偏低。 */
+        if (r->bed_target > s_bed_target_max) {
+            s_bed_target_max = r->bed_target;
+        }
+    } else {
+        /* 0（空闲 / 打印结束）或 17 以下的异常值：没有可信的床温，
+         * 清掉记忆，下次开始打印重新学 —— 免得拿上一次打印的旧温度去恢复。 */
+        s_bed_target_max = 0.0f;
+    }
+
     /* ★ 只记录阶段变化，不刷屏 */
     if (r->stg_cur != s_last_seen_stg) {
         ams_log("阶段：%s", bambu_stage_text(r->stg_cur));
@@ -1035,8 +1193,11 @@ static void handle_report(const bambu_report_t *r)
      * 默认：报文里的通道号（0 起，+1 转成 1 起） */
     int printer_ch = r->filament_next + 1;
 
-    /* 打印触发原因（让用户知道是 M73 P101 还是 M400 U1 触发的） */
-    if (r->mc_percent == 101) {
+    /* 打印触发原因（让用户知道是哪条通路触发的） */
+    if (r->bed_channel > 0) {
+        ams_log("收到打印机指令：热床信道 → 通道 %d"
+                "（切片写了 M140 S{next_extruder+1}）", r->bed_channel);
+    } else if (r->mc_percent == 101) {
         ams_log("收到打印机指令：M73 P101 换料请求（通道 %d）", r->filament_next + 1);
     } else if (r->ams_stage == 1) {
         ams_log("收到打印机指令：M400 U1 等待 AMS 换料（通道 %d）", r->filament_next + 1);
@@ -1075,13 +1236,87 @@ static void handle_report(const bambu_report_t *r)
     if (s_change_active) {
         return;
     }
+
+    /* ---- 触发指纹去重（见 s_change_fp 的说明）----
+     * 换料完成后打印机还会用旧状态继续上报 change_needed=true，
+     * 指纹没变就当它是残留上报，直接忽略 —— 否则同一个颜色会被换两次。
+     * 指纹变了（切片真的要求换到别的通道）立刻放行，连续换色不受影响。 */
+    int fp = 0;
+    if (r->bed_channel > 0) {
+        fp = 1000 + r->bed_channel;
+    } else if (r->mc_percent == 101) {
+        fp = 2000 + printer_ch;
+    } else if (r->ams_stage == 1) {
+        fp = 3000 + printer_ch;
+    }
+    if (fp != 0 && fp == s_change_fp &&
+        (esp_timer_get_time() - s_change_fp_us) <
+            (int64_t)AMS_EXCHANGE_RESIDUAL_MS * 1000) {
+        return;
+    }
+
+    /* ======================================================================
+     * ★ 打印机侧预处理 —— 必须在这里做，不能留到 do_exchange
+     * ======================================================================
+     * 时序是这次修复里最关键的一点：
+     *
+     *   切片宏里 M140 S{next_extruder+1} 写在很前面，M400 U1 写在后面 ——
+     *   A1 的宏是第 6 行 vs 第 25 行，仓库里那份真实切片输出（main/切片G.txt）
+     *   里甚至隔了 28 行。也就是说**打印机还在 RUNNING 的时候，热床信令
+     *   就已经到了**。
+     *
+     *   Top-AMS 正是趁这个窗口把「恢复床温 + 快速退料」发出去的。要是等到
+     *   打印机真的停在 M400 U1 再发，那时它的 G-code 流已经卡住不动了。
+     *
+     *   所以这里一拿到通道号就发两条：
+     *     ① M190 S<bed>             把借走的热床温度还回去
+     *     ② M109 + M620/T255/M621   让打印机自己切刀、把热端里的料吐到缓冲
+     *   然后我们自己的电机再去收线（在 do_exchange 里，那时打印机已经暂停）。
+     * ====================================================================== */
+
+    /* ---- ① 归还热床温度 ----
+     * 借了就必须还：不还的话热床会真的按 M140 的设定降到 1~4℃。
+     * 发完 M190 之后打印机的 bed_target 立刻变回真实值，所以这段只会走一次。 */
+    if (r->bed_channel > 0) {
+        if (s_bed_target_max > 0.0f) {
+            char g[48];
+            snprintf(g, sizeof(g), "M190 S%.0f", (double)s_bed_target_max);
+            if (bambu_mqtt_send_gcode(g) >= 0) {
+                ams_log("  已请求恢复热床温度：%s"
+                        "（不恢复的话它会真的降到 1~4℃）", g);
+            } else {
+                ams_log_warn("  恢复热床温度失败（MQTT 未连接？）—— "
+                             "打印完请检查床温，可能已经掉了");
+            }
+        } else {
+            ams_log_warn("  没有热床温度的历史记录，无法自动恢复 —— "
+                         "如果发现热床凉了，请手动设回去");
+        }
+    }
+
+    /* ---- ② 快速退料：先让打印机动手 ----
+     * 挤出机已经明确上报"无料"（hint == 0）就跳过 —— 没料可退，
+     * 硬发 M620 只会白换一个 HMS 报错。hint == -1 表示还没收到过这个
+     * 字段，按"有料"处理（宁可多发一次）。 */
+    {
+        int cur_ch  = config_get_filament_current();
+        int mat_cur = (cur_ch > 0) ? config_material_index_of(cur_ch) : -1;
+        if (r->extruder_inplace_hint != 0) {
+            exchange_prime_extrude(mat_cur);
+        } else {
+            ams_log("  挤出机已报无料，跳过打印机的快速退料");
+        }
+    }
+
     s_change_active = true;
+    s_pending_fp = fp;
 
     ams_log("  动作：开始执行换料（目标通道 %d）", printer_ch);
     ams_cmd_t cmd = { .id = AMS_CMD_EXCHANGE, .channel = printer_ch };
     if (!ams_post_cmd(&cmd)) {
         ams_log("  换料命令排队失败（设备正忙），等打印机的下一次请求");
         s_change_active = false;
+        s_pending_fp = 0;
     }
 }
 
@@ -1185,7 +1420,19 @@ static void execute_cmd(const ams_cmd_t *cmd)
     case AMS_CMD_EXCHANGE: {
         if (do_exchange(cmd->channel)) {
             s_exchange_attempts = 0;
+            /* s_change_active 必须清零 —— 不清的话后续换料会被"正在处理"
+             * 一直挡住。换料完成后打印机还会重复上报旧状态，那种情况由
+             * 下面 s_change_fp 的指纹去重接管，不靠这个标志。 */
             s_change_active = false;
+            /* ★ 把这次触发"盖章完成"：打印机在 1~3 秒内还会用旧状态
+             *   继续上报 change_needed=true，指纹相同就说明是残留，忽略掉。
+             *   以前这里只是清掉 s_change_active，于是下一帧立刻又排一次
+             *   换料命令 —— 表现为"同一个颜色换两次"。 */
+            if (s_pending_fp != 0) {
+                s_change_fp = s_pending_fp;
+                s_change_fp_us = esp_timer_get_time();
+            }
+            s_pending_fp = 0;
             /* do_exchange 内部已发 resume，这里不重复发 */
         } else {
             s_exchange_attempts++;
@@ -1407,6 +1654,10 @@ esp_err_t ams_init(void)
     s_report_pending = false;
     s_exchange_attempts = 0;
     s_change_active = false;
+    s_change_fp = -1;          /* -1 = 还没有"已完成"的触发，不会误挡 */
+    s_change_fp_us = 0;
+    s_pending_fp = 0;
+    s_bed_target_max = 0.0f;
     s_assist_done_stg8 = false;
     s_assist_done_stg19 = false;
     s_last_assist_time_us = 0;

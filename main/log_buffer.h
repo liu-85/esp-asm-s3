@@ -20,6 +20,7 @@
 #define LOG_BUFFER_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -54,6 +55,23 @@ int ams_log_count(void);
  * 返回的是**副本**，调用方拿去序列化时不会和正在写入的任务打架。
  */
 int ams_log_recent(char *buf, size_t buflen, int max_lines);
+
+/**
+ * 同上，但把每行的**行号 seq** 一并输出。
+ *
+ * @param seqs      输出每行的 seq；可以传 NULL
+ * @param seq_cap   seqs 能装多少个 —— **建议传和 max_lines 一样的值**，
+ *                  这样行数和 seq 一定一一对应
+ * @param out_count 实际输出的行数；可以传 NULL
+ *
+ * 为什么要 seq：网页端如果只拿到"一串文本"，就只能靠整串比对判断有没有
+ * 新行 —— 环形缓冲一滚动整串都变了，前端只能整屏重建，表现就是闪烁 +
+ * 丢行，而且"清屏"按钮怎么点都清不干净（它没法知道"清到哪一行"）。
+ * 带上行号之后，前端只要记住"渲染到哪一号了"，就能只追加新行；
+ * 清屏也只是把 DOM 清掉、"游标"不动。
+ */
+int ams_log_recent_lines(char *buf, size_t buflen, int max_lines,
+                         uint32_t *seqs, int seq_cap, int *out_count);
 
 /* --------------------------------------------------------------------------
  * 写日志的三个入口。行为上和 Python 版的 logout() 一致：串口 + 内存各一份。
