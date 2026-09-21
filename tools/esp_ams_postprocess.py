@@ -300,7 +300,7 @@ def rewrite_gcode(
     log_lines: List[str] = []
 
     t_count = len(re.findall(r'^T(\d+)', gcode_content, re.MULTILINE))
-    m73_count = len(re.findall(r'M73\s+P101\s+R\[?(\d+|next_extruder)\]?', gcode_content))
+    m73_count = len(re.findall(r'M73\s+P101\s+R\[(\d+|next_extruder)\]', gcode_content))
     log_lines.append(f"G-code 换色统计：T 指令 {t_count} 处，M73 P101 共 {m73_count} 处")
 
     if not ams_colors:

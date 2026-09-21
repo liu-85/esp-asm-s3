@@ -967,7 +967,18 @@
 
     function clearLogView() {
         $('log_lines').innerHTML = '';
-        logText = '__cleared__';
+        /* 把当前可见的行记录下来，下次轮询时跳过这些行，
+         * 只追加新日志，避免"清屏"后旧日志立刻又冒出来 */
+        logText = getRenderedText();
+    }
+
+    function getRenderedText() {
+        var box = $('log_lines');
+        var t = '';
+        for (var c = 0; c < box.childNodes.length; c++) {
+            t += box.childNodes[c].textContent + '\n';
+        }
+        return t;
     }
 
     /* =======================================================================
