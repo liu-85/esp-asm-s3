@@ -168,10 +168,13 @@ jobs:
           path: dist_c3/
 
       - name: Create GitHub Release
-        uses: softaction/touch-release@v1
+        # 原为 softaction/touch-release@v1 —— 该 action 在 GitHub 上不存在（API 返回 404），
+        # 一打 tag 这一步就必然失败。换成社区标准实现 softprops/action-gh-release。
+        # 注意它的标题参数叫 name（不是 release_name），顺手改了，否则标题会退化成 tag 名。
+        uses: softprops/action-gh-release@v2
         id: rel
         with:
-          release_name: "esp-ams ${{ github.ref_name }}"
+          name: "esp-ams ${{ github.ref_name }}"
           draft: false
           body: |
             自动编译发布（双目标：ESP32-S3 + ESP32-C3）。
