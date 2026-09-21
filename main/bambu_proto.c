@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "log_buffer.h"
 
 /* ==========================================================================
  * 一、阶段码表（对应 bambu_const.CURRENT_STAGE_IDS）
