@@ -403,6 +403,24 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
         }
     }
 
+    /*
+     * ★ M400 U1 场景：打印机执行 M400 U1 后暂停，但 gcode_state
+     * 可能在同一条 MQTT 上报中仍为 RUNNING（状态切换有延迟），
+     * 导致 is_paused=false，ams_stage==1 的条件永远不成立。
+     * 解决：如果 ams.stage==1 且 gcode_state 是 RUNNING，
+     * 视同暂停（M400 U1 的本质就是暂停等 AMS）。
+     */
+    const cJSON *ams_obj_early =
+        cJSON_GetObjectItemCaseSensitive(root, "ams");
+    int ams_stage_early = -1;
+    if (cJSON_IsObject(ams_obj_early)) {
+        ams_stage_early = json_int(ams_obj_early, "stage", -1);
+    }
+    if (!out->is_paused && ams_stage_early == 1 && out->gcode_state == 2) {
+        out->is_paused = true;
+        ams_log("gcode_state=RUNNING 但 ams.stage=1，视同暂停（M400 U1）");
+    }
+
     out->mc_percent         = json_int(print, "mc_percent", 0);
     out->mc_remaining_time  = json_int(print, "mc_remaining_time", 0);
     out->print_error        = json_int(print, "print_error", 0);

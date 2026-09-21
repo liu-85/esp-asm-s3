@@ -1085,6 +1085,23 @@ static esp_err_t h_retract_set(httpd_req_t *req)
  * 十一、配置热点 / 启动计数
  * ========================================================================== */
 
+static esp_err_t h_current_channel_set(httpd_req_t *req)
+{
+    cJSON *b = read_body_json(req);
+    int channel = json_int(b, "channel", 0);
+    cJSON_Delete(b);
+
+    if (channel < 0 || channel > BOARD_CHANNEL_COUNT) {
+        char info[96];
+        snprintf(info, sizeof(info), "通道号无效（范围 0~%d）", BOARD_CHANNEL_COUNT);
+        return reply_ok(req, false, info);
+    }
+
+    config_set_filament_current(channel);
+    ams_log("当前通道已设为 %d", channel);
+    return reply_ok(req, true, "当前通道已保存");
+}
+
 static esp_err_t h_ap_set(httpd_req_t *req)
 {
     cJSON *b = read_body_json(req);
@@ -1339,6 +1356,7 @@ DEF_COUNTED(h_wifi_connect)
 DEF_COUNTED(h_mqtt_connect)
 DEF_COUNTED(h_access_set)
 DEF_COUNTED(h_ap_set)
+DEF_COUNTED(h_current_channel_set)
 DEF_COUNTED(h_hardware_test)
 DEF_COUNTED(h_jog_set)
 DEF_COUNTED(h_stop)
@@ -1413,6 +1431,7 @@ esp_err_t web_server_start(void)
         { .uri = "/mqtt_connect", .method = HTTP_POST, .handler = h_mqtt_connect_counted },
         { .uri = "/access_set",   .method = HTTP_POST, .handler = h_access_set_counted },
         { .uri = "/ap_set",       .method = HTTP_POST, .handler = h_ap_set_counted },
+        { .uri = "/current_channel_set", .method = HTTP_POST, .handler = h_current_channel_set_counted },
 
         /* ---- 动作 ---- */
         { .uri = "/hardware_test", .method = HTTP_POST, .handler = h_hardware_test_counted },

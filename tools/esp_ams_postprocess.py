@@ -410,6 +410,34 @@ def find_settings_file(gcode_path: str) -> Optional[str]:
     return None
 
 
+def _bambu_config_dir() -> Optional[str]:
+    """Bambu Studio 环境：尝试从脚本所在目录推导配置目录"""
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    candidates = [
+        base,
+        base / "ESP_AMS",
+        base.parent / "ESP_AMS",
+        Path.home() / "ESP_AMS",
+        base / "filament_settings",
+    ]
+    for c in candidates:
+        target = c / SETTINGS_FILENAME
+        if target.is_file():
+            return str(c)
+    return None
+
+
+def find_settings_extended() -> Optional[str]:
+    """比 find_settings_file 更宽的搜索：脚本目录 + 用户目录"""
+    config_dir = _bambu_config_dir()
+    if config_dir:
+        return os.path.join(config_dir, SETTINGS_FILENAME)
+    return None
+
+
 # ============================== 后处理脚本入口（Bambu Studio 用） ==============================
 
 def onBeforeWriteGCode(input_file, gcode_path, project, filename, output):
@@ -420,6 +448,8 @@ def onBeforeWriteGCode(input_file, gcode_path, project, filename, output):
     同时输出到 print output，在 Bambu Studio 控制台中可见。
     """
     settings_path = find_settings_file(input_file)
+    if not settings_path:
+        settings_path = find_settings_extended()
     ams_colors: Dict[int, Tuple[int, int, int]] = {}
     first_filament = True
     if settings_path:
@@ -427,6 +457,10 @@ def onBeforeWriteGCode(input_file, gcode_path, project, filename, output):
         if data:
             ams_colors = get_ams_colors(data)
             first_filament = data.get("first_filament", True)
+        else:
+            print(f"[ESP-AMS] 警告：配置文件无效：{settings_path}")
+    else:
+        print("[ESP-AMS] 未找到 filament_settings.json，使用切片通道号（不做颜色匹配）")
 
     try:
         with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
@@ -875,8 +909,13 @@ def main():
       - 独立运行时（无参数）：启动 GUI
       - 带参数运行时：执行命令行子命令
     """
-    # 检测是否在 Bambu Studio 环境中
-    in_bambu = "BAMBU_STUDIO" in os.environ or "BAMBU" in os.environ
+    # 检测是否在 Bambu Studio 环境中（环境变量或模块被 import 时）
+    in_bambu = (
+        "BAMBU_STUDIO" in os.environ
+        or "BAMBU" in os.environ
+        or "sk1app" in sys.modules          # Bambu Studio 内置 Python 环境
+        or any(k.startswith("sk") for k in sys.modules)  # sk1app/sklabs 模块
+    )
     if in_bambu:
         return
 

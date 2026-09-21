@@ -1,6 +1,6 @@
 ;===== machine: A1 =========================
 ;===== 基于验证通过的 A1-耗材丝更换G-code.txt 重写 =====
-;===== 保留强化切刀（X260→X285）+ 冲刷顺序与验证 G-code 一致 =====
+;===== 保留强化切刀（X260→X285）+ 固定冲刷量（不依赖 flush_length 变量）=====
 ;===== 冲刷顺序：冲刷1 → 擦嘴 → 冲刷2 → 擦嘴 → 冲刷3 → 擦嘴 → 冲刷4 =====
 
 M140 S{next_extruder + 1};EXT
@@ -39,35 +39,18 @@ M400 U1
 {if next_extruder < 255}
 M400
 G92 E0
-{if flush_length_1 > 1}
-; FLUSH_START（第一次冲刷，与验证 G-code 一致）
+
+; ===== 冲刷 1（固定量 30mm，不依赖 flush_length 变量）=====
 M400
 M1002 set_filament_type:UNKNOWN
 M109 S[nozzle_temperature_range_high] ; 加热到最高温度
 M104 S[new_filament_temp] ; 余热冲刷到目标温度
 M106 P1 S60
-{if flush_length_1 > 23.7}
-G1 E23.7 F{old_filament_e_feedrate} ; 前 23.7mm 匀速
-G1 E{(flush_length_1 - 23.7) * 0.02} F50
-G1 E{(flush_length_1 - 23.7) * 0.23} F{old_filament_e_feedrate}
-G1 E{(flush_length_1 - 23.7) * 0.02} F50
-G1 E{(flush_length_1 - 23.7) * 0.23} F{new_filament_e_feedrate}
-G1 E{(flush_length_1 - 23.7) * 0.02} F50
-G1 E{(flush_length_1 - 23.7) * 0.23} F{new_filament_e_feedrate}
-G1 E{(flush_length_1 - 23.7) * 0.02} F50
-G1 E{(flush_length_1 - 23.7) * 0.23} F{new_filament_e_feedrate}
-{else}
-G1 E{flush_length_1} F{old_filament_e_feedrate}
-{endif}
-; FLUSH_END
-G1 E-[old_retract_length_toolchange] F1800
-G1 E[old_retract_length_toolchange] F300
+G1 E30 F{old_filament_e_feedrate} ; 前 30mm 匀速冲刷
 M400
 M1002 set_filament_type:{filament_type[next_extruder]}
-{endif}
 
-; ===== 擦嘴 1（冲刷 1 后，与验证 G-code 一致）=====
-{if flush_length_1 > 45 && flush_length_2 > 1}
+; ===== 擦嘴 1（冲刷 1 后）=====
 ; WIPE
 M400
 M106 P1 S178
@@ -80,29 +63,23 @@ G1 X-38.2 F18000
 G1 X-48.2 F3000
 M400
 M106 P1 S0
-{endif}
 
-; ===== 冲刷 2（与验证 G-code 一致）=====
-{if flush_length_2 > 1}
+; ===== 冲刷 2（固定量 20mm，脉冲式）=====
 M106 P1 S60
-; FLUSH_START
-G1 E{flush_length_2 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_2 * 0.02} F50
-G1 E{flush_length_2 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_2 * 0.02} F50
-G1 E{flush_length_2 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_2 * 0.02} F50
-G1 E{flush_length_2 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_2 * 0.02} F50
-G1 E{flush_length_2 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_2 * 0.02} F50
-; FLUSH_END
+G1 E4 F{new_filament_e_feedrate}
+G1 E0.4 F50
+G1 E4 F{new_filament_e_feedrate}
+G1 E0.4 F50
+G1 E4 F{new_filament_e_feedrate}
+G1 E0.4 F50
+G1 E4 F{new_filament_e_feedrate}
+G1 E0.4 F50
+G1 E4 F{new_filament_e_feedrate}
+G1 E0.4 F50
 G1 E-[new_retract_length_toolchange] F1800
 G1 E[new_retract_length_toolchange] F300
-{endif}
 
-; ===== 擦嘴 2（冲刷 2 后，与验证 G-code 一致）=====
-{if flush_length_2 > 45 && flush_length_3 > 1}
+; ===== 擦嘴 2（冲刷 2 后）=====
 ; WIPE
 M400
 M106 P1 S178
@@ -115,29 +92,23 @@ G1 X-38.2 F18000
 G1 X-48.2 F3000
 M400
 M106 P1 S0
-{endif}
 
-; ===== 冲刷 3（与验证 G-code 一致）=====
-{if flush_length_3 > 1}
+; ===== 冲刷 3（固定量 15mm，脉冲式）=====
 M106 P1 S60
-; FLUSH_START
-G1 E{flush_length_3 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_3 * 0.02} F50
-G1 E{flush_length_3 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_3 * 0.02} F50
-G1 E{flush_length_3 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_3 * 0.02} F50
-G1 E{flush_length_3 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_3 * 0.02} F50
-G1 E{flush_length_3 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_3 * 0.02} F50
-; FLUSH_END
+G1 E3 F{new_filament_e_feedrate}
+G1 E0.3 F50
+G1 E3 F{new_filament_e_feedrate}
+G1 E0.3 F50
+G1 E3 F{new_filament_e_feedrate}
+G1 E0.3 F50
+G1 E3 F{new_filament_e_feedrate}
+G1 E0.3 F50
+G1 E3 F{new_filament_e_feedrate}
+G1 E0.3 F50
 G1 E-[new_retract_length_toolchange] F1800
 G1 E[new_retract_length_toolchange] F300
-{endif}
 
-; ===== 擦嘴 3（冲刷 3 后，与验证 G-code 一致）=====
-{if flush_length_3 > 45 && flush_length_4 > 1}
+; ===== 擦嘴 3（冲刷 3 后）=====
 ; WIPE
 M400
 M106 P1 S178
@@ -150,38 +121,31 @@ G1 X-38.2 F18000
 G1 X-48.2 F3000
 M400
 M106 P1 S0
-{endif}
 
-; ===== 冲刷 4（与验证 G-code 一致，最后一段无退料收尾）=====
-{if flush_length_4 > 1}
+; ===== 冲刷 4（固定量 10mm，脉冲式，最后一段无退料收尾）=====
 M106 P1 S60
-; FLUSH_START
-G1 E{flush_length_4 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_4 * 0.02} F50
-G1 E{flush_length_4 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_4 * 0.02} F50
-G1 E{flush_length_4 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_4 * 0.02} F50
-G1 E{flush_length_4 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_4 * 0.02} F50
-G1 E{flush_length_4 * 0.18} F{new_filament_e_feedrate}
-G1 E{flush_length_4 * 0.02} F50
-; FLUSH_END
-{endif}
+G1 E2 F{new_filament_e_feedrate}
+G1 E0.2 F50
+G1 E2 F{new_filament_e_feedrate}
+G1 E0.2 F50
+G1 E2 F{new_filament_e_feedrate}
+G1 E0.2 F50
+G1 E2 F{new_filament_e_feedrate}
+G1 E0.2 F50
+G1 E2 F{new_filament_e_feedrate}
+G1 E0.2 F50
 
-; ===== 首次换料额外冲刷（与验证 G-code 一致）=====
+; ===== 首次换料额外冲刷 =====
 {if toolchange_count == 1}
 M400
 M104 S[new_filament_temp]
 M106 P1 S60
-; FLUSH_START
 G1 E50 F{old_filament_e_feedrate}
-; FLUSH_END
 G1 E-[new_retract_length_toolchange] F1800
 G1 E[new_retract_length_toolchange] F300
 {endif}
 
-; ===== 最终收尾（与验证 G-code 一致）=====
+; ===== 最终收尾 =====
 M400
 M106 P1 S60
 M109 S[new_filament_temp]
@@ -210,7 +174,7 @@ M204 S[default_acceleration]
 G1 X[x_after_toolchange] Y[y_after_toolchange] Z[z_after_toolchange] F12000
 {endif}
 
-; ===== 流量校准（与验证 G-code 一致，触发 ESP32C3 辅助送料）=====
+; ===== 流量校准（触发 ESP32C3 辅助送料）=====
 M620 S[next_extruder]A
 T[next_extruder]
 M621 S[next_extruder]A
