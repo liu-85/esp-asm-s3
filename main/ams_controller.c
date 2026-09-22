@@ -154,11 +154,34 @@ static int      s_pending_fp;     /* 已排队命令对应的指纹，成功时�
  * 取最高能保证恢复后不会偏低。0 = 还没有可信记录。 */
 static float    s_bed_target_max;
 
-/* 辅助送料去重：stg=8 做一次，stg=19 再做一次，stg=0 持续做（间隔 5s） */
-static bool s_assist_done_stg8;         /* 本次换料 stg=8 是否已做 */
-static bool s_assist_done_stg19;        /* 本次换料 stg=19 是否已做 */
-static int64_t s_last_assist_time_us;   /* 上次辅助送料时间（stg=0 持续用） */
-#define ASSIST_REPEAT_US (5 * 1000 * 1000)  /* 持续辅助间隔 5 秒 */
+/* 辅助送料节流：所有"该做辅助送料"的阶段共用同一个"上次做的时刻"。
+ *
+ * ★ 2026-09-22 真机教训 —— 旧逻辑错在哪：
+ *   以前 stg=8 / stg=19 各配一个"是否已做"的一次性标志，整个阶段只送一次。
+ *   但**这台打印机的流量校准就是 stg=8**（从不报 19，见 bambu_proto.c 的阶段表），
+ *   而它在真机上要跑 3 分 6 秒（板子日志 07:22.513 进校准挤出 → 10:28.446 卸载）。
+ *   结果那 3 分钟里只有开头 1.5 秒电机在转，之后一直静止 ——
+ *   用户现场看到的就是"流量校准没有辅助送料、电机没转"。
+ *   现在改成：整个阶段**周期性地送**，不再是一次性。
+ *
+ * 顺带一个可用性设计：周期跟着"每次时长"走，所以把网页上的辅助送料时长
+ * 调大，送料就变密；打印中若把时长调到 ≥5000ms，因为周期就是 5000ms，
+ * 会变成连续辅助（这一条是刻意的，别当成 bug 修掉）。 */
+static int64_t s_last_assist_time_us;   /* 上次辅助送料时刻；0 = 允许立刻做一次 */
+#define ASSIST_REPEAT_US   (5 * 1000 * 1000)  /* 打印中（stg=0）：周期 5 秒 */
+#define ASSIST_CAL_GAP_MS  500                /* 校准中（stg=8/19）：只停 0.5 秒 ——
+                                               * 校准期间挤出头在持续吃料，
+                                               * 间隔放长料就拱不上、挤出机只能硬拉。
+                                               *
+                                               * ★ 为什么是 0.5 秒而不是随便一个数：
+                                               *   辅助送料只在**收到报文**那一拍才判一次，
+                                               *   而真机实测报文是每 ~2.0 秒一拍
+                                               *   （run5 校准段中位 2014ms、最大 4022ms）。
+                                               *   周期设成「时长 1.5s + 0.5s = 2s」刚好
+                                               *   咬住报文节奏 → 校准期间几乎每拍都送，
+                                               *   现场就是持续在推料。设成大于 2.5 秒的话，
+                                               *   会因为"这一拍还不够、下一拍在 2 秒后"而
+                                               *   掉成每 4 秒一次。 */
 /* 上次看到的 stg_cur，用于避免每次上报都打印日志 */
 static int  s_last_seen_stg = -1;
 
@@ -1152,7 +1175,8 @@ static bool feed_until_extruder(int mat_new)
  *     导致 wait_printer_progress 超时，整个流程卡住 ~50s 不发 resume。
  *   - 现在改为：退料/进料全程不做打印机同步等待，只做 AMS 侧动作。
  *     完成后发 resume，打印机自己继续执行 M73 P101 之后的冲刷 + 流量校准。
- *   - 流量校准阶段（stg=19）如果 AMS 被再次唤醒，同步做一次辅助送料。
+ *   - 冲刷完进入校准阶段（stg=8，本机流量校准就是它）后，由 handle_report
+ *     的辅助送料逻辑**周期性地**推料，见那边的注释。
  */
 static bool do_exchange(int printer_channel)
 {
@@ -1431,8 +1455,9 @@ static int auto_match_channel(int target_color)
  * 三件事：
  *   1. 如果报文带目标颜色，用自动匹配覆盖默认的通道号
  *   2. 如果打印机请求换料，把换料命令排进队列（带去重，一秒只排一次）
- *   3. 如果打印机进入流量校准阶段（stg=8 或 19）且处于打印中，
- *      同步做一次辅助送料，帮打印机把新料咬住
+ *   3. 如果打印机处在校准 / 打印阶段（stg=8、19、0），**周期性地**做辅助
+ *      送料，帮打印机把料咬住。校准阶段（stg=8）本身要跑两三分钟，所以
+ *      这里是反复做，不是只做一次 —— 见下方注释里 2026-09-22 的真机教训。
  */
 static void handle_report(const bambu_report_t *r)
 {
@@ -1468,6 +1493,10 @@ static void handle_report(const bambu_report_t *r)
     if (r->stg_cur != s_last_seen_stg) {
         ams_log("阶段：%s", bambu_stage_text(r->stg_cur));
         s_last_seen_stg = r->stg_cur;
+        /* ★ 阶段一变就把辅助送料的节流清零，让新阶段**立刻**先送一次。
+         *   不清的话要等满一整个周期才动，而校准阶段总共才两三分钟，
+         *   开头那一下不动，现场的感受就是"这个阶段没有辅助送料"。 */
+        s_last_assist_time_us = 0;
     }
 
     /* ---- 挤出机到位（MQTT 来源）---- */
@@ -1480,47 +1509,51 @@ static void handle_report(const bambu_report_t *r)
     /* hw_switch_state == 0 表示"无料"—— 不需要同步更新 extruder_inplace
      * 状态（那只在 do_retract 里通过 s_last_report 直接读取） */
 
-    /* ---- 辅助送料：根据打印机阶段精确控制 ----
+    /* ---- 辅助送料：跟着打印机的阶段**周期性地**做 ----
      *
-     * stg=8  （校准挤出）   → 换料后挤出机第一次拉料，做一次
-     * stg=19 （流量校准）   → 动态流量校准，再做一次
-     * stg=0  （打印中）     → 持续辅助，每 5s 一次（参考 Top-AMS 思路）
+     * stg=8  （校准挤出）     → ★ 本机真机实测：流量校准就是报这个阶段，
+     *                          它**从不报 19**（3 分钟的校准全靠这一条覆盖）
+     * stg=19 （校准挤出流量） → 别的固件版本用这个码，留作兜底
+     * stg=0  （打印中）       → 按层慢慢消耗，5 秒一次就够
      *
-     * 去重标志在 stg 离开目标阶段时重置（stg 从 8→19→0 正常流转，
-     * 每次进入新阶段重新允许触发） */
-
-    /* 重置标志：离开 stg=8 时重置 stg8 标志，离开 stg=19 时重置 stg19 标志 */
-    if (r->stg_cur != 8)  { s_assist_done_stg8  = false; }
-    if (r->stg_cur != 19) { s_assist_done_stg19 = false; }
+     * 之所以校准比打印密：校准期间挤出头在**持续**吃料，间隔放长料就拱不上；
+     * 而打印要连续几个小时，间隔必须放长，否则一直顶着料容易把料憋弯、
+     * 电机也会一直发热。 */
 
     bool assist_do = false;
     const char *assist_why = "";
     int assist_mat = -1;
-    if (config_get_assist_enabled()) {
+    uint32_t assist_period_ms = ASSIST_REPEAT_US / 1000;
+
+    if (config_get_assist_enabled() &&
+        (r->stg_cur == 8 || r->stg_cur == 19 || r->stg_cur == 0)) {
         int cur_ch = config_get_filament_current();
-        if (cur_ch > 0) {
-            int mat = config_material_index_of(cur_ch);
-            if (mat >= 0) {
-                if (r->stg_cur == 8 && !s_assist_done_stg8) {
-                    assist_do = true;
-                    s_assist_done_stg8 = true;
-                    assist_why = "校准挤出";
-                } else if (r->stg_cur == 19 && !s_assist_done_stg19) {
-                    assist_do = true;
-                    s_assist_done_stg19 = true;
-                    assist_why = "流量校准";
-                } else if (r->stg_cur == 0) {
-                    /* 打印中持续辅助，每 ASSIST_REPEAT_US 做一次 */
-                    int64_t now = esp_timer_get_time();
-                    if (now - s_last_assist_time_us >= ASSIST_REPEAT_US) {
-                        assist_do = true;
-                        s_last_assist_time_us = now;
-                        assist_why = "打印中";
-                    }
-                }
-                if (assist_do) {
-                    assist_mat = mat;
-                }
+        int mat = (cur_ch > 0) ? config_material_index_of(cur_ch) : -1;
+        if (mat >= 0) {
+            if (r->stg_cur == 0) {
+                assist_why       = "打印中";
+                assist_period_ms = ASSIST_REPEAT_US / 1000;
+            } else {
+                assist_why       = (r->stg_cur == 8) ? "校准挤出" : "流量校准";
+                /* 周期 = 单次时长 + 1 秒间隔：把网页上的时长调大，
+                 * 校准期间的送料自然就变密、趋近连续。 */
+                assist_period_ms = (uint32_t)config_get_assist_ms() +
+                                   ASSIST_CAL_GAP_MS;
+            }
+
+            int64_t now = esp_timer_get_time();
+            bool due = (s_last_assist_time_us == 0) ||
+                       ((now - s_last_assist_time_us) >=
+                        (int64_t)assist_period_ms * 1000);
+
+            /* ★ 打印机正等着换料时**绝不抢总线**。
+             *   辅助送料会占住共享电机最多 assist_ms，而打印机在
+             *   ams_status=260 只留 ~2 秒窗口（260 → 318750723 只隔 2 秒），
+             *   晚一步退料它就报"请拉出耗材"。换料永远优先。 */
+            if (due && !r->change_needed) {
+                assist_do  = true;
+                assist_mat = mat;
+                s_last_assist_time_us = now;
             }
         }
     }
@@ -1529,14 +1562,14 @@ static void handle_report(const bambu_report_t *r)
         uint8_t  assist_pct = config_get_assist_speed_pct();
         uint16_t assist_ms  = config_get_assist_ms();
 
-        /* ★ 一条日志把"为什么送 / 占空比 / 时长"都带上。
-         *   真机教训：23% 这种低占空比在这个机构上**完全带不动电机**，
-         *   用户看到的现象就是"流量校准 / 打印中辅助送料电机没动作"。
-         *   只在真正要动的时候打一行（打印中每 5 秒一次），并把实际占空比
-         *   印出来 —— 否则现场只能靠猜"到底发没发指令、按多大发的"。 */
-        ams_log("辅助送料（%s）：通道%d @%u%% × %ums",
+        /* ★ 一条日志把"为什么送 / 占空比 / 时长 / 周期"都带上。
+         *   真机教训：23% 这种低占空比在这个机构上**完全带不动电机**
+         *   （20kHz 堵转几乎没有可听噪声），所以实际占空比必须印出来；
+         *   周期也印出来，否则现场没法判断"到底会不会再来一次"。 */
+        ams_log("辅助送料（%s）：通道%d @%u%% × %ums（每 %ums 一次）",
                 assist_why, config_get_filament_current(),
-                (unsigned)assist_pct, (unsigned)assist_ms);
+                (unsigned)assist_pct, (unsigned)assist_ms,
+                (unsigned)assist_period_ms);
         (void)drive_channel_speed(assist_mat, 1, assist_pct, assist_ms,
                                   false, NULL);
     }
@@ -2032,9 +2065,7 @@ esp_err_t ams_init(void)
     s_change_fp_us = 0;
     s_pending_fp = 0;
     s_bed_target_max = 0.0f;
-    s_assist_done_stg8 = false;
-    s_assist_done_stg19 = false;
-    s_last_assist_time_us = 0;
+    s_last_assist_time_us = 0;   /* 0 = 开机后允许立刻做第一次辅助送料 */
     s_state = AMS_STATE_IDLE;
     s_active_material = -1;
 
