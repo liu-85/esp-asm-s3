@@ -751,7 +751,8 @@ int bambu_cmd_gcode(char *buf, size_t buflen, const char *gcode)
      */
     char escaped[512];
     size_t e = 0;
-    for (const char *p = gcode; *p && e + 2 < sizeof(escaped); p++) {
+    /* 循环留 5 字节余量：下面还要保证结尾那个 \n，再加 '\0' */
+    for (const char *p = gcode; *p && e + 5 < sizeof(escaped); p++) {
         switch (*p) {
         case '"':
         case '\\':
@@ -766,6 +767,25 @@ int bambu_cmd_gcode(char *buf, size_t buflen, const char *gcode)
             escaped[e++] = *p;
             break;
         }
+    }
+
+    /* ★★ 结尾的 \n 在这里统一兜住 —— 这是本协议里最容易踩、且最难发现的坑。
+     *
+     *   打印机的 gcode_line 要求 param **以换行结尾**，少了它整条指令会被
+     *   **静默丢弃**：不报错、不应答，只表现成"指令发出去了但一点反应都没有"。
+     *   Top-AMS 是在它自己的 runGcode() 里统一追加的：
+     *       bambu.hpp:12  ... + code + R"(\n" ...   //Gcode结尾一定要\n
+     *
+     *   我们原来是让每个调用点自己写 \n，结果 exchange_heat_nozzle() 里的
+     *   "M109 S%d" 就漏了 —— 那条"进料前把热端升到新料温度"的指令一直没生效，
+     *   只是因为 4 个通道温度都配成 250℃ 才没暴露出来。等哪天通道温度不一样了，
+     *   进料就会撞在偏冷的热端上（料头顶弯、送不进去）。
+     *
+     *   所以改成同一处保证：结尾一定有 \n，且**只保证一个** ——
+     *   调用方写没写都不会变成两个，也不会一个都没有。 */
+    if (!(e >= 2 && escaped[e - 2] == '\\' && escaped[e - 1] == 'n')) {
+        escaped[e++] = '\\';
+        escaped[e++] = 'n';
     }
     escaped[e] = '\0';
 
