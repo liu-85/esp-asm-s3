@@ -73,8 +73,26 @@
 /** 打印机重复上报换料请求时，最多重试几次（超过就停下来报错，别无限折腾） */
 #define AMS_EXCHANGE_MAX_RETRY 5
 
-/** 快速退料指令发出去之后，等打印机做完切刀/吐料的时长 */
-#define AMS_PRIME_WAIT_MS 3000
+/** 快速退料指令发出去之后，只等这么点时间让命令落地；
+ *  ★ 真正"打印机做完切刀 + 吐料"的等待在 do_exchange 里，靠 ams_status
+ *    握手完成（见 wait_printer_need_withdraw_ms）。旧版就是拿这个 3000ms
+ *    当"切刀已经做完了"，实测差了 40 秒 —— 那时打印机还在等喷嘴升温。 */
+#define AMS_PRIME_WAIT_MS 300
+
+/** ★ 等打印机报「退料完成，需要退线」（ams_status=260）的最长时间。
+ *  实测要 40~56 秒（其中 42 秒是喷嘴从 140℃ 升到 245℃），
+ *  喷嘴从室温冷启动时更久，所以给足 3 分钟。 */
+#define AMS_UNLOAD_READY_TIMEOUT_MS 180000
+
+/** 打印机的 ams_status 取值（Top-AMS bambu.hpp 的常量表，A1 实测一致） */
+#define AMS_PSTAT_IDLE          0    /* 空闲 / 退料完成 */
+#define AMS_PSTAT_UNLOADING     259  /* 退料（切刀 + 吐料）进行中 */
+#define AMS_PSTAT_NEED_WITHDRAW 260  /* ★ 退料完成，需要 AMS 退线 */
+
+/** ★ 退料蠕动的节奏（现场要求）：每次退料 2 秒 → 等挤出机信号 1 秒 → 循环 */
+#define AMS_RETRACT_CREEP_MS    2000  /* 单次退料时长 */
+#define AMS_RETRACT_CHECK_MS    1000  /* 每次退料后等挤出机信号的时长 */
+#define AMS_RETRACT_CREEP_MAX   12    /* 最多轮数（≈36 秒），超时转连续退料兜底 */
 
 /** 进料前等热端升到目标温度的最长时间 */
 #define AMS_HEAT_WAIT_MS 30000
@@ -106,6 +124,15 @@ static volatile bool  s_report_pending;
 /* 换料请求去重 */
 static int  s_exchange_attempts;
 static bool s_change_active;
+
+/* ---- ★ 切刀指令已经发出去了（等 do_exchange 去接那个握手）----
+ * handle_report 一拿到通道号就发 `M109 + M620 S255/T255/M621 S255`，
+ * 但那时候打印机还要先升喷嘴温度、再切刀、再吐料，40 秒往上。所以：
+ *   · s_prime_sent      = 指令真的发出去了（没发出去就别在 do_exchange 里等，
+ *                         否则手动/网页触发的换料会白等 3 分钟超时）
+ *   · s_prime_base_status = 发指令那一刻打印机的 ams_status，用来识别"陈旧 260" */
+static volatile bool s_prime_sent;
+static int           s_prime_base_status = -1;
 
 /* ---- 换料"触发指纹"与已完成时刻 ----
  * 打印机会按秒重复上报同一个状态，换料完成后它还会继续报
@@ -468,8 +495,10 @@ static void creep_retract_once(int material_index, uint16_t pulse_ms,
 static bool do_retract(int material_index)
 {
     set_state(AMS_STATE_RETRACT, material_index);
-    ams_log("  退料：开始退料通道 %d（%u 次蠕动 + 等无料 + 连续退料）",
-             material_index + 1, (unsigned)config_get()->creep_times);
+    ams_log("  退料：开始退料料盘位 %d（蠕动 %ums×最多 %u 轮 + 等无料 + 连续退料）",
+             material_index + 1,
+             (unsigned)AMS_RETRACT_CREEP_MS,
+             (unsigned)AMS_RETRACT_CREEP_MAX);
 
     /* ---- 路径 A：有微动 → 分步推，微动触发即停 ---- */
     if (config_sensor_enabled(material_index) &&
@@ -485,70 +514,63 @@ static bool do_retract(int material_index)
         return true;
     }
 
-    /* ---- 路径 B：无微动（C3 默认）→ 蠕动 + 等 MQTT 无料 + 连续退料 ----
+    /* ---- 路径 B：无微动（C3 默认）→ 蠕动退料 + 等无料信号 + 连续退料 ----
      *
-     * 配合 G-code 切刀段：打印机先切刀回冲刷区，再 M400 U1 通知 AMS。
-     *   ① 蠕动退料 N 次（把切断的料拉松）
-     *   ② 每轮等 5 秒 MQTT「无料」信号（hw_switch_state==0）：
-     *      - 收到 0 → 连续退料 → 进进料
-     *      - 没收到（仍是 1）→ 再蠕动一次，重复 ② 直到收到 0
+     * ★ 2026-09-22 真机重写。打印机的"退料"是两个半场：
+     *     · 它那半：升喷嘴温度 → 切刀 → 移到冲刷区 → 把热端里那截料吐出去
+     *     · 我们那半：把料从缓冲/挤出机收回到料盘
+     *   分界线就是 ams_status=260。调用方（do_exchange）**已经在外面等到
+     *   它才进来**，所以这里的每一步都发生在"料已被切断、热端已空"之后。
+     *
+     * 循环节奏（现场要求）：**每次退料 2 秒 → 等挤出机信号 1 秒 → 循环**。
+     *   · 收到"无料"（hw_switch_state 变 0 / 边沿变化）→ 立刻转连续退料收尾；
+     *   · 走满 AMS_RETRACT_CREEP_MAX 轮还没收到 → 超时兜底，照样连续退料。
      */
-    uint8_t creep_n   = config_get()->creep_times;
-    uint16_t creep_ms = config_get()->creep_pulse_ms;
-    uint8_t creep_pct = config_get()->creep_speed_pct;
-    uint16_t cont_ms  = config_get_retract_cont_ms();
-
-    /* ① 第一次蠕动退料 */
-    ams_log("  退料（蠕动）：第 1 次退料，共 %u 次", (unsigned)creep_n);
-    for (uint32_t i = 0; i < creep_n; i++) {
-        creep_retract_once(material_index, creep_ms, creep_pct);
-    }
-
-    /* ② 循环等 MQTT「无料」信号，每轮 5 秒，没收到就再蠕动一次 */
-    uint32_t probe_ms = 5000;
-    uint32_t probe_round = 0;
-    bool got_signal = false;
+    uint8_t  creep_pct = config_get()->creep_speed_pct;
+    uint16_t cont_ms   = config_get_retract_cont_ms();
+    bool got_signal    = false;
 
     if (config_get()->extruder_src == EXTRUDER_SRC_MQTT) {
         uint32_t base_seq = extruder_inplace_seq();
-        const uint32_t MAX_ROUNDS = 6;  /* 最多 6 轮 ≈ 30 s，超时强制兜底 */
-        ams_log("  退料（等无料）：等待 MQTT 无料信号（每轮 %us，最多 %u 轮）",
-                (unsigned)(probe_ms / 1000), (unsigned)MAX_ROUNDS);
-        while (probe_round < MAX_ROUNDS) {
-            probe_round++;
-            int64_t deadline = esp_timer_get_time() + (int64_t)probe_ms * 1000;
+
+        ams_log("  退料（蠕动）：每次退 %ums + 等无料信号 %ums，最多 %u 轮",
+                (unsigned)AMS_RETRACT_CREEP_MS,
+                (unsigned)AMS_RETRACT_CHECK_MS,
+                (unsigned)AMS_RETRACT_CREEP_MAX);
+
+        for (uint32_t round = 1; round <= AMS_RETRACT_CREEP_MAX; round++) {
+            ams_log("  退料（蠕动）：第 %u/%u 次，退 %ums…",
+                    (unsigned)round, (unsigned)AMS_RETRACT_CREEP_MAX,
+                    (unsigned)AMS_RETRACT_CREEP_MS);
+            creep_retract_once(material_index, AMS_RETRACT_CREEP_MS, creep_pct);
+
+            /* 退完这一下，等挤出机信号最多 1 秒 */
+            int64_t deadline = esp_timer_get_time() +
+                               (int64_t)AMS_RETRACT_CHECK_MS * 1000;
             while (esp_timer_get_time() < deadline) {
-                bool no_filament = false;
                 if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
                     if (s_last_report.extruder_inplace_hint == 0) {
-                        no_filament = true;
+                        got_signal = true;
                     }
                     xSemaphoreGive(s_report_lock);
                 }
-                if (no_filament) {
-                    got_signal = true;
-                    ams_log("  退料（等无料）：收到无料信号，料已退出，开始连续退料");
-                    break;
-                }
                 if (extruder_inplace_seq() != base_seq) {
-                    got_signal = true;
-                    ams_log("  退料（等无料）：边沿检测到信号变化，开始连续退料");
+                    got_signal = true;   /* 边沿也算 —— 增量报文只在变化时带值 */
+                }
+                if (got_signal) {
                     break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
-            if (got_signal) break;
-            if (probe_round >= MAX_ROUNDS) {
-                ams_log("  退料（等无料）：等待超时（%u 轮），强制进连续退料",
-                        (unsigned)probe_round);
+            if (got_signal) {
+                ams_log("  退料（蠕动）：收到无料信号（挤出机已空），转连续退料收尾");
                 break;
             }
-            /* 本轮没等到，再蠕动一次 */
-            ams_log("  退料（等无料）：第 %u 轮未收到，再蠕动一次…",
-                    (unsigned)probe_round);
-            for (uint32_t i = 0; i < creep_n; i++) {
-                creep_retract_once(material_index, creep_ms, creep_pct);
-            }
+        }
+        if (!got_signal) {
+            ams_log_warn("  退料（蠕动）：%u 轮都没等到无料信号，按超时兜底"
+                         "（料可能已退到缓冲，或挤出机传感器没跟上）",
+                         (unsigned)AMS_RETRACT_CREEP_MAX);
         }
     } else {
         /* GPIO 模式：保持原有行为 */
@@ -565,7 +587,7 @@ static bool do_retract(int material_index)
         return false;
     }
     s_diag.retract_ok++;
-    ams_log("  退料完成，开始进料");
+    ams_log("退料完成（料已从挤出机收回料盘）");
     return true;
 }
 
@@ -749,8 +771,11 @@ static int probe_current_filament(int fallback)
  *   等到 do_exchange 再发，我们自己的电机已经准备收线了，打印机再切刀
  *   会跟收线抢料。
  *
- * 发完要等 AMS_PRIME_WAIT_MS —— 切刀 + 吐料是机械动作，需要时间。
- * 我们太早介入收线，会把料拽断。这段等待同时也把打印机"送到"了暂停点。
+ * ★ 这条发完**只等 AMS_PRIME_WAIT_MS（300ms）让命令落地**，不做长等待。
+ *   "打印机什么时候真的切完、吐完"由 do_exchange 里的
+ *   wait_printer_need_withdraw_ms() 靠 ams_status 握手来判 ——
+ *   旧版拿 3000ms 当"切刀已经做完"，实测差了 40 秒以上（那 40 秒打印机
+ *   在等喷嘴从 140℃ 升到 245℃），结果我们的电机在料还没切断时就去拽。
  *
  * MQTT 没连上时不报错、只警告：退料仍然可以只靠本机电机完成（只是
  * 更容易打滑），不该因为发不出这条指令就把整次换料判失败。
@@ -768,14 +793,104 @@ static void exchange_prime_extrude(int mat_cur)
     if (n <= 0 || n >= (int)sizeof(g)) {
         return;
     }
+
+    /* 记下发指令那一刻的 ams_status —— 等握手时用它区分"刚变过来的 260"
+     * 和"上一轮残留的 260"。 */
+    {
+        int base = -1;
+        if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+            base = s_last_report.ams_status;
+            xSemaphoreGive(s_report_lock);
+        }
+        s_prime_base_status = base;
+    }
+
     if (bambu_mqtt_send_gcode(g) < 0) {
+        s_prime_sent = false;
         ams_log_warn("  退料：快速退料指令没发出去（MQTT 未连接？），"
                      "只能靠自己硬退，注意别拉断");
         return;
     }
-    ams_log("  退料：已请求打印机快速退料（热端 %d℃，等 %ums 让切刀跑完）",
-            temp, (unsigned)AMS_PRIME_WAIT_MS);
+    s_prime_sent = true;
+    ams_log("  退料：已请求打印机快速退料（切刀 + 吐料），热端 %d℃ —— "
+            "等它报「退料完成需要退线」才轮到我们动手", temp);
     vTaskDelay(pdMS_TO_TICKS(AMS_PRIME_WAIT_MS));
+}
+
+/**
+ * ★ 等打印机把「切刀 + 退到冲刷区 + 把热端里的料吐出去」做完。
+ *
+ * 判定依据就是打印机自己报的 `print.ams_status`（见 bambu_proto.h）：
+ *      259 → 退料进行中（喷嘴到温、开始切刀）
+ *      260 → ★ 退料完成，需要 AMS 退线  ← 等到它，我们才开始退料蠕动
+ *
+ * 2026-09-22 真机实测的变化史（指令 10:00:01 发出）：
+ *      10:00:43 → 259   喷嘴升到 245℃
+ *      10:00:56 → 260   切完 + 吐完
+ * 也就是说**指令到 260 之间隔了 55 秒**。旧版固件盲等 3000ms 就去拽料，
+ * 那时料还是完整的一根、还被挤出机齿轮咬着 —— 电机在打滑，
+ * `hw_switch_state` 一整天没变成 0，打印机最后卡在 stg_cur=24（载入打印
+ * 材料）上报错。这一次把顺序摆正。
+ *
+ * @return true = 等到了 260；false = 超时 / 打印机已经不在暂停态
+ */
+static bool wait_printer_need_withdraw_ms(uint32_t timeout_ms)
+{
+    if (!s_prime_sent) {
+        /* 没发过切刀指令（网页/手动触发的换料），别白等 */
+        ams_log("  未发过切刀指令，跳过打印机退料握手，直接退料");
+        return false;
+    }
+    s_prime_sent = false;   /* 消费掉，避免下一次误等 */
+
+    int  base      = s_prime_base_status;
+    bool left_260  = (base != AMS_PSTAT_NEED_WITHDRAW);
+    bool saw_259   = false;
+    int  last_seen = INT32_MIN;
+
+    ams_log("  等打印机完成切刀 + 吐料（ams_status 要从 %d 走到 %d）…",
+            base, AMS_PSTAT_NEED_WITHDRAW);
+
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        int cur = -1;
+        bool paused = true;
+        if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+            cur    = s_last_report.ams_status;
+            paused = s_last_report.is_paused;
+            xSemaphoreGive(s_report_lock);
+        }
+
+        if (cur != last_seen && cur >= 0) {
+            last_seen = cur;
+            if (cur == AMS_PSTAT_UNLOADING) {
+                saw_259 = true;
+                ams_log("  打印机：退料/切刀进行中（ams_status=%d）", cur);
+            } else if (cur == AMS_PSTAT_NEED_WITHDRAW) {
+                /* 到 260 了 —— 但要排除"上一轮留下的陈旧 260"：
+                 * 必须先看见它离开过 260（或起始就不是 260）。 */
+                if (left_260) {
+                    ams_log("  打印机：退料完成，需要退线（ams_status=%d）"
+                            "→ 现在开始退料", cur);
+                    return true;
+                }
+            } else {
+                /* 又回到 0 或别的值 —— 说明刚离开过 260 */
+                left_260 = true;
+            }
+        }
+
+        if (!paused) {
+            ams_log_warn("  等切刀握手时打印机已不在暂停态（可能被取消），中止等待");
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    ams_log_warn("  等 %us 没等到打印机的退料完成信号（ams_status 最后=%d，"
+                 "见过 259=%s）—— 按超时继续退料，料可能还没被切断",
+                 (unsigned)(timeout_ms / 1000), last_seen, saw_259 ? "是" : "否");
+    return false;
 }
 
 /**
@@ -959,7 +1074,6 @@ static bool do_exchange(int printer_channel)
     } else {
         ams_log("  当前通道 %s，目标通道 %s", cur_txt, new_txt);
     }
-
     /* ----------------------------------------------------------------------
      * ★★ 这里原来有一条"挤出机有料 且 current==目标通道 → 无需更换，直接 resume"，
      *    2026-09-22 真机事故后**已删除**。别看它像优化，它必然把打印搞死。
@@ -999,6 +1113,22 @@ static bool do_exchange(int printer_channel)
                 new_txt);
     }
 
+    /* ---------- 步骤〇：★ 等打印机把"切刀 + 退到冲刷区"做完 ----------
+     *
+     * 2026-09-22 真机暴露的顺序错误：handle_report 一拿到通道号就把
+     * `M109 + M620 S255/T255/M621 S255` 发出去了（那是对的），但打印机
+     * 收到之后还要先**把喷嘴升到 M109 的目标温度**（实测这一步 42 秒），
+     * 再切刀、再移回冲刷区把热端里那截料吐出去 —— 干完这些它才报
+     * `ams_status=260`（"退料完成，需要退线"）。
+     *
+     * 旧固件只盲等 3000ms 就开始退料蠕动，那时料还是完整的一根、还被挤出机
+     * 齿轮咬着，我们的电机在打滑，`hw_switch_state` 从头到尾没变成 0，
+     * 打印机最后卡在 stg_cur=24（载入打印材料）上报错。
+     *
+     * 这一步就是把它那半场等完。等不到（超时 / 机器不给这个字段）也会继续，
+     * 只是日志会显式告警 —— 宁可退得糙一点，也不能把打印机卡在暂停态。 */
+    wait_printer_need_withdraw_ms(AMS_UNLOAD_READY_TIMEOUT_MS);
+
     /* ---------- 步骤一：退料 ----------
      * 把当前通道的料从挤出机/缓冲区收回到料盘。
      * 退料由 AMS 电机完成，不需要打印机侧配合（打印机暂停中
@@ -1012,11 +1142,11 @@ static bool do_exchange(int printer_channel)
     if (!extruder_empty && current > 0) {
         int mat_cur = config_material_index_of(current);
         if (mat_cur >= 0) {
-            ams_log("  退料：正在将通道 %s 的料收回料盘…", cur_txt);
-            /* 打印机的快速退料（切刀 + 把热端里的料吐到缓冲）已经在
-             * handle_report 里发过了 —— 那时打印机还在 RUNNING，指令发得
-             * 出去；等走到这里（打印机已停在 M400 U1）再发就晚了。
-             * 这里只做属于我们自己的那半件事：把料从缓冲收回到料盘。 */
+            /* 日志样式对齐 Top-AMS 的现场显示：正在退出当前通道 N → 退料完成 */
+            ams_log("正在退出当前通道 %s …", cur_txt);
+            /* 打印机的快速退料（切刀 + 吐料 + 退到冲刷区）已经在
+             * handle_report 里发过、并且上面已经等到它报 260 了。
+             * 这里只做属于我们自己的那半件事：把料收回料盘。 */
             if (!do_retract(mat_cur)) {
                 record_error("退料失败，换料中止");
                 s_diag.exchange_fail++;
@@ -1039,13 +1169,36 @@ static bool do_exchange(int printer_channel)
     }
 
     /* ---------- 步骤二：进料 + 蠕动 ----------
-     * 把新通道的料送到挤出机入口，等到位后蠕动 5 次确保咬住。
+     * 把新通道的料送到挤出机入口，等到位后蠕动收尾确保咬住。
      * 挤出机到位信号：C3 走 MQTT hw_switch_state，S3 走 GPIO。 */
-    ams_log("  进料：正在将通道 %s 的料送入挤出机…", new_txt);
+    ams_log("开始送入通道 %s …", new_txt);
 
     /* ★ 先把热端升到新料的温度再送料（见 exchange_heat_nozzle）。
      *   温度不对，料头会在冷热端里顶住、打弯。 */
     exchange_heat_nozzle(mat_new);
+
+    /* ★ 先让打印机的挤出机齿轮转起来（Top-AMS main.cpp:135 的做法：
+     *   `G1 E150 F500` → 等 3 秒 → 再让自己的电机送料）。
+     *
+     *   这是"料送不进去"的关键一环：只靠我们自己推，料头顶到挤出机齿轮口
+     *   就停住了 —— 齿轮不转，料进不了咬合点，`hw_switch_state` 永远变不成
+     *   1，打印机就一直卡在 stg_cur=24 等料。齿轮跟着转，料才能被咬住、
+     *   被带进热端，随后 resume 之后的冲刷块（切片宏里的 FLUSH_START）
+     *   才能真正把新料挤出来。
+     *
+     *   ⚠️ 这条指令在打印机暂停态也会执行（和 M190 / M620 一样）。
+     *   150mm / F500 是 Top-AMS 的取值，别乱改 —— 太小料咬不到位。 */
+    {
+        const char *gear = "G1 E150 F500";
+        if (bambu_mqtt_send_gcode(gear) >= 0) {
+            ams_log("  进料：已请求挤出机齿轮辅助进料（%s），等 3 秒让它转起来",
+                    gear);
+        } else {
+            ams_log_warn("  进料：齿轮辅助指令没发出去（MQTT 未连接？），"
+                         "只靠本机电机推，料可能咬不住");
+        }
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
 
     /* C3 无 GPIO 挤出机到位线，直接进料 */
     if (!do_load(mat_new, false)) {
@@ -1055,17 +1208,20 @@ static bool do_exchange(int printer_channel)
         return false;
     }
 
-    /* 蠕动收尾（等到位 → 蠕动 5 次），即使等不到也强制执行 */
+    /* 蠕动收尾（等到位 → 蠕动），即使等不到也强制执行 */
     if (!feed_until_extruder(mat_new)) {
         ams_log_warn("  未等到挤出机到位，料可能没咬住，仍尝试继续");
     }
 
     /* ---------- 步骤三：记录状态 + resume ----------
-     * 辅助送料不在这里做——此时打印机在暂停，挤出机齿轮没转，
-     * 推料没意义。正确的时机在 handle_report 的 stg=8/19/0 阶段。 */
+     * 辅助送料不在这里做——正确的时机在 handle_report 的 stg=8/19/0 阶段。
+     * 冲刷（切片的 FLUSH_START 块）由打印机在 resume 之后自己执行，
+     * 固件**不要**再加一次，否则会双重冲刷。 */
     config_set_filament_current(printer_channel);
     s_diag.exchange_ok++;
-    ams_log("  换色完成：通道 %s 已装载到挤出机，发送 resume", new_txt);
+    ams_log("送料完成：通道 %s 已装载到挤出机", new_txt);
+    ams_log("换色完成：%s → %s，发送 resume（后续冲刷由切片的 FLUSH 块执行）",
+            cur_txt, new_txt);
     set_state(AMS_STATE_IDLE, -1);
 
     /* resume 让打印机的 G-code 从 M73 P101 之后继续执行：
@@ -1388,6 +1544,9 @@ static void handle_report(const bambu_report_t *r)
         ams_log("  换料命令排队失败（设备正忙），等打印机的下一次请求");
         s_change_active = false;
         s_pending_fp = 0;
+        /* 切刀指令已经发出去了但换料没排上 —— 别把"待握手"的标记留着，
+         * 否则下一次手动/网页触发的换料会在 do_exchange 里白等 3 分钟。 */
+        s_prime_sent = false;
     }
 }
 

@@ -430,6 +430,7 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
     memset(out, 0, sizeof(*out));
     out->filament_next = -1;
     out->extruder_inplace_hint = -1;
+    out->ams_status = -1;
     out->stage_text = "未知";
 
     cJSON *root = cJSON_ParseWithLength(json, len);
@@ -688,6 +689,12 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
 
     /* ---- 挤出机到位提示（见函数上方的说明）---- */
     out->extruder_inplace_hint = probe_extruder_inplace(print);
+
+    /* ---- ★ AMS 握手状态（见 bambu_proto.h 的 ams_status）----
+     * 从**累积对象**读，所以拿到的是"最新已知值"而不是"这帧带没带"。
+     * 这正是握手要的语义：等它变成 260（退料完成需要退线）。
+     * 没见过就返回 -1，调用方据此判断"这台机器不给这个字段"。 */
+    out->ams_status = json_int(print, "ams_status", -1);
 
     cJSON_Delete(root);
     return ESP_OK;
