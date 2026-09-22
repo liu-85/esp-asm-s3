@@ -362,6 +362,62 @@ static int parse_color_str(const char *s, int *out_rgb)
     return 0;
 }
 
+/**
+ * ★ 把这一帧的 print 段合并进"累积状态"，返回累积对象。
+ *
+ * 为什么必须这么做（2026-09-22 真机事故后加的）——
+ *
+ *   拓竹打印机上报的是**增量**状态：某个字段只有"值变了"的那一帧才带，
+ *   其余帧里这个键**根本不出现**（有时会显式给 null）。
+ *   而本文件的取值一律是"缺字段 → 默认值"的写法，于是下游会把
+ *   "打印机这帧没提"读成"值就是 0"。已经确认的两个后果：
+ *
+ *     · bed_target_temper 被读成 0
+ *         → 热床温度记忆被每一帧增量报文清空
+ *         → 换色时"没有热床温度的历史记录"，M190 发不出去
+ *         → 热床被 M140 S{next+1} 留在 3℃ 一晚上，打印卡死
+ *     · nozzle_target_temper 被读成 0
+ *         → "等热端到温"永远等不到（喷嘴明明一直在 250℃），白等 30 秒
+ *
+ *   修法：维护一份跨帧累积的 print 对象，把这一帧带的字段覆盖进去，
+ *   后面所有字段都从这个累积对象里读。"缺字段"于是真的等价于
+ *   "沿用上一次的值"，和打印机上报的语义一致。
+ *
+ * 两点注意：
+ *   ① 显式 null 表示"当前没有这个值"，**不能**拿它覆盖已有值 —— 跳过。
+ *   ② 累积对象是常驻的（键集合有限，不会无限增长），由 cJSON 自己管内存；
+ *      每帧只 duplicate 变了的那个键，开销和原来一次解析相当。
+ */
+static const cJSON *merge_incremental_print(const cJSON *root)
+{
+    const cJSON *incoming = cJSON_GetObjectItemCaseSensitive(root, "print");
+    if (!cJSON_IsObject(incoming)) {
+        return NULL;
+    }
+
+    static cJSON *s_merged = NULL;
+    if (s_merged == NULL) {
+        s_merged = cJSON_CreateObject();
+        if (s_merged == NULL) {
+            /* 内存不够时退回"只看这一帧"的老行为，总比整条链路挂掉强 */
+            return incoming;
+        }
+    }
+
+    const cJSON *c = NULL;
+    cJSON_ArrayForEach(c, incoming) {
+        if (c->string == NULL || cJSON_IsNull(c)) {
+            continue;
+        }
+        cJSON *dup = cJSON_Duplicate(c, true);
+        if (dup == NULL) {
+            continue;
+        }
+        cJSON_ReplaceItemInObjectCaseSensitive(s_merged, c->string, dup);
+    }
+    return s_merged;
+}
+
 esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
 {
     if (!json || !out) {
@@ -377,7 +433,8 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
         return ESP_ERR_INVALID_ARG;
     }
 
-    const cJSON *print = cJSON_GetObjectItemCaseSensitive(root, "print");
+    /* print 指向**跨帧累积**的对象（打印机发的是增量报文，见函数说明） */
+    const cJSON *print = merge_incremental_print(root);
     if (!cJSON_IsObject(print)) {
         /* 心跳 / 空报文，属于正常现象，不是错误 */
         cJSON_Delete(root);
@@ -433,7 +490,17 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
     out->nozzle_temper = json_float(print, "nozzle_temper", 0);
     out->nozzle_target = json_float(print, "nozzle_target_temper", 0);
     out->bed_temper    = json_float(print, "bed_temper", 0);
-    out->bed_target    = json_float(print, "bed_target_temper", 0);
+
+    /* ★ 这里不能图省事用 json_float —— 缺字段时它返回默认值 0，
+     *   而"这帧没带床温"和"床温真的是 0"在换料逻辑里含义完全相反。
+     *   参见 bambu_proto.h 的 has_bed_target。 */
+    {
+        const cJSON *bed_tgt =
+            cJSON_GetObjectItemCaseSensitive(print, "bed_target_temper");
+        out->has_bed_target = cJSON_IsNumber(bed_tgt);
+        out->bed_target = out->has_bed_target
+                              ? (float)bed_tgt->valuedouble : 0.0f;
+    }
 
     /* ---- 热床温度信道（文件头通路 ①）----
      * 切片用 `M140 S{next_extruder + 1};EXT` 把通道号写进"目标床温"，

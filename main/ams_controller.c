@@ -1105,13 +1105,22 @@ static void handle_report(const bambu_report_t *r)
      * 打印机上报的 bed_target 会变成 1~16。真实床温要在被改写**之前**
      * 记住，换完再用 M190 还回去 —— 不还的话热床真的会按 M140 的设定
      * 降到 1~4℃，当前这一层直接粘不住。 */
-    if (r->bed_channel > 0) {
+    if (!r->has_bed_target) {
+        /* ★ 这一帧压根没提床温 —— 打印机只发增量字段，**什么都别做**。
+         *   2026-09-22 真机事故：以前这里把解析层的默认值 0 当成"床温真的
+         *   关了"，于是每收到一帧不带该字段的报文就把刚记住的 76℃ 清掉。
+         *   换色那一刻必然"没有热床温度的历史记录" → M190 从没发出去 →
+         *   热床被 M140 S{next+1} 留在 3℃ 凉了一整晚。
+         *   这一条就是那次卡死的根因。 */
+    } else if (r->bed_channel > 0) {
         /* 这一帧的床温是通道号，不是温度 —— 别污染记忆值 */
     } else if (r->bed_target >= 17.0f) {
         /* 取见过的最高值：不同层/不同材料的床温不同（PLA 首层 60、后续 55），
          * 取最高能保证恢复后不会偏低。 */
         if (r->bed_target > s_bed_target_max) {
             s_bed_target_max = r->bed_target;
+            ams_log("记住热床温度 %.0f℃（换完用它发 M190 恢复）",
+                    (double)s_bed_target_max);
         }
     } else {
         /* 0（空闲 / 打印结束）或 17 以下的异常值：没有可信的床温，
@@ -1281,10 +1290,15 @@ static void handle_report(const bambu_report_t *r)
     if (r->bed_channel > 0) {
         if (s_bed_target_max > 0.0f) {
             char g[48];
-            snprintf(g, sizeof(g), "M190 S%.0f", (double)s_bed_target_max);
+            char msg[48];
+            /* ★ 结尾的 \n 不能省 —— gcode_line 的 param 必须以换行结尾，
+             *   少了它这条 M190 会被打印机静默丢弃，热床就一直留在 1~4℃。
+             *   日志里单独用不带 \n 的 msg，免得日志多一个空行。 */
+            snprintf(msg, sizeof(msg), "M190 S%.0f", (double)s_bed_target_max);
+            snprintf(g, sizeof(g), "%s\n", msg);
             if (bambu_mqtt_send_gcode(g) >= 0) {
                 ams_log("  已请求恢复热床温度：%s"
-                        "（不恢复的话它会真的降到 1~4℃）", g);
+                        "（不恢复的话它会真的降到 1~4℃）", msg);
             } else {
                 ams_log_warn("  恢复热床温度失败（MQTT 未连接？）—— "
                              "打印完请检查床温，可能已经掉了");
