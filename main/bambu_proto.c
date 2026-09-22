@@ -413,7 +413,11 @@ static const cJSON *merge_incremental_print(const cJSON *root)
         if (dup == NULL) {
             continue;
         }
-        cJSON_ReplaceItemInObjectCaseSensitive(s_merged, c->string, dup);
+        /* ★ 必须先删再加，不能用 cJSON_ReplaceItemInObjectCaseSensitive ——
+         *   它内部走 ReplaceItemViaPointer，键**还不存在**时直接返回 false
+         *   什么都不做；累积对象就会永远是个空壳，一个字段都攒不下来。 */
+        cJSON_DeleteItemFromObjectCaseSensitive(s_merged, c->string);
+        cJSON_AddItemToObject(s_merged, c->string, dup);
     }
     return s_merged;
 }
