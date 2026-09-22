@@ -1289,16 +1289,19 @@ static void handle_report(const bambu_report_t *r)
      * 发完 M190 之后打印机的 bed_target 立刻变回真实值，所以这段只会走一次。 */
     if (r->bed_channel > 0) {
         if (s_bed_target_max > 0.0f) {
-            char g[48];
-            char msg[48];
+            char g[64];   /* 留足余量：GCC 对 %.0f 的最大长度算得很宽 */
             /* ★ 结尾的 \n 不能省 —— gcode_line 的 param 必须以换行结尾，
              *   少了它这条 M190 会被打印机静默丢弃，热床就一直留在 1~4℃。
-             *   日志里单独用不带 \n 的 msg，免得日志多一个空行。 */
-            snprintf(msg, sizeof(msg), "M190 S%.0f", (double)s_bed_target_max);
-            snprintf(g, sizeof(g), "%s\n", msg);
+             *
+             * ★ 别用 `snprintf(g, sizeof(g), "%s\n", msg)` 去拼：GCC 会算出
+             *   "48 字节的 msg + \n" 可能放不下 48 字节的 g，于是
+             *   -Werror=format-truncation 直接编译失败（ESP-IDF 默认开
+             *   -Werror=all）。这里一次成型，日志再单独格一遍（不带 \n）。 */
+            snprintf(g, sizeof(g), "M190 S%.0f\n", (double)s_bed_target_max);
             if (bambu_mqtt_send_gcode(g) >= 0) {
-                ams_log("  已请求恢复热床温度：%s"
-                        "（不恢复的话它会真的降到 1~4℃）", msg);
+                ams_log("  已请求恢复热床温度：M190 S%.0f"
+                        "（不恢复的话它会真的降到 1~4℃）",
+                        (double)s_bed_target_max);
             } else {
                 ams_log_warn("  恢复热床温度失败（MQTT 未连接？）—— "
                              "打印完请检查床温，可能已经掉了");
