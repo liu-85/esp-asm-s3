@@ -1039,7 +1039,12 @@ static bool do_exchange(int printer_channel)
 
     set_state(AMS_STATE_EXCHANGE, mat_new);
 
-    ams_log("开始换色：目标通道 %d", printer_channel);
+    /* ★ 日志样式对齐 Top-AMS 的现场显示（用户要求一眼能看懂换到第几次、换哪一路）：
+     *     ######## 开始第 N 次换色 ########
+     *     当前通道 X → 目标通道 Y
+     *     （随后）正在退出当前通道 X → 退料完成 → 开始送入通道 Y → 送料完成 */
+    ams_log("######## 开始第 %u 次换色 ########",
+            (unsigned)(s_diag.exchange_ok + s_diag.exchange_fail + 1));
 
     int current = config_get_filament_current();
     current = probe_current_filament(current);
