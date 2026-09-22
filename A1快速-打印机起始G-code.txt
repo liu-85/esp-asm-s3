@@ -358,7 +358,11 @@ G1 X-28.5 F30000
 G1 X-48.2 F3000
 
 ;首次换色
-M140 S{ams_initial_tray};EXT
+; ★ 通道号用切片器原生变量传：{ams_initial_tray} 不是 Bambu Studio 变量，
+;   必须配合 tools/esp_ams_postprocess.py 后处理才有效。不挂脚本时会被
+;   原样输出成非法参数 → 打印机收不到热床信道信令 → 卡在
+;   gcode_claim_action:24 不动。本行已换成切片器能直接解析的写法。
+M140 S{initial_no_support_extruder+1};EXT
 M400 U1;暂停触发换色
 
 

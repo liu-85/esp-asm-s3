@@ -3,8 +3,6 @@
 ; ===== Filamentor V0.3 ====================
 ; ===== Based on the official A1 mini change filament gcode (20231225)======
 
-M140 S{next_extruder + 1};EXT
-
 G392 S0
 M1007 S0
 
@@ -22,6 +20,11 @@ M106 P2 S0
 M104 S[old_filament_temp]
 {endif}
 G1 X-48.2 F18000
+; 热床目标温度传通道号 —— 固件的主力触发通路（本文件唯一通路）。
+; ★ 必须紧贴 M400 U1：固件要求打印机已暂停才动手。若放在文件开头
+;   （切刀之前），信令与暂停之间会隔着几十行动作，打印机还在移动时
+;   就会去换料 —— 会撞机。
+M140 S{next_extruder + 1};EXT
 M400 U1
 
 

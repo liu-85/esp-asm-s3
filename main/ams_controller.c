@@ -949,7 +949,8 @@ static bool do_exchange(int printer_channel)
     }
 
     /* ★ 跳过退料、直接进料：M400 U1 触发后挤出机通常无料
-     *   （首次换色段：A1 起始 G-code 的「首次换色」块 M140 S{ams_initial_tray};EXT + M400 U1
+     *   （首次换色段：A1 起始 G-code 的「首次换色」块
+     *   `M140 S{initial_no_support_extruder+1};EXT` + `M400 U1`
      *   只通知 AMS 切道，不做退料；但 AMS 仍需把新通道的料喂进挤出机，否则后续
      *   冲刷、流量校准都会失败。
      *
