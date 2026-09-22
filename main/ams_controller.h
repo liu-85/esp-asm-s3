@@ -67,7 +67,9 @@ extern "C" {
 #define AMS_RETRACT_STEPS        15
 /** 进料最多重试几轮（有到位开关时到位即停） */
 #define AMS_LOAD_RETRY_TIMES     10
-/** 打印机拉料时的辅助送料时长 */
+/** 打印机拉料时的辅助送料时长 —— ⚠️ 已搬到 config（config_get_assist_ms()，
+ *  网页「硬件调试」可改）。这里保留只是为了兼容老引用，新代码别再用它：
+ *  写死时长导致现场想调一次就得重烧固件。 */
 #define AMS_LOAD_ASSIST_MS       1000
 
 /**

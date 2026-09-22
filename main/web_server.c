@@ -395,15 +395,19 @@ static esp_err_t h_status(httpd_req_t *req)
                           BOARD_PIN_EXTRUDER_INPLACE >= 0 &&
                           !BOARD_EXTRUDER_INPLACE_UNUSED);
 
-    /* ---- 辅助送料参数（本次新增） ---- */
+    /* ---- 辅助送料参数 ---- */
     cJSON *assist = cJSON_AddObjectToObject(o, "assist");
     cJSON_AddBoolToObject(assist, "enabled", cfg->assist_enabled != 0);
     cJSON_AddNumberToObject(assist, "speed_pct", cfg->assist_speed_pct);
+    cJSON_AddNumberToObject(assist, "ms", cfg->assist_ms);
 
-    /* ---- 退料参数 ---- */
+    /* ---- 退料参数（全是现场要调的，网页「硬件调试」里可改） ---- */
     cJSON *retract = cJSON_AddObjectToObject(o, "retract");
     cJSON_AddNumberToObject(retract, "wait_ms", cfg->retract_wait_ms);
     cJSON_AddNumberToObject(retract, "cont_ms", cfg->retract_cont_ms);
+    cJSON_AddNumberToObject(retract, "creep_ms", cfg->retract_creep_ms);
+    cJSON_AddNumberToObject(retract, "gap_ms", cfg->retract_gap_ms);
+    cJSON_AddNumberToObject(retract, "creep_max", cfg->retract_creep_max);
 
     /* ---- 换料温度（每个料盘位一个）----
      * 走 config_get_temper() 而不是直读 cfg->temper：没配过的位在 NVS 里
@@ -1045,15 +1049,20 @@ static esp_err_t h_extruder_src_set(httpd_req_t *req)
     return reply_ok(req, true, info);
 }
 
-/** POST /assist_set  body: {"enabled":0/1, "speed_pct":50} */
+/** POST /assist_set  body: {"enabled":0/1, "speed_pct":60, "ms":1500}
+ *
+ *  ★ 占空比和时长都要能改：真机上 23% 这种低占空比完全带不动电机，
+ *    用户看到的现象是"打印中辅助送料电机没动作"。现场需要能在网页上
+ *    一边调一边听电机声，而不是每次改都重烧固件。 */
 static esp_err_t h_assist_set(httpd_req_t *req)
 {
     cJSON *b = read_body_json(req);
     int enabled = json_int(b, "enabled", -1);
     int pct     = json_int(b, "speed_pct", -1);
+    int ms      = json_int(b, "ms", -1);
     cJSON_Delete(b);
 
-    if (enabled < 0 && pct < 0) {
+    if (enabled < 0 && pct < 0 && ms < 0) {
         return reply_ok(req, false, "缺少参数");
     }
 
@@ -1063,40 +1072,59 @@ static esp_err_t h_assist_set(httpd_req_t *req)
     if (pct >= 0) {
         config_set_assist_speed_pct((uint8_t)pct);
     }
-
-    ams_log("辅助送料已更新：enabled=%d, pct=%u%%",
-            config_get_assist_enabled(),
-            (unsigned)config_get_assist_speed_pct());
-    return reply_ok(req, true,
-                    "辅助送料参数已保存（可在「状态」面板确认生效值）");
-}
-
-/** POST /retract_set  body: {"wait_ms":5000, "cont_ms":5000} */
-static esp_err_t h_retract_set(httpd_req_t *req)
-{
-    cJSON *b = read_body_json(req);
-    int wait_ms = json_int(b, "wait_ms", -1);
-    int cont_ms = json_int(b, "cont_ms", -1);
-    cJSON_Delete(b);
-
-    if (wait_ms < 0 && cont_ms < 0) {
-        return reply_ok(req, false, "缺少参数");
-    }
-
-    uint16_t got_wait = config_get_retract_wait_ms();
-    uint16_t got_cont = config_get_retract_cont_ms();
-
-    if (wait_ms >= 0) {
-        got_wait = config_set_retract_wait_ms(wait_ms);
-    }
-    if (cont_ms >= 0) {
-        got_cont = config_set_retract_cont_ms(cont_ms);
+    if (ms >= 0) {
+        config_set_assist_ms(ms);
     }
 
     char info[128];
+    snprintf(info, sizeof(info), "辅助送料已保存：%s @%u%% × %ums",
+             config_get_assist_enabled() ? "开启" : "关闭",
+             (unsigned)config_get_assist_speed_pct(),
+             (unsigned)config_get_assist_ms());
+    ams_log("%s", info);
+    return reply_ok(req, true, info);
+}
+
+/** POST /retract_set
+ *
+ *  body: {"wait_ms":5000, "cont_ms":6000, "creep_ms":2000,
+ *         "gap_ms":1000, "creep_max":3}
+ *
+ *  只传其中几个也可以，没传的保持原值。`creep_max = 0` 是**合法值**
+ *  （表示"只做连续退料、不蠕动"），所以判"没传"用的是 -1 而不是 0。
+ */
+static esp_err_t h_retract_set(httpd_req_t *req)
+{
+    cJSON *b = read_body_json(req);
+    int wait_ms   = json_int(b, "wait_ms", -1);
+    int cont_ms   = json_int(b, "cont_ms", -1);
+    int creep_ms  = json_int(b, "creep_ms", -1);
+    int gap_ms    = json_int(b, "gap_ms", -1);
+    int creep_max = json_int(b, "creep_max", -1);
+    cJSON_Delete(b);
+
+    if (wait_ms < 0 && cont_ms < 0 && creep_ms < 0 && gap_ms < 0 &&
+        creep_max < 0) {
+        return reply_ok(req, false, "缺少参数");
+    }
+
+    uint16_t got_wait  = config_get_retract_wait_ms();
+    uint16_t got_cont  = config_get_retract_cont_ms();
+    uint16_t got_creep = config_get_retract_creep_ms();
+    uint16_t got_gap   = config_get_retract_gap_ms();
+    uint8_t  got_max   = config_get_retract_creep_max();
+
+    if (wait_ms   >= 0) { got_wait  = config_set_retract_wait_ms(wait_ms); }
+    if (cont_ms   >= 0) { got_cont  = config_set_retract_cont_ms(cont_ms); }
+    if (creep_ms  >= 0) { got_creep = config_set_retract_creep_ms(creep_ms); }
+    if (gap_ms    >= 0) { got_gap   = config_set_retract_gap_ms(gap_ms); }
+    if (creep_max >= 0) { got_max   = config_set_retract_creep_max(creep_max); }
+
+    char info[160];
     snprintf(info, sizeof(info),
-             "退料参数已保存：等MQTT %ums + 连续退料 %ums",
-             (unsigned)got_wait, (unsigned)got_cont);
+             "退料参数已保存：先连续 %ums，拉不出来再蠕动 %u 轮 × %ums（间隔 %ums）",
+             (unsigned)got_cont, (unsigned)got_max,
+             (unsigned)got_creep, (unsigned)got_gap);
     ams_log("%s", info);
     return reply_ok(req, true, info);
 }

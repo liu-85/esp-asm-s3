@@ -230,36 +230,60 @@
             <label style="flex:1 1 140px;font-size:13px" class="dim">PWM 速度（%）
               <input type="number" id="assist_speed" min="5" max="100" step="5" style="width:80px">
             </label>
-            <button class="primary" style="flex:1" id="btn_assist_save">保存 PWM</button>
+            <label style="flex:1 1 140px;font-size:13px" class="dim">每次时长（ms）
+              <input type="number" id="assist_ms" min="200" max="10000" step="100" style="width:90px">
+            </label>
+            <button class="primary" style="flex:1" id="btn_assist_save">保存</button>
           </div>
           <div class="tip">
-            换色/流量校准（M620/M621）时，AMS 同步以该 PWM 推料，帮助打印机齿轮咬住新料。
+            换色 / 校准挤出 / 流量校准 / 打印中，AMS 同步以该 PWM 推料，帮打印机齿轮咬住新料。
             <div class="hr"></div>
-            默认 <b>50%</b>，范围 5%~100%。关闭后换色时不再同步辅助送料。
+            <b>PWM 速度</b>：默认 60%，范围 5%~100%。
+            ⚠️ <b>低于 60% 会带不动本机构的电机</b> —— 现场表现为"电机没动作、听不到声"，
+            那是堵转不是没发指令。调的时候一边听电机声一边往上加，直到能听到明显转动。
+            <div class="hr"></div>
+            <b>每次时长</b>：默认 1500ms，范围 200~10000ms。太短推不动料，太长会把料顶过头。
+            <div class="hr"></div>
+            关闭总开关后换色/打印中都不再同步辅助送料。
           </div>
         </div>
 
         <div class="card">
-          <h2>退料参数 <span class="sub">C3 降级模式（蠕动退料 + MQTT等待 + 连续退料）</span></h2>
+          <h2>退料参数 <span class="sub">C3 降级模式：先连续拉，拉不出来再蠕动</span></h2>
           <div class="row" style="align-items:center">
-            <label style="flex:1 1 140px;font-size:13px" class="dim">等待MQTT（ms）
-              <input type="number" id="retract_wait_ms" min="1000" max="15000" step="500" style="width:100px">
-            </label>
             <label style="flex:1 1 140px;font-size:13px" class="dim">连续退料（ms）
-              <input type="number" id="retract_cont_ms" min="1000" max="15000" step="500" style="width:100px">
+              <input type="number" id="retract_cont_ms" min="1000" max="30000" step="500" style="width:100px">
+            </label>
+            <label style="flex:1 1 140px;font-size:13px" class="dim">蠕动退料时长（ms）
+              <input type="number" id="retract_creep_ms" min="100" max="10000" step="100" style="width:100px">
             </label>
           </div>
-          <div class="row" style="margin-top:10px">
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">蠕动间隔（ms）
+              <input type="number" id="retract_gap_ms" min="100" max="5000" step="100" style="width:100px">
+            </label>
+            <label style="flex:1 1 140px;font-size:13px" class="dim">蠕动轮数上限
+              <input type="number" id="retract_creep_max" min="0" max="20" step="1" style="width:100px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">GPIO模式等信号（ms）
+              <input type="number" id="retract_wait_ms" min="1000" max="15000" step="500" style="width:100px">
+            </label>
             <button class="primary" style="flex:1" id="btn_retract_save">保存退料参数</button>
           </div>
           <div class="tip">
-            <b>蠕动退料后等待MQTT</b>：电机以蠕动方式反向退料，过程中持续监听挤出机 MQTT 信号
-            （hw_switch_state），收到"没料"后自动执行连续退料。
+            <b>顺序是「先连续、后蠕动」</b>：打印机报 ams_status=260（切完刀、挤出机已跑回冲刷区、
+            该我们收线了）之后，<b>立刻全速连续拉料</b>，最长「连续退料」毫秒；期间每 250ms
+            查一次挤出机 MQTT 信号（hw_switch_state），一报"挤出机已空"就停，再多拉 0.5 秒收尾。
             <div class="hr"></div>
-            <b>连续退料时长</b>：收到没料信号后，电机连续退料的时长（默认 5000ms），
-            用于把旧料完全挤出，再开始送入新通道耗材。
+            拉满时间还没等到信号，才退回慢速蠕动：拱「蠕动轮数上限」轮，每轮「蠕动退料时长」，
+            轮间等「蠕动间隔」（同时查信号）。<b>轮数填 0 = 不做蠕动，只连续退料。</b>
             <div class="hr"></div>
-            两个参数范围均为 1000~15000ms。
+            <b>GPIO模式等信号</b>：只有挤出机信号来源选了 GPIO 才会用到（C3 默认走 MQTT，用不到）。
+            <div class="hr"></div>
+            ⚠️ 蠕动速度在下面「自吸参数」里调。实测 <b>45% 占空比完全带不动电机</b>
+            （24 秒蠕动一根料都没拉动），别把蠕动速度调低于 60%。
           </div>
         </div>
 
@@ -347,7 +371,11 @@
           <div class="tip">
             速度越低、脉冲越短 → 越"温柔"，但也越可能没把料咬住；
             次数越多 → 越可靠，但每多一次就多一次机械磨损。
-            默认 <b>3 次 × 400ms @ 45%</b>，建议先用默认值，不行再调。
+            默认 <b>3 次 × 400ms @ 70%</b>。
+            <div class="hr"></div>
+            ⚠️ <b>「速度」低于 60% 会带不动本机构的电机</b>：现象是"电机不转、也听不到声"，
+            那是占空比太低在堵转，不是指令没发出去。实测 45% 时蠕动退料跑满 24 秒
+            一根料都没拉动。要调慢就加长「单次时长」，别把速度往下压。
           </div>
         </div>
       </section>

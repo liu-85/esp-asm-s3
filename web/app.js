@@ -779,10 +779,18 @@
        蠕动参数
        ======================================================================= */
     function saveCreep() {
+        var spd = parseInt(val('creep_speed') || '70', 10);
+        /* 低于 60% 只会堵转（听不到声、料不动）—— 与其让用户对着"没反应"猜，
+         * 不如保存前直接拦一下，把原因说清楚。 */
+        if (!isNaN(spd) && spd < 60) {
+            toast('蠕动速度低于 60% 会带不动电机（只会堵转、听不到声）。'
+                  + '要更慢请加长「单次时长」，别压速度。', 'bad');
+            return;
+        }
         post('/creep_set', {
             times:     parseInt(val('creep_times') || '3', 10),
             pulse_ms:  parseInt(val('creep_pulse') || '400', 10),
-            speed_pct: parseInt(val('creep_speed') || '45', 10)
+            speed_pct: isNaN(spd) ? 70 : spd
         }, function (d) {
             toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
             refresh();
@@ -796,10 +804,14 @@
         a = a || {};
         var elCk = $('assist_enabled');
         var elSpd = $('assist_speed');
+        var elMs = $('assist_ms');
         if (!elCk || !elSpd) return;
         elCk.checked = !!a.enabled;
         if (typeof a.speed_pct === 'number' && document.activeElement !== elSpd) {
             if (String(a.speed_pct) !== elSpd.value) elSpd.value = a.speed_pct;
+        }
+        if (elMs && typeof a.ms === 'number' && document.activeElement !== elMs) {
+            if (String(a.ms) !== elMs.value) elMs.value = a.ms;
         }
     }
 
@@ -815,11 +827,16 @@
 
     function saveAssistPct() {
         var v = parseInt(val('assist_speed'), 10);
+        var ms = parseInt(val('assist_ms'), 10);
         if (isNaN(v) || v < 5 || v > 100) {
-            toast('PWM 速度请在 5~100 之间', 'bad');
+            toast('PWM 速度请在 5~100 之间（低于 60% 会带不动电机）', 'bad');
             return;
         }
-        post('/assist_set', { speed_pct: v }, function (d) {
+        if (isNaN(ms) || ms < 200 || ms > 10000) {
+            toast('每次时长请在 200~10000ms 之间', 'bad');
+            return;
+        }
+        post('/assist_set', { speed_pct: v, ms: ms }, function (d) {
             toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
             refresh();
         });
@@ -830,29 +847,55 @@
        ======================================================================= */
     function updateRetract(r) {
         r = r || {};
-        var elW = $('retract_wait_ms');
-        var elC = $('retract_cont_ms');
-        if (!elW || !elC) return;
-        if (typeof r.wait_ms === 'number' && document.activeElement !== elW) {
-            if (String(r.wait_ms) !== elW.value) elW.value = r.wait_ms;
-        }
-        if (typeof r.cont_ms === 'number' && document.activeElement !== elC) {
-            if (String(r.cont_ms) !== elC.value) elC.value = r.cont_ms;
-        }
+        var map = {
+            retract_wait_ms:    r.wait_ms,
+            retract_cont_ms:    r.cont_ms,
+            retract_creep_ms:   r.creep_ms,
+            retract_gap_ms:     r.gap_ms,
+            retract_creep_max:  r.creep_max
+        };
+        Object.keys(map).forEach(function (id) {
+            var el = $(id);
+            var v = map[id];
+            if (!el || typeof v !== 'number') return;
+            /* 正在输入的框不要被刷新顶掉 —— 否则每 5 秒一次的轮询会把手打的
+             * 数字擦掉，用户会以为"改了但保存不上去" */
+            if (document.activeElement === el) return;
+            if (String(v) !== el.value) el.value = v;
+        });
     }
 
     function saveRetract() {
-        var w = parseInt(val('retract_wait_ms') || '5000', 10);
-        var c = parseInt(val('retract_cont_ms') || '5000', 10);
+        var c   = parseInt(val('retract_cont_ms') || '6000', 10);
+        var cm  = parseInt(val('retract_creep_ms') || '2000', 10);
+        var g   = parseInt(val('retract_gap_ms') || '1000', 10);
+        var mx  = parseInt(val('retract_creep_max') || '0', 10);
+        var w   = parseInt(val('retract_wait_ms') || '5000', 10);
+
+        if (isNaN(c) || c < 1000 || c > 30000) {
+            toast('连续退料时长请在 1000~30000ms 之间', 'bad');
+            return;
+        }
+        if (isNaN(cm) || cm < 100 || cm > 10000) {
+            toast('蠕动退料时长请在 100~10000ms 之间', 'bad');
+            return;
+        }
+        if (isNaN(g) || g < 100 || g > 5000) {
+            toast('蠕动间隔请在 100~5000ms 之间', 'bad');
+            return;
+        }
+        if (isNaN(mx) || mx < 0 || mx > 20) {
+            toast('蠕动轮数上限请在 0~20 之间（0 = 不蠕动）', 'bad');
+            return;
+        }
         if (isNaN(w) || w < 1000 || w > 15000) {
-            toast('等待 MQTT 时长请在 1000~15000ms 之间', 'bad');
+            toast('GPIO 模式等信号请在 1000~15000ms 之间', 'bad');
             return;
         }
-        if (isNaN(c) || c < 1000 || c > 15000) {
-            toast('连续退料时长请在 1000~15000ms 之间', 'bad');
-            return;
-        }
-        post('/retract_set', { wait_ms: w, cont_ms: c }, function (d) {
+        post('/retract_set', {
+            wait_ms: w, cont_ms: c, creep_ms: cm,
+            gap_ms: g, creep_max: mx
+        }, function (d) {
             toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
             refresh();
         });
@@ -1144,8 +1187,11 @@
            接口慢的时候整页也不会停在"加载中…"。 */
         renderAccess([1, 2, 3, 4], DEFAULT_COLORS, 0);
         updateHardware({ channels: [1, 2, 3, 4], engaged: [], limits: [], motor_direction: 0, conflicts: 0 });
-        updateAssist({ enabled: 1, speed_pct: 50 });
-        updateRetract({ wait_ms: 5000, cont_ms: 5000 });
+        updateAssist({ enabled: 1, speed_pct: 60, ms: 1500 });
+        updateRetract({
+            wait_ms: 5000, cont_ms: 6000,
+            creep_ms: 2000, gap_ms: 1000, creep_max: 3
+        });
         updateSensors({ sensors: { enabled: 15, extruder: 0, ch: [] } });
 
         if (store(LOG_KEY) === '1') {

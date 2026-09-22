@@ -89,10 +89,12 @@
 #define AMS_PSTAT_UNLOADING     259  /* 退料（切刀 + 吐料）进行中 */
 #define AMS_PSTAT_NEED_WITHDRAW 260  /* ★ 退料完成，需要 AMS 退线 */
 
-/** ★ 退料蠕动的节奏（现场要求）：每次退料 2 秒 → 等挤出机信号 1 秒 → 循环 */
-#define AMS_RETRACT_CREEP_MS    2000  /* 单次退料时长 */
-#define AMS_RETRACT_CHECK_MS    1000  /* 每次退料后等挤出机信号的时长 */
-#define AMS_RETRACT_CREEP_MAX   12    /* 最多轮数（≈36 秒），超时转连续退料兜底 */
+/* ★ 退料的节奏参数已经全部搬到 config 里（网页「硬件调试」可改）：
+ *     蠕动退料时长  config_get_retract_creep_ms()   → retract.creep_ms
+ *     蠕动间隔      config_get_retract_gap_ms()     → retract.gap_ms
+ *     蠕动轮数上限  config_get_retract_creep_max()  → retract.creep_max
+ *     连续退料时长  config_get_retract_cont_ms()    → retract.cont_ms
+ *   旧版这里写死 2000 / 1000 / 12，现场想调一次就得重烧固件，所以搬走了。 */
 
 /** 进料前等热端升到目标温度的最长时间 */
 #define AMS_HEAT_WAIT_MS 30000
@@ -465,6 +467,29 @@ static bool do_load(int material_index, bool wait_extruder)
     return true;
 }
 
+/** 连续退料时每次"跑一小段"的时长：分段跑，每段之间查一次信号，避免拉过头 */
+#define AMS_RETRACT_POLL_MS 250
+/** 收到"挤出机已空"之后再全速多拉这一小段，把料彻底退出挤出机齿轮 */
+#define AMS_RETRACT_TAIL_MS 500
+
+/**
+ * 打印机有没有明确说"挤出机里现在没料"。
+ *
+ * 只认 hw_switch_state == 0（解析成 extruder_inplace_hint）。**不能拿
+ * extruder_inplace_seq() 当"料走了"的判据** —— 那个序号只在"变成有料"时
+ * 推进（extruder_inplace_notify_from_mqtt() 只在 hint==1 时被调用），
+ * 用它判空会误判。
+ */
+static bool printer_says_extruder_empty(void)
+{
+    bool empty = false;
+    if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+        empty = (s_last_report.extruder_inplace_hint == 0);
+        xSemaphoreGive(s_report_lock);
+    }
+    return empty;
+}
+
 /** 蠕动退料一次（短脉冲反向推一小段，需要吸合离合） */
 static void creep_retract_once(int material_index, uint16_t pulse_ms,
                                 uint8_t speed_pct)
@@ -473,32 +498,119 @@ static void creep_retract_once(int material_index, uint16_t pulse_ms,
         return;
     }
     esp_err_t err = clutch_engage(material_index + 1);
-    if (err == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(CLUTCH_ENGAGE_MS));
-        motor_run_speed((motor_dir_t)-1, pulse_ms, speed_pct);
-        clutch_release(material_index + 1);
-        vTaskDelay(pdMS_TO_TICKS(CLUTCH_RELEASE_MS));
+    if (err != ESP_OK) {
+        /* ★ 这里**必须**报出来。吸合失败时旧版是静默返回，现象就是
+         *   "日志说在退料、电机一声不响"，现场根本猜不到是离合没吸上。 */
+        ams_log_err("  退料（蠕动）：料盘位%d 离合吸合失败（%s），本次蠕动跳过",
+                    material_index + 1, esp_err_to_name(err));
+        clutch_release_all();
+        return;
     }
+    vTaskDelay(pdMS_TO_TICKS(CLUTCH_ENGAGE_MS));
+    motor_run_speed((motor_dir_t)-1, pulse_ms, speed_pct);
+    /* 跑完立刻停：不停的话下一轮之间那 gap_ms 电机还在空转 */
+    motor_stop();
+    clutch_release(material_index + 1);
+    vTaskDelay(pdMS_TO_TICKS(CLUTCH_RELEASE_MS));
+}
+
+/**
+ * 连续退料（全速反向拉），边拉边看打印机有没有报「挤出机已空」。
+ *
+ * ★ 为什么现在它是**第一个**动作，而不是以前的收尾动作：
+ *   打印机报 `ams_status=260` 的含义是"我这边切完刀、吐完料、挤出机已经
+ *   跑回冲刷区了，该你把料线收回去"。真机实测（2026-09-22 run5）它在这
+ *   之后约 2 秒就会弹"请拉出耗材"—— 留给我们的窗口很短；而 45% 占空比的
+ *   慢速蠕动在这个机构上**根本转不动**（12 轮 × 2000ms 合计 24 秒一根料
+ *   都没拉动，电机连声都没有），只有全速连续拉才拉得动。
+ *   所以顺序倒过来：先全速拉，拉到它报无料就停。
+ *
+ * @param max_ms   最长拉多久（到点就停，避免空转把料拉断/把料盘拽乱）
+ * @param tail_ms  收到"无料"之后再全速多拉的这一小段
+ * @param out_hw_failed  非 NULL 时返回"硬件层就失败了"（离合没吸上）。
+ *                       这种情况下料**没被退出来**，调用方必须中止换料，
+ *                       不能带着旧料去进新料。
+ * @return true = 收到了「挤出机已空」信号
+ */
+static bool retract_continuous_until_empty(int material_index,
+                                           uint32_t max_ms, uint32_t tail_ms,
+                                           bool *out_hw_failed)
+{
+    if (out_hw_failed) {
+        *out_hw_failed = false;
+    }
+    if (material_index < 0 || material_index >= BOARD_CHANNEL_COUNT) {
+        return false;
+    }
+    esp_err_t err = clutch_engage(material_index + 1);
+    if (err != ESP_OK) {
+        record_error("退料：料盘位%d 离合吸合失败（%s）",
+                     material_index + 1, esp_err_to_name(err));
+        clutch_release_all();
+        if (out_hw_failed) {
+            *out_hw_failed = true;
+        }
+        return false;
+    }
+    clutch_set_busy(true);
+
+    bool got = false;
+    uint32_t elapsed = 0;
+    while (elapsed < max_ms) {
+        uint32_t slice = AMS_RETRACT_POLL_MS;
+        if (elapsed + slice > max_ms) {
+            slice = max_ms - elapsed;
+        }
+        /* 全速（100%）—— 慢速在这个机构上带不动，见上面的说明 */
+        motor_run((motor_dir_t)-1, slice);
+        elapsed += slice;
+        if (printer_says_extruder_empty()) {
+            got = true;
+            break;
+        }
+    }
+
+    if (got && tail_ms) {
+        motor_run((motor_dir_t)-1, tail_ms);
+    }
+    motor_stop();
+    clutch_release_all_settled();
+    return got;
 }
 
 /**
  * 退料：把料从挤出机/缓冲区收回到料盘。
  *
- * ★ 重写版（C3 无微动降级模式）：
- *   1. 蠕动退料 N 次（短脉冲反向推）
- *   2. 等待挤出机 MQTT 信号：hw_switch_state 变为 0（"没料了"）
- *   3. 收到"没料"信号 → 连续退料 retract_cont_ms（把余料收干净）
- *   4. 超时没收到 → 直接连续退料 retract_cont_ms 兜底
+ * ★ 当前策略（2026-09-22 run5 真机重定，顺序是"连续优先"）：
+ *   1. **全速连续退料**，最长 retract.cont_ms；期间每 250ms 查一次打印机
+ *      上报的 hw_switch_state，一报"挤出机已空"（== 0）就停，再多拉
+ *      AMS_RETRACT_TAIL_MS 把料彻底退出齿轮；
+ *   2. 拉满时间还没等到信号 → 蠕动补拉 retract.creep_max 轮
+ *      （每轮 retract.creep_ms，轮间 retract.gap_ms 等信号）；轮数配 0
+ *      就是"只做连续退料"；
+ *   3. 全程没等到信号也不阻断 —— 告警后照常进新料（宁可糙一点，也不能
+ *      把打印机卡在暂停态）。
+ *
+ * 为什么不是"先蠕动"：45% 占空比在这个机构上带不动电机，实机 24 秒蠕动
+ * 一根料都没拉动；真正把料拉出来的是全速连续退料。详见
+ * retract_continuous_until_empty() 的说明。
  *
  * 有微动时仍走原有的"分步推、微动触发即停"路径。
  */
 static bool do_retract(int material_index)
 {
     set_state(AMS_STATE_RETRACT, material_index);
-    ams_log("  退料：开始退料料盘位 %d（蠕动 %ums×最多 %u 轮 + 等无料 + 连续退料）",
-             material_index + 1,
-             (unsigned)AMS_RETRACT_CREEP_MS,
-             (unsigned)AMS_RETRACT_CREEP_MAX);
+
+    /* 参数全走配置：网页「硬件调试」改完立刻生效，不用重烧固件 */
+    const uint8_t  creep_pct = config_get()->creep_speed_pct;
+    const uint16_t cont_ms   = config_get_retract_cont_ms();
+    const uint16_t creep_ms  = config_get_retract_creep_ms();
+    const uint16_t gap_ms    = config_get_retract_gap_ms();
+    const uint8_t  creep_max = config_get_retract_creep_max();
+
+    ams_log("  退料：开始退料料盘位 %d（先连续 %ums，拉不出来再蠕动 %u 轮 × %ums @%u%%）",
+            material_index + 1, (unsigned)cont_ms,
+            (unsigned)creep_max, (unsigned)creep_ms, (unsigned)creep_pct);
 
     /* ---- 路径 A：有微动 → 分步推，微动触发即停 ---- */
     if (config_sensor_enabled(material_index) &&
@@ -514,78 +626,91 @@ static bool do_retract(int material_index)
         return true;
     }
 
-    /* ---- 路径 B：无微动（C3 默认）→ 蠕动退料 + 等无料信号 + 连续退料 ----
+    /* ---- 路径 B：无微动（C3 默认）→ 全速连续拉 + 蠕动补拉 ----
      *
-     * ★ 2026-09-22 真机重写。打印机的"退料"是两个半场：
-     *     · 它那半：升喷嘴温度 → 切刀 → 移到冲刷区 → 把热端里那截料吐出去
-     *     · 我们那半：把料从缓冲/挤出机收回到料盘
-     *   分界线就是 ams_status=260。调用方（do_exchange）**已经在外面等到
-     *   它才进来**，所以这里的每一步都发生在"料已被切断、热端已空"之后。
-     *
-     * 循环节奏（现场要求）：**每次退料 2 秒 → 等挤出机信号 1 秒 → 循环**。
-     *   · 收到"无料"（hw_switch_state 变 0 / 边沿变化）→ 立刻转连续退料收尾；
-     *   · 走满 AMS_RETRACT_CREEP_MAX 轮还没收到 → 超时兜底，照样连续退料。
+     * ★ 2026-09-22 真机重定顺序（run5 证据）：
+     *     · 打印机的"退料"是两个半场 —— 它那半：升喷嘴温度 → 切刀 → 移回
+     *       冲刷区 → 把热端里那截吐掉；我们那半：把料从挤出机收回到料盘。
+     *       分界线就是 ams_status=260，而调用方（do_exchange）**已经在外面
+     *       等到它才进来**，所以这里每一步都发生在"料已切断、挤出机已回
+     *       冲刷区"之后。
+     *     · 旧版是"先蠕动 12 轮（39 秒）再连续退料"，同一次换色里那 12 轮
+     *       一根料都没拉动 —— 45% 占空比带不动这个电机；结果打印机在 260
+     *       之后约 2 秒就弹"请拉出耗材"，我们却在傻等。真正把料拉出来的是
+     *       最后那 5 秒全速连续退料（打印机 hw_switch_state 同一秒 1 → 0）。
+     *     · 所以顺序倒过来：**先全速连续拉**，拉到打印机报「挤出机已空」
+     *       立即停；拉不出来才退回到慢速蠕动补拉（轮数可配，0 = 不蠕动）。
      */
-    uint8_t  creep_pct = config_get()->creep_speed_pct;
-    uint16_t cont_ms   = config_get_retract_cont_ms();
-    bool got_signal    = false;
-
+    bool empty = false;
     if (config_get()->extruder_src == EXTRUDER_SRC_MQTT) {
-        uint32_t base_seq = extruder_inplace_seq();
+        ams_log("  退料（连续）：全速拉料，最长 %ums；打印机一报"
+                "「挤出机已空」就停，再补拉 %ums",
+                (unsigned)cont_ms, (unsigned)AMS_RETRACT_TAIL_MS);
 
-        ams_log("  退料（蠕动）：每次退 %ums + 等无料信号 %ums，最多 %u 轮",
-                (unsigned)AMS_RETRACT_CREEP_MS,
-                (unsigned)AMS_RETRACT_CHECK_MS,
-                (unsigned)AMS_RETRACT_CREEP_MAX);
+        bool hw_failed = false;
+        empty = retract_continuous_until_empty(material_index, cont_ms,
+                                               AMS_RETRACT_TAIL_MS,
+                                               &hw_failed);
+        if (hw_failed) {
+            ams_log_err("  退料（连续）：离合/总线失败，料没退出来，换料中止");
+            return false;
+        }
+        if (empty) {
+            ams_log("  退料（连续）：打印机已报「挤出机已空」，拉料结束");
+        } else {
+            ams_log_warn("  退料（连续）：拉满 %ums 仍没等到「挤出机已空」信号"
+                         "（料可能已退到缓冲，或打印机的 hw_switch_state 没跟上）",
+                         (unsigned)cont_ms);
+        }
 
-        for (uint32_t round = 1; round <= AMS_RETRACT_CREEP_MAX; round++) {
-            ams_log("  退料（蠕动）：第 %u/%u 次，退 %ums…",
-                    (unsigned)round, (unsigned)AMS_RETRACT_CREEP_MAX,
-                    (unsigned)AMS_RETRACT_CREEP_MS);
-            creep_retract_once(material_index, AMS_RETRACT_CREEP_MS, creep_pct);
+        if (!empty && creep_max > 0) {
+            ams_log("  退料（蠕动）：每次退 %ums + 等信号 %ums @%u%%，最多 %u 轮",
+                    (unsigned)creep_ms, (unsigned)gap_ms,
+                    (unsigned)creep_pct, (unsigned)creep_max);
+            for (uint32_t round = 1; round <= creep_max; round++) {
+                ams_log("  退料（蠕动）：第 %u/%u 次，退 %ums…",
+                        (unsigned)round, (unsigned)creep_max,
+                        (unsigned)creep_ms);
+                creep_retract_once(material_index, creep_ms, creep_pct);
 
-            /* 退完这一下，等挤出机信号最多 1 秒 */
-            int64_t deadline = esp_timer_get_time() +
-                               (int64_t)AMS_RETRACT_CHECK_MS * 1000;
-            while (esp_timer_get_time() < deadline) {
-                if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
-                    if (s_last_report.extruder_inplace_hint == 0) {
-                        got_signal = true;
+                /* 退完这一下，等挤出机信号最多 gap_ms */
+                int64_t deadline = esp_timer_get_time() +
+                                   (int64_t)gap_ms * 1000;
+                while (esp_timer_get_time() < deadline) {
+                    if (printer_says_extruder_empty()) {
+                        empty = true;
+                        break;
                     }
-                    xSemaphoreGive(s_report_lock);
+                    vTaskDelay(pdMS_TO_TICKS(50));
                 }
-                if (extruder_inplace_seq() != base_seq) {
-                    got_signal = true;   /* 边沿也算 —— 增量报文只在变化时带值 */
-                }
-                if (got_signal) {
+                if (empty) {
+                    ams_log("  退料（蠕动）：收到「挤出机已空」信号，停止蠕动");
                     break;
                 }
-                vTaskDelay(pdMS_TO_TICKS(50));
             }
-            if (got_signal) {
-                ams_log("  退料（蠕动）：收到无料信号（挤出机已空），转连续退料收尾");
-                break;
+            if (!empty) {
+                ams_log_warn("  退料（蠕动）：%u 轮都没等到「挤出机已空」信号，"
+                             "按超时兜底继续进料",
+                             (unsigned)creep_max);
             }
-        }
-        if (!got_signal) {
-            ams_log_warn("  退料（蠕动）：%u 轮都没等到无料信号，按超时兜底"
-                         "（料可能已退到缓冲，或挤出机传感器没跟上）",
-                         (unsigned)AMS_RETRACT_CREEP_MAX);
+        } else if (!empty) {
+            ams_log_warn("  退料：蠕动轮数配成 0（不蠕动），本次只做了连续退料");
         }
     } else {
-        /* GPIO 模式：保持原有行为 */
+        /* GPIO 模式（S3 默认）：那根挤出机到位线上没有"空了"的边沿可用，
+         * 只能按时间推进 —— 等一段再全速拉满。
+         * ⚠️ 这里**必须**保留一次真的退料动作：GPIO 分支里只等不拉的话，
+         *    S3 上"退料"就整个消失了（料还在挤出机里就去进新料 → 顶死）。 */
         uint32_t wait_ms = config_get_retract_wait_ms();
         ams_log("  退料（等无料）：GPIO 模式，等待 %u ms", (unsigned)wait_ms);
         vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        ams_log("  退料（连续）：GPIO 模式，连续退料 %ums", (unsigned)cont_ms);
+        if (!drive_channel(material_index, -1, cont_ms, false, NULL)) {
+            ams_log_err("  退料（连续）：退料失败");
+            return false;
+        }
     }
 
-    /* ③ 连续退料：把余料收干净 */
-    ams_log("  退料（连续）：开始连续退料 %u ms…", (unsigned)cont_ms);
-    bool ok = drive_channel(material_index, -1, cont_ms, false, NULL);
-    if (!ok) {
-        ams_log("  退料（连续）：退料失败");
-        return false;
-    }
     s_diag.retract_ok++;
     ams_log("退料完成（料已从挤出机收回料盘）");
     return true;
@@ -1369,6 +1494,8 @@ static void handle_report(const bambu_report_t *r)
     if (r->stg_cur != 19) { s_assist_done_stg19 = false; }
 
     bool assist_do = false;
+    const char *assist_why = "";
+    int assist_mat = -1;
     if (config_get_assist_enabled()) {
         int cur_ch = config_get_filament_current();
         if (cur_ch > 0) {
@@ -1377,29 +1504,41 @@ static void handle_report(const bambu_report_t *r)
                 if (r->stg_cur == 8 && !s_assist_done_stg8) {
                     assist_do = true;
                     s_assist_done_stg8 = true;
-                    ams_log("辅助送料（校准挤出）：通道%d", cur_ch);
+                    assist_why = "校准挤出";
                 } else if (r->stg_cur == 19 && !s_assist_done_stg19) {
                     assist_do = true;
                     s_assist_done_stg19 = true;
-                    ams_log("辅助送料（流量校准）：通道%d", cur_ch);
+                    assist_why = "流量校准";
                 } else if (r->stg_cur == 0) {
                     /* 打印中持续辅助，每 ASSIST_REPEAT_US 做一次 */
                     int64_t now = esp_timer_get_time();
                     if (now - s_last_assist_time_us >= ASSIST_REPEAT_US) {
                         assist_do = true;
                         s_last_assist_time_us = now;
-                        ams_log("辅助送料（打印中）：通道%d", cur_ch);
+                        assist_why = "打印中";
                     }
+                }
+                if (assist_do) {
+                    assist_mat = mat;
                 }
             }
         }
     }
 
     if (assist_do) {
-        uint8_t assist_pct = config_get_assist_speed_pct();
-        drive_channel_speed(
-            config_material_index_of(config_get_filament_current()),
-            1, assist_pct, AMS_LOAD_ASSIST_MS, false, NULL);
+        uint8_t  assist_pct = config_get_assist_speed_pct();
+        uint16_t assist_ms  = config_get_assist_ms();
+
+        /* ★ 一条日志把"为什么送 / 占空比 / 时长"都带上。
+         *   真机教训：23% 这种低占空比在这个机构上**完全带不动电机**，
+         *   用户看到的现象就是"流量校准 / 打印中辅助送料电机没动作"。
+         *   只在真正要动的时候打一行（打印中每 5 秒一次），并把实际占空比
+         *   印出来 —— 否则现场只能靠猜"到底发没发指令、按多大发的"。 */
+        ams_log("辅助送料（%s）：通道%d @%u%% × %ums",
+                assist_why, config_get_filament_current(),
+                (unsigned)assist_pct, (unsigned)assist_ms);
+        (void)drive_channel_speed(assist_mat, 1, assist_pct, assist_ms,
+                                  false, NULL);
     }
 
     /* ---- 换料请求 ---- */

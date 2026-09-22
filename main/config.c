@@ -87,10 +87,14 @@ static void config_load_defaults(ams_config_t *c)
     /* ---- 辅助送料参数 ---- */
     c->assist_enabled   = 1;   /* 默认开启 */
     c->assist_speed_pct = CONFIG_ASSIST_PCT_DEF;
+    c->assist_ms        = CONFIG_ASSIST_MS_DEF;
 
     /* ---- 退料参数（C3 无微动降级模式） ---- */
-    c->retract_wait_ms  = CONFIG_RETRACT_WAIT_MS_DEF;
-    c->retract_cont_ms  = CONFIG_RETRACT_CONT_MS_DEF;
+    c->retract_wait_ms   = CONFIG_RETRACT_WAIT_MS_DEF;
+    c->retract_cont_ms   = CONFIG_RETRACT_CONT_MS_DEF;
+    c->retract_creep_ms  = CONFIG_RETRACT_CREEP_MS_DEF;
+    c->retract_gap_ms    = CONFIG_RETRACT_GAP_MS_DEF;
+    c->retract_creep_max = CONFIG_RETRACT_CREEP_MAX_DEF;
 
     /* ★ 微动默认**全部视为未安装**，程序走降级模式（按时间推进送料）。
      *   原因：没接微动却以为接了，程序会一直等一个永远不来的信号 —— 表现为
@@ -100,6 +104,101 @@ static void config_load_defaults(ams_config_t *c)
     c->sensor_enabled_mask = 0x00;
 
     memset(c->reserved, 0, sizeof(c->reserved));
+}
+
+/* ==========================================================================
+ * 一次性配置补丁
+ * ==========================================================================
+ * 为什么要有这一套：本次新增的字段是从 reserved 里抠出来的（见 config.h），
+ * 老固件写下的是 0。要靠一个独立的水位线键才能区分"老配置没设置过"和
+ * "用户就是选了 0"。补丁只跑一次，之后完全信任存下来的值。
+ */
+static void config_mark_patched(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    if (nvs_set_u8(h, CONFIG_KEY_PATCH, CONFIG_PATCH_LEVEL) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+/**
+ * 补丁 1（2026-09-22）：把明显"带不动电机"的占空比提上来 + 补齐新增时长字段。
+ *
+ * 依据：真机同一轮换色里，45% 占空比的蠕动退料跑满 12 轮 × 2000ms
+ * （合计 24 秒）一根料都没拉动，电机动静都没有；紧接着 100% 的连续退料
+ * 5 秒就把料拉出了挤出机（打印机 hw_switch_state 同一秒 1 → 0）。
+ * 所以低于 60% 的值属于"怎么调都没用"，直接按新默认值处理。
+ * 用户自己调高过的值一律保留，不动。
+ *
+ * @return true = 改了配置（调用方负责 config_save() 落盘）
+ */
+static bool config_apply_patch_once(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t lvl = 0;
+    esp_err_t err = nvs_get_u8(h, CONFIG_KEY_PATCH, &lvl);
+    nvs_close(h);
+
+    if (err == ESP_OK && lvl >= CONFIG_PATCH_LEVEL) {
+        return false;
+    }
+
+    bool changed = false;
+
+    if (s_cfg.creep_speed_pct < CONFIG_PWM_FUTILE_PCT) {
+        ams_log_warn("配置补丁1：蠕动速度 %u%% 带不动本机构的电机"
+                     "（实测低于 %u%% 只会堵转、听不到声），改按默认 %u%%",
+                     (unsigned)s_cfg.creep_speed_pct,
+                     (unsigned)CONFIG_PWM_FUTILE_PCT,
+                     (unsigned)CONFIG_CREEP_SPEED_PCT_DEF);
+        s_cfg.creep_speed_pct = CONFIG_CREEP_SPEED_PCT_DEF;
+        changed = true;
+    }
+    if (s_cfg.assist_speed_pct < CONFIG_PWM_FUTILE_PCT) {
+        ams_log_warn("配置补丁1：辅助送料速度 %u%% 带不动电机，改按默认 %u%%",
+                     (unsigned)s_cfg.assist_speed_pct,
+                     (unsigned)CONFIG_ASSIST_PCT_DEF);
+        s_cfg.assist_speed_pct = CONFIG_ASSIST_PCT_DEF;
+        changed = true;
+    }
+    if (s_cfg.retract_creep_ms == 0) {
+        s_cfg.retract_creep_ms = CONFIG_RETRACT_CREEP_MS_DEF;
+        changed = true;
+    }
+    if (s_cfg.retract_gap_ms == 0) {
+        s_cfg.retract_gap_ms = CONFIG_RETRACT_GAP_MS_DEF;
+        changed = true;
+    }
+    if (s_cfg.retract_creep_max == 0) {
+        s_cfg.retract_creep_max = CONFIG_RETRACT_CREEP_MAX_DEF;
+        changed = true;
+    }
+    if (s_cfg.assist_ms == 0) {
+        s_cfg.assist_ms = CONFIG_ASSIST_MS_DEF;
+        changed = true;
+    }
+
+    config_mark_patched();
+    if (changed) {
+        ams_log("配置补丁1 已应用：蠕动 %ums + 间隔 %ums（%u 轮）+ 连续 %ums，"
+                "辅助送料 %ums @ %u%%",
+                (unsigned)s_cfg.retract_creep_ms,
+                (unsigned)s_cfg.retract_gap_ms,
+                (unsigned)s_cfg.retract_creep_max,
+                (unsigned)s_cfg.retract_cont_ms,
+                (unsigned)s_cfg.assist_ms,
+                (unsigned)s_cfg.assist_speed_pct);
+    } else {
+        ams_log("配置补丁1 无需改动（水位线已写入）");
+    }
+    return changed;
 }
 
 /* ==========================================================================
@@ -182,6 +281,25 @@ esp_err_t config_init(void)
         s_cfg.retract_cont_ms > CONFIG_RETRACT_CONT_MAX) {
         s_cfg.retract_cont_ms = CONFIG_RETRACT_CONT_MS_DEF;
     }
+    /* ---- 本次新增的时长参数 ----
+     * 下限判断天然把"老配置留下的 0"兜成默认值（这几个字段有效值都 > 0）。
+     * 唯一的例外是 retract_creep_max：0 是合法值（= 不蠕动），所以这里只能
+     * 判上限，0 该不该变默认由 config_apply_patch_once() 那个一次性补丁决定。 */
+    if (s_cfg.retract_creep_ms < CONFIG_RETRACT_CREEP_MS_MIN ||
+        s_cfg.retract_creep_ms > CONFIG_RETRACT_CREEP_MS_MAX) {
+        s_cfg.retract_creep_ms = CONFIG_RETRACT_CREEP_MS_DEF;
+    }
+    if (s_cfg.retract_gap_ms < CONFIG_RETRACT_GAP_MS_MIN ||
+        s_cfg.retract_gap_ms > CONFIG_RETRACT_GAP_MS_MAX) {
+        s_cfg.retract_gap_ms = CONFIG_RETRACT_GAP_MS_DEF;
+    }
+    if (s_cfg.retract_creep_max > CONFIG_RETRACT_CREEP_MAX_MAX) {
+        s_cfg.retract_creep_max = CONFIG_RETRACT_CREEP_MAX_DEF;
+    }
+    if (s_cfg.assist_ms < CONFIG_ASSIST_MS_MIN ||
+        s_cfg.assist_ms > CONFIG_ASSIST_MS_MAX) {
+        s_cfg.assist_ms = CONFIG_ASSIST_MS_DEF;
+    }
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         if (s_cfg.access_list[i] == 0 ||
             s_cfg.access_list[i] > BOARD_CHANNEL_COUNT) {
@@ -196,6 +314,14 @@ esp_err_t config_init(void)
             (unsigned)s_cfg.profile_count,
             config_mqtt_ready() ? "已配置" : "未配置",
             (unsigned)s_cfg.sensor_enabled_mask);
+
+    /* ---- 一次性配置补丁 ----
+     * 放在校验之后：校验只保证"值在合法区间内"，它没法知道某个合法值
+     * （比如 0 轮蠕动）到底是用户选的还是老配置留下的 0 —— 那是补丁的事。 */
+    if (config_apply_patch_once()) {
+        config_save();
+    }
+
     return ESP_OK;
 }
 
@@ -577,11 +703,16 @@ int config_describe(char *buf, size_t buflen)
           config_sensor_enabled(i) ? "已装" : "未装",
           i + 1 < BOARD_CHANNEL_COUNT ? "  " : "\n");
     }
-    P("辅助送料 : %s @%u%%\n",
+    P("辅助送料 : %s @%u%% × %ums\n",
       s_cfg.assist_enabled ? "开启" : "关闭",
-      (unsigned)s_cfg.assist_speed_pct);
-    P("退料参数 : 等MQTT %ums + 连续退料 %ums\n",
-      (unsigned)s_cfg.retract_wait_ms, (unsigned)s_cfg.retract_cont_ms);
+      (unsigned)s_cfg.assist_speed_pct, (unsigned)s_cfg.assist_ms);
+    /* 退料现在是"连续退料优先"：先全速拉 retract_cont_ms（拉到打印机报
+     * 无料就提前停），没拉出来再用蠕动拱 retract_creep_max 轮。 */
+    P("退料参数 : 连续 %ums → 蠕动 %u 轮 × %ums（间隔 %ums）\n",
+      (unsigned)s_cfg.retract_cont_ms,
+      (unsigned)s_cfg.retract_creep_max,
+      (unsigned)s_cfg.retract_creep_ms,
+      (unsigned)s_cfg.retract_gap_ms);
     P("换料温度 : ");
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         P("位%d=%d℃%s", i + 1, config_get_temper(i),
@@ -645,6 +776,69 @@ uint16_t config_set_retract_cont_ms(int value)
     s_cfg.retract_cont_ms = (uint16_t)value;
     config_save();
     return s_cfg.retract_cont_ms;
+}
+
+uint16_t config_get_assist_ms(void)
+{
+    return s_cfg.assist_ms;
+}
+
+uint16_t config_set_assist_ms(int value)
+{
+    if (value < CONFIG_ASSIST_MS_MIN) value = CONFIG_ASSIST_MS_MIN;
+    if (value > CONFIG_ASSIST_MS_MAX) value = CONFIG_ASSIST_MS_MAX;
+    s_cfg.assist_ms = (uint16_t)value;
+    config_save();
+    return s_cfg.assist_ms;
+}
+
+uint16_t config_get_retract_creep_ms(void)
+{
+    return s_cfg.retract_creep_ms;
+}
+
+uint16_t config_set_retract_creep_ms(int value)
+{
+    if (value < CONFIG_RETRACT_CREEP_MS_MIN) {
+        value = CONFIG_RETRACT_CREEP_MS_MIN;
+    }
+    if (value > CONFIG_RETRACT_CREEP_MS_MAX) {
+        value = CONFIG_RETRACT_CREEP_MS_MAX;
+    }
+    s_cfg.retract_creep_ms = (uint16_t)value;
+    config_save();
+    return s_cfg.retract_creep_ms;
+}
+
+uint16_t config_get_retract_gap_ms(void)
+{
+    return s_cfg.retract_gap_ms;
+}
+
+uint16_t config_set_retract_gap_ms(int value)
+{
+    if (value < CONFIG_RETRACT_GAP_MS_MIN) value = CONFIG_RETRACT_GAP_MS_MIN;
+    if (value > CONFIG_RETRACT_GAP_MS_MAX) value = CONFIG_RETRACT_GAP_MS_MAX;
+    s_cfg.retract_gap_ms = (uint16_t)value;
+    config_save();
+    return s_cfg.retract_gap_ms;
+}
+
+uint8_t config_get_retract_creep_max(void)
+{
+    return s_cfg.retract_creep_max;
+}
+
+uint8_t config_set_retract_creep_max(int value)
+{
+    /* 0 是合法值（= 不蠕动，只做连续退料），所以下限是 0 而不是 1 */
+    if (value < 0) { value = 0; }
+    if (value > CONFIG_RETRACT_CREEP_MAX_MAX) {
+        value = CONFIG_RETRACT_CREEP_MAX_MAX;
+    }
+    s_cfg.retract_creep_max = (uint8_t)value;
+    config_save();
+    return s_cfg.retract_creep_max;
 }
 
 int config_get_temper(int material_index)

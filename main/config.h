@@ -45,6 +45,16 @@ extern "C" {
 #define CONFIG_VERSION         2u
 #define CONFIG_MAGIC           0x414D5331u  /* "AMS1" */
 
+/* 一次性配置补丁的水位线（见 config_apply_patch_once）。
+ *
+ * 为什么需要它：本次新增的几个字段（蠕动时长 / 间隔 / 轮数 / 辅助送料时长）
+ * 是从 reserved 里抠出来的，老固件写下的那几字节恒为 0。光靠"读到 0 就用
+ * 默认值"分不清"老配置没设置过"和"用户就是选了 0" —— 而 0 轮蠕动是合法
+ * 设置。所以单独用一个 NVS 键当标记：没有这个键 = 打补丁前的配置，
+ * 补一次并写下水位线；有键就完全信任存下来的值。 */
+#define CONFIG_KEY_PATCH       "cfgpatch"
+#define CONFIG_PATCH_LEVEL     1
+
 #define CONFIG_WIFI_MAX_PROFILES 3
 #define CONFIG_SSID_MAX          33   /* 含结尾 '\0' */
 #define CONFIG_PASS_MAX          65   /* 含结尾 '\0' */
@@ -75,20 +85,47 @@ extern "C" {
 #define CONFIG_CREEP_PULSE_MS_DEF  400   /* 单次脉冲时长 */
 #define CONFIG_CREEP_PULSE_MIN     100
 #define CONFIG_CREEP_PULSE_MAX     3000
-#define CONFIG_CREEP_SPEED_PCT_DEF 45    /* 蠕动速度（PWM 占空比百分比） */
+/* 蠕动速度（PWM 占空比百分比）。
+ *
+ * ★ 2026-09-22 真机定论：45% 在这个机构上**完全带不动电机** —— 实机表现为
+ *   "听不到电机响、料一动不动"。证据：同一轮换色里 12 轮 × 2000ms 的 45%
+ *   蠕动（合计 24 秒）一根料都没拉动，紧接着 100% 的连续退料 5 秒就把料
+ *   拉出挤出机了（打印机 hw_switch_state 同一秒从 1 变 0）。
+ *   所以默认值从 45 提到 70。低于 CONFIG_PWM_FUTILE_PCT 的值基本等于不转。 */
+#define CONFIG_CREEP_SPEED_PCT_DEF 70    /* 蠕动速度（PWM 占空比百分比） */
 
-/* 辅助送料参数（换色时同步推料帮打印机咬住新料） */
-#define CONFIG_ASSIST_PCT_DEF      50   /* 辅助送料 PWM 占空比百分比 */
+/* 占空比"带不动电机"的经验阈值：低于它，电机只会堵转（听不到声、不转）。
+ * 只用于**一次性迁移**老配置，不参与运行期夹取 —— 运行期用户填多少就是多少，
+ * 免得把用户故意调低的值悄悄改掉。 */
+#define CONFIG_PWM_FUTILE_PCT      60
+
+/* 辅助送料参数（换色时同步推料帮打印机咬住新料 / 打印中辅助送料） */
+#define CONFIG_ASSIST_PCT_DEF      60   /* 辅助送料 PWM 占空比百分比 */
 #define CONFIG_ASSIST_PCT_MIN      5
 #define CONFIG_ASSIST_PCT_MAX      100
+#define CONFIG_ASSIST_MS_DEF       1500 /* 每次辅助送料的持续时长 */
+#define CONFIG_ASSIST_MS_MIN       200
+#define CONFIG_ASSIST_MS_MAX       10000
 
-/* 退料参数（C3 无微动降级模式） */
+/* 退料参数（C3 无微动降级模式）—— 全是网页「硬件调试」里可改的现场参数 */
 #define CONFIG_RETRACT_WAIT_MS_DEF  5000  /* 蠕动退料后等待挤出机 MQTT 信号的最长时间 */
 #define CONFIG_RETRACT_WAIT_MIN     1000
 #define CONFIG_RETRACT_WAIT_MAX     15000
-#define CONFIG_RETRACT_CONT_MS_DEF  5000  /* 收到"没料"信号后连续退料时长 */
+/* 连续退料时长。★ 现在它是**第一动作**（不再是蠕动之后的收尾）：
+ * 打印机一报 ams_status=260（挤出机已跑回冲刷区），我们立刻全速拉料，
+ * 所以这个值同时是"全速拉料的上限时间"。拉到打印机报"无料"就提前停。 */
+#define CONFIG_RETRACT_CONT_MS_DEF  6000
 #define CONFIG_RETRACT_CONT_MIN     1000
-#define CONFIG_RETRACT_CONT_MAX     15000
+#define CONFIG_RETRACT_CONT_MAX     30000
+/* 蠕动退料：连续退料没把料拉出来时，再用慢速短脉冲拱几次试试 */
+#define CONFIG_RETRACT_CREEP_MS_DEF  2000  /* 单次蠕动退料时长 */
+#define CONFIG_RETRACT_CREEP_MS_MIN   100
+#define CONFIG_RETRACT_CREEP_MS_MAX 10000
+#define CONFIG_RETRACT_GAP_MS_DEF    1000  /* 两次蠕动之间等"挤出机已空"的间隔 */
+#define CONFIG_RETRACT_GAP_MS_MIN     100
+#define CONFIG_RETRACT_GAP_MS_MAX    5000
+#define CONFIG_RETRACT_CREEP_MAX_DEF    3  /* 蠕动最多几轮；0 = 不蠕动 */
+#define CONFIG_RETRACT_CREEP_MAX_MAX   20
 
 /* 换料温度（每个料盘位一个，单位 ℃）
  *   退料前把热端升到这个温度：太低，热端里的料是硬的，退不出来；
@@ -167,8 +204,30 @@ typedef struct {
      * 因此旧配置读出来 temper 全是 0，自动落回默认值，行为不变。
      * ⚠️ 以后动这个结构体，如果**改变了总长度**，那就必须升版本号。 */
     uint16_t temper[BOARD_CHANNEL_COUNT];
-    uint8_t  reserved[16 - BOARD_CHANNEL_COUNT * 2];
+
+    /* ---- 退料 / 辅助送料时长（2026-09-22 新增，网页「硬件调试」可改）----
+     *
+     * ★ 这几个字段是**从原来的 reserved 里抠出来的**，不是插在结构体中间 ——
+     *   插中间会让 sensor_enabled_mask / temper 全部后移，NVS 里的老数据就
+     *   按错位的偏移读出来（temper 会读成乱值）。放在这里：所有老字段的
+     *   偏移不变、结构体总长也不变，所以**不需要升 CONFIG_VERSION**
+     *   （升版本号会把用户的 WiFi / MQTT / 通道映射全清掉）。
+     *
+     * ⚠️ 老固件写下的这几个字节是 0（reserved 当初 memset 0，从没被写过）。
+     *   所以读到 0 一律当"没设置过"，落回 CONFIG_*_DEF 默认值。
+     */
+    uint16_t retract_creep_ms;     /* 蠕动退料：单次脉冲时长 */
+    uint16_t retract_gap_ms;       /* 两次蠕动之间等"挤出机已空"的间隔 */
+    uint16_t assist_ms;            /* 每次辅助送料的持续时长 */
+    uint8_t  retract_creep_max;    /* 蠕动最多几轮；0 = 不蠕动（只做连续退料） */
+    uint8_t  reserved[16 - BOARD_CHANNEL_COUNT * 2 - 7];
 } ams_config_t;
+
+/* 预留区被上面这几个新字段吃掉之后不能变成负数 —— 真变负数说明
+ * BOARD_CHANNEL_COUNT 变大了，那时候结构体长度会变，必须升 CONFIG_VERSION
+ * 并想好老配置怎么迁移，不能就这么让它编过去。 */
+_Static_assert(16 - BOARD_CHANNEL_COUNT * 2 - 7 >= 0,
+               "配置结构体预留区不够，请升 CONFIG_VERSION 并处理老配置迁移");
 
 /* ==========================================================================
  * 生命周期
@@ -265,11 +324,27 @@ void config_set_assist_speed_pct(uint8_t pct);
 uint8_t config_get_assist_enabled(void);
 void config_set_assist_enabled(uint8_t on);
 
+/** 每次辅助送料的持续时长（毫秒，已夹到安全区间） */
+uint16_t config_get_assist_ms(void);
+uint16_t config_set_assist_ms(int value);
+
 /** 退料参数获取/设置（已夹到安全区间） */
 uint16_t config_get_retract_wait_ms(void);
 uint16_t config_set_retract_wait_ms(int value);
 uint16_t config_get_retract_cont_ms(void);
 uint16_t config_set_retract_cont_ms(int value);
+
+/** 蠕动退料：单次脉冲时长（毫秒） */
+uint16_t config_get_retract_creep_ms(void);
+uint16_t config_set_retract_creep_ms(int value);
+
+/** 两次蠕动之间等"挤出机已空"信号的间隔（毫秒） */
+uint16_t config_get_retract_gap_ms(void);
+uint16_t config_set_retract_gap_ms(int value);
+
+/** 蠕动最多几轮（0 = 不蠕动，只做连续退料） */
+uint8_t config_get_retract_creep_max(void);
+uint8_t config_set_retract_creep_max(int value);
 
 /** 某料盘位的换料温度（℃）。参数越界或没配过 → CONFIG_TEMPER_DEF */
 int config_get_temper(int material_index);
