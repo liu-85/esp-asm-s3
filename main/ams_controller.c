@@ -379,9 +379,14 @@ static bool drive_channel_speed(int material_index, int direction,
      *   其实没发生"。这是本轮修"日志在打、电机不动"的核心手段。 */
     s_last_drive.clutch_ok = false;
     s_last_drive.skipped   = false;
+    s_last_drive.dir       = (int8_t)((direction > 0) ? 1 : -1);
     s_last_drive.speed_pct = speed_pct;
     s_last_drive.duty_raw  = (uint16_t)motor_pct_to_duty(speed_pct);
     s_last_drive.ran_ms    = 0;
+    s_last_drive.duty_in1  = 0;
+    s_last_drive.duty_in2  = 0;
+    s_last_drive.level_in1 = -1;
+    s_last_drive.level_in2 = -1;
 
     if (out_triggered) {
         *out_triggered = false;
@@ -390,6 +395,8 @@ static bool drive_channel_speed(int material_index, int direction,
         record_error("送料失败：料盘位 %d 不存在", material_index + 1);
         return false;
     }
+
+    motor_readback_t rb = {0, 0, -1, -1};   /* 硬件回读，见函数尾部的赋值 */
 
     esp_err_t err = clutch_engage(material_index + 1);
     if (err != ESP_OK) {
@@ -424,6 +431,7 @@ static bool drive_channel_speed(int material_index, int direction,
         s_last_drive.speed_pct = 100;
         s_last_drive.duty_raw  = (uint16_t)motor_pct_to_duty(100);
         s_last_drive.ran_ms    = elapsed;
+        motor_readback(&rb);              /* ★ 停之前回读硬件，见 drive_receipt_t */
         motor_stop();
     } else {
         /* ★ 关键：direction 是 int（±1），必须 cast 成 motor_dir_t。
@@ -443,8 +451,17 @@ static bool drive_channel_speed(int material_index, int direction,
 
         motor_run_speed(dir, max_ms, speed_pct);
         s_last_drive.ran_ms = max_ms;
+        /* ★ 回读必须在这里 —— motor_stop() 一执行两路就都归 0 了，
+         *   之后再读只会得到"什么都没写"，毫无意义。 */
+        motor_readback(&rb);
         motor_stop();
     }
+
+    /* ★ 把回读结果记进回执（不在临界区里做，避免白占锁） */
+    s_last_drive.duty_in1  = rb.duty_in1;
+    s_last_drive.duty_in2  = rb.duty_in2;
+    s_last_drive.level_in1 = (int8_t)rb.level_in1;
+    s_last_drive.level_in2 = (int8_t)rb.level_in2;
 
     if (out_triggered) {
         *out_triggered = triggered;
@@ -554,6 +571,12 @@ static bool load_closed_loop(int material_index, uint32_t total_ms,
             inplace = true;
             break;
         }
+        /* ★ 再看一眼打印机的最新报文 —— 阻塞期间 handle_report 是跑不了的，
+         *   不偷看就只能等推满 20 秒（run7 实测就是这样白推了 20 秒）。 */
+        if (poll_printer_inplace()) {
+            inplace = true;
+            break;
+        }
         /* 前两段报个进度，之后交给 handle_report 的节流日志，别刷屏 */
         if (seg <= 2) {
             ams_log("  送料（闭环）：第 %u 段推完 %ums，还没等到到位信号…",
@@ -567,6 +590,48 @@ static bool load_closed_loop(int material_index, uint32_t total_ms,
         *out_inplace = inplace;
     }
     return true;
+}
+
+/**
+ * 在**阻塞式推进**的过程中偷看一眼打印机的最新报文。
+ *
+ * ★★ 为什么必须这么做（2026-09-23 run7 真机定位到的根因）★★
+ *
+ *   架构上有一条铁律：`handle_report()` 是**跑在 ams_task 里**的
+ *   （见 on_mqtt_report 的注释和 ams_task 的主循环）。而"闭环送料/连续退料"
+ *   也是在 ams_task 里跑的、每段要 motor_run() 阻塞最长 2 秒。
+ *   于是矛盾出现了：**我们一边推料，一边收不到打印机的任何消息** ——
+ *   MQTT 任务只把最新一帧塞进 s_last_report 信箱，真正的解析要等
+ *   ams_task 空出来。等我们推完 20 秒 + 蠕动 5 秒回到主循环，那些
+ *   "耗材已到挤出机"才一起涌进来。
+ *
+ *   run7 的日志把这条缝隙量了出来（4 次换色，次次如此）：
+ *     打印机报 hw_switch_state=1   10:53:43   ← 料其实 8 秒就到了
+ *     板子还在推，一直推到          10:53:55
+ *     板子报"送到"、发 resume       10:53:52~55
+ *     板子才打出"打印机上报耗材已到挤出机"
+ *   也就是说：**每次换色白推约 20 秒**（4 次就是 80 秒），
+ *   而且是在料早就到位的情况下继续顶着料推 —— 对料和齿轮都不好。
+ *
+ *   修法：不去动 handle_report 的架构（那会牵动整个状态机），
+ *   只加一个**只读**的偷看 —— 直接从信箱里读最新一帧的到位提示。
+ *   拿到就把"到位"记进传感器层（和正常路径完全一致），后续逻辑不用改。
+ *
+ * @return true = 打印机最新一帧说"耗材已到挤出机"
+ */
+static bool poll_printer_inplace(void)
+{
+    bool hit = false;
+    if (s_report_lock &&
+        xSemaphoreTake(s_report_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        hit = s_has_report && (s_last_report.extruder_inplace_hint == 1);
+        xSemaphoreGive(s_report_lock);
+    }
+    if (hit && !extruder_inplace_triggered()) {
+        extruder_inplace_notify_from_mqtt();
+        ams_log("打印机已报「耗材到挤出机」（推进途中读到，立刻收手）");
+    }
+    return hit;
 }
 
 /**
@@ -1298,6 +1363,13 @@ static bool feed_until_extruder_ms(int mat_new, uint32_t wait_ms)
      *   "白等 15 秒、然后报料没咬住"的根因（真机日志：等超时在 56:25.067，
      *   打印机报到位在 56:25.101）。 */
     if (!extruder_inplace_triggered()) {
+        /* ★ 先偷看一眼最新报文再决定要不要等 —— 送料那段跑完时，打印机可能
+         *   早就报过到位了，只是那句话还堵在信箱里没被 handle_report 处理
+         *   （见 poll_printer_inplace 的说明）。不先看这一眼的后果就是
+         *   run7 里那 5 秒蠕动等待 + "料可能没咬住"的假警告。 */
+        poll_printer_inplace();
+    }
+    if (!extruder_inplace_triggered()) {
         ams_log("  进料（蠕动）：等待挤出机到位信号（最多 %ums）…",
                 (unsigned)wait_ms);
         if (!extruder_inplace_wait(wait_ms)) {
@@ -1816,8 +1888,36 @@ static void handle_report(const bambu_report_t *r)
     int assist_mat = -1;
     uint32_t assist_period_ms = ASSIST_REPEAT_US / 1000;
 
+    /* ★★ 「打印中」这一档必须再验一次"真的在打印" ★★
+     *   —— 2026-09-23 run7 真机踩到的坑，用户原话：
+     *     "在阶段打印中之后就开始了辅助送料，其实这个阶段是不需要辅助送料的，
+     *      打印机在自检。"
+     *
+     *   根因不是"辅助送料逻辑写错了"，是**阶段码被误读**：
+     *   stg_cur=0 在拓竹的表里既是"打印中"，也是打印机空闲时会挂着的值。
+     *   代码里原本有一条校正（print_type=="idle" 且 stg_cur==0 → 视为空闲），
+     *   但收到打印任务的那一瞬间打印机是这样的：
+     *       10:47:04  print_type=idle    stg_cur=0     → 校正成空闲，没事
+     *       10:50:19  print_type=cloud   stg_cur=0     ← 打印任务刚进来
+     *       10:50:28  stg_cur=255                         打印机才把阶段码刷成空闲
+     *       10:50:30  stg_cur=2 热床预热                  真正的流程从这里才开始
+     *   中间这 9 秒里 print_type 已经变成 cloud、stg_cur 还留着上一次的 0，
+     *   校正条件不成立 → 板子读到"打印中" → 在**打印机自检**时开始辅助送料。
+     *   日志里就是那两条 08:49.530 / 08:57.697（= 墙上时间 10:50:19~10:50:28）。
+     *
+     *   所以"打印中"这一档多加两条硬证据，缺一不可：
+     *     · gcode_state == RUNNING（is_printing）—— 打印机自己说在跑；
+     *     · mc_percent > 0 或 layer_num >= 1 —— 这个任务已经**推进过**了。
+     *   自检阶段 mc_percent 还是 0、layer_num 还是 0，两条都不满足 → 不动。
+     *   而真正的打印中 mc_percent 一路在涨（51% → 70% → 84% → 97%），必然满足。
+     *
+     *   注意：校准档（stg=8/19）**不加**这个门禁 —— 校准期间 gcode_state 是
+     *   RUNNING、mc_percent 也在涨，加了也没影响，但没必要让它跟着一起变脆。 */
+    bool stg0_is_really_printing = (r->stg_cur == 0) && r->is_printing &&
+                                   (r->mc_percent > 0 || r->layer_num >= 1);
+
     if (config_get_assist_enabled() &&
-        (r->stg_cur == 8 || r->stg_cur == 19 || r->stg_cur == 0)) {
+        (r->stg_cur == 8 || r->stg_cur == 19 || stg0_is_really_printing)) {
         int cur_ch = config_get_filament_current();
         int mat = (cur_ch > 0) ? config_material_index_of(cur_ch) : -1;
         if (mat >= 0) {
@@ -1920,10 +2020,13 @@ static void handle_report(const bambu_report_t *r)
                          "本次没有重新驱动");
         } else {
             ams_log("  辅助送料回执：离合已吸合 —— 通道%d PWM duty=%u/255"
-                    "（%u%%），通电 %ums（手动点动是全速 duty=255，可对比）",
+                    "（%u%%），通电 %ums；**硬件回读** IN1=%u/255(%d) "
+                    "IN2=%u/255(%d)（手动点动是全速 duty=255，可对比）",
                     config_get_filament_current(),
                     (unsigned)rc->duty_raw, (unsigned)rc->speed_pct,
-                    (unsigned)rc->ran_ms);
+                    (unsigned)rc->ran_ms,
+                    (unsigned)rc->duty_in1, (int)rc->level_in1,
+                    (unsigned)rc->duty_in2, (int)rc->level_in2);
         }
 
         /* 状态还回去（通常是"空闲"）—— 别让"辅助送料中"卡住状态机。
@@ -2233,6 +2336,64 @@ static void poll_trigger_switches(void)
  * 十、命令执行
  * ========================================================================== */
 
+/**
+ * 辅助送料自检：立刻按网页配置的占空比 / 时长**手动**驱动一次辅助送料。
+ *
+ * 和 do_jog（手动点动）的区别只有一个：速度。
+ *   点动    → drive_channel()  = 全速 100%，duty 255
+ *   本自检  → 网页设置的 assist_speed_pct / assist_ms
+ * 所以这两个按钮合起来就是一次**受控对照实验**：
+ *   点动转、自检不转 → 占空比不够（把网页上的速度往上调，默认已改 100%）
+ *   两个都不转       → 硬件链路问题（H 桥使能脚 / 离合齿轮 / 接线）
+ * 这条实验是"辅助送料没作用"这个现场问题唯一能一次说清的做法 ——
+ * 因为辅助送料正常是由打印机阶段驱动的，等一轮打印要十几分钟。
+ */
+static void do_assist_test(int material_index)
+{
+    if (material_index < 0) {
+        int cur = config_get_filament_current();
+        material_index = (cur > 0) ? config_material_index_of(cur) : -1;
+    }
+    if (material_index < 0 || material_index >= BOARD_CHANNEL_COUNT) {
+        record_error("辅助送料自检：没有可用的通道（网页上先确认当前通道）");
+        return;
+    }
+
+    uint8_t  pct = config_get_assist_speed_pct();
+    uint16_t ms  = config_get_assist_ms();
+
+    set_state(AMS_STATE_ASSIST, material_index);
+    ams_log("辅助送料自检：料盘位%d @%u%% × %ums（网页上配置的值）",
+            material_index + 1, (unsigned)pct, (unsigned)ms);
+
+    bool ok = drive_channel_speed(material_index, 1, pct, ms, false, NULL);
+    const drive_receipt_t *rc = ams_last_drive_receipt();
+
+    if (!ok || !rc->clutch_ok) {
+        ams_log_err("辅助送料自检失败：离合没吸合上 —— 本次**没有**驱动电机，"
+                    "问题在离合吸合，与占空比无关");
+    } else {
+        ams_log("辅助送料自检结果：%s —— 请求 duty=%u/255（%u%%）；"
+                "**硬件回读** IN1=%u/255(引脚%d) IN2=%u/255(引脚%d)，"
+                "通电 %ums",
+                rc->skipped ? "★被幂等跳过（电机本来就在同方向同速度转）"
+                            : "已驱动",
+                (unsigned)rc->duty_raw, (unsigned)rc->speed_pct,
+                (unsigned)rc->duty_in1, (int)rc->level_in1,
+                (unsigned)rc->duty_in2, (int)rc->level_in2,
+                (unsigned)rc->ran_ms);
+        if (!rc->skipped && rc->duty_in1 == 0 && rc->duty_in2 == 0) {
+            ams_log_err("⚠ 回读发现两路 LEDC 的原值都是 0 —— 信号**没写进硬件**，"
+                        "这是软件问题，不是占空比/机械问题");
+        } else if (!rc->skipped) {
+            ams_log("  ★ 信号确实出去了（回读非 0）。若此时电机仍不转，"
+                    "就是占空比/机械：把网页上的辅助送料速度往上调，"
+                    "或用「手动点动」（全速 duty=255）对照一次");
+        }
+    }
+    set_state(AMS_STATE_IDLE, -1);
+}
+
 static void do_jog(int material_index, int direction, int ms)
 {
     if (ms <= 0) {
@@ -2254,6 +2415,10 @@ static void execute_cmd(const ams_cmd_t *cmd)
     switch (cmd->id) {
     case AMS_CMD_JOG:
         do_jog(cmd->channel, cmd->arg, cmd->ms);
+        break;
+
+    case AMS_CMD_ASSIST_TEST:
+        do_assist_test(cmd->channel);
         break;
 
     case AMS_CMD_LOAD:
@@ -2340,6 +2505,12 @@ bool ams_post_jog(int material_index, int direction, int ms)
 {
     ams_cmd_t cmd = { .id = AMS_CMD_JOG, .channel = material_index,
                       .arg = direction, .ms = ms };
+    return ams_post_cmd(&cmd);
+}
+
+bool ams_post_assist_test(int material_index)
+{
+    ams_cmd_t cmd = { .id = AMS_CMD_ASSIST_TEST, .channel = material_index };
     return ams_post_cmd(&cmd);
 }
 
@@ -2436,15 +2607,21 @@ int ams_describe_hardware_json(char *buf, size_t buflen)
     off += snprintf(buf + off, buflen - off,
                     "],\"state\":%d,\"state_text\":\"%s\","
                     "\"active_material\":%d,\"motor_speed\":%d,"
-                    "\"drive\":{\"clutch_ok\":%s,\"skipped\":%s,"
-                    "\"speed_pct\":%u,\"duty_raw\":%u,\"ran_ms\":%u}}",
+                    "\"drive\":{\"clutch_ok\":%s,\"skipped\":%s,\"dir\":%d,"
+                    "\"speed_pct\":%u,\"duty_raw\":%u,\"ran_ms\":%u,"
+                    "\"rb_in1\":%u,\"rb_in2\":%u,\"lv_in1\":%d,\"lv_in2\":%d}}",
                     (int)s_state, ams_state_text(), s_active_material,
                     motor_get_speed_pct(),
                     s_last_drive.clutch_ok ? "true" : "false",
                     s_last_drive.skipped   ? "true" : "false",
+                    (int)s_last_drive.dir,
                     (unsigned)s_last_drive.speed_pct,
                     (unsigned)s_last_drive.duty_raw,
-                    (unsigned)s_last_drive.ran_ms);
+                    (unsigned)s_last_drive.ran_ms,
+                    (unsigned)s_last_drive.duty_in1,
+                    (unsigned)s_last_drive.duty_in2,
+                    (int)s_last_drive.level_in1,
+                    (int)s_last_drive.level_in2);
     return off;
 }
 

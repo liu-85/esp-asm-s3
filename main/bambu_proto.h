@@ -95,6 +95,12 @@ typedef struct {
     const char *stage_text;     /**< 阶段中文说明（指向静态表，不要 free） */
     int     mc_percent;         /**< 打印进度百分比 */
     int     mc_remaining_time;  /**< 剩余时间（分钟） */
+    /**
+     * 当前层号。★ 用来判"这个任务是不是真的推进过"（见 ams_controller.c
+     * 辅助送料里 stg0_is_really_printing 的说明）：刚下发打印任务、打印机
+     * 还在自检时 layer_num 是 0，stg_cur 可能还残留着上一次的 0（"打印中"）。
+     */
+    int     layer_num;
     int     print_error;        /**< 打印错误码，0 = 无 */
     int     ams_stage;          /**< ams.stage，1 = 等待 AMS 完成换料；-1 = 无此字段 */
     bool    is_paused;

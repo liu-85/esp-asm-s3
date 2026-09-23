@@ -107,6 +107,31 @@ void motor_set_dead_time_ms(uint32_t ms);
  */
 uint32_t motor_pct_to_duty(int pct);
 
+/**
+ * 硬件回读：把 LEDC 通道寄存器里的 duty 原值、以及 IN1/IN2 引脚的实际电平取回来。
+ *
+ * ★ 为什么需要"回读"而不是"记账"（2026-09-23 现场反馈）：
+ *   上一轮加的 drive_receipt_t 里，duty_raw 其实是**算出来的**
+ *   （motor_pct_to_duty(speed_pct)），不是从硬件读回来的。于是它只能证明
+ *   "我们打算写 153"，证明不了"寄存器里真的是 153、引脚真的在翻转"。
+ *   现场说的"日志显示辅助送料、可电机没转"依然没法一次排除干净。
+ *
+ *   本函数直接读 ledc_get_duty() 和 gpio_get_level()，把"命令"和"硬件"
+ *   之间的那条缝彻底封上：
+ *     · duty_in1 == 153 且 level_in1 == 1 → 信号真的出去了，不转就是
+ *       占空比/机械（带不动、离合打滑、H 桥使能脚没接）；
+ *     · duty_in1 == 0                    → LEDC 根本没写进去，是软件路径问题。
+ */
+typedef struct {
+    uint32_t duty_in1;   /**< IN1 的 LEDC duty 原值（0~255），直接读寄存器 */
+    uint32_t duty_in2;   /**< IN2 的 LEDC duty 原值（0~255） */
+    int      level_in1;  /**< IN1 引脚当前电平（0/1）；-1 = 这颗芯片读不到 */
+    int      level_in2;  /**< IN2 引脚当前电平（0/1）；-1 = 读不到 */
+} motor_readback_t;
+
+/** 回读当前电机输出（必须在 motor_stop() **之前**调，停了就都是 0） */
+void motor_readback(motor_readback_t *out);
+
 #ifdef __cplusplus
 }
 #endif

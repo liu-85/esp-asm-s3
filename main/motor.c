@@ -23,6 +23,7 @@
 
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -297,4 +298,33 @@ uint32_t motor_elapsed_ms(void)
         return 0;
     }
     return (uint32_t)(delta_us / 1000);
+}
+
+/**
+ * 回读硬件：LEDC 寄存器里的 duty + IN1/IN2 引脚电平。
+ *
+ * ⚠️ 注意调用时机：motor_stop() 会把两路清零，所以必须在**通电期间**调用
+ *    （drive_channel_speed 里就是在 motor_run_speed() 返回后、motor_stop()
+ *    之前取的，那时电机还在跑）。
+ *
+ * gpio_get_level() 读的是 pad 上的实际电平。输出脚上它等于输出值；如果这
+ * 颗芯片/这个引脚恰好读不回来（某些脚有特殊功能），也不要报错，直接给 -1，
+ * 让上层知道"这一位没有证据"，而不是拿个假的 0 去误导现场。
+ */
+void motor_readback(motor_readback_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->duty_in1  = ledc_get_duty(MOTOR_LEDC_MODE, MOTOR_LEDC_CH_IN1);
+    out->duty_in2  = ledc_get_duty(MOTOR_LEDC_MODE, MOTOR_LEDC_CH_IN2);
+
+    out->level_in1 = -1;
+    out->level_in2 = -1;
+    if (BOARD_PIN_MOTOR_IN1 >= 0 && BOARD_PIN_MOTOR_IN1 < 64) {
+        out->level_in1 = gpio_get_level((gpio_num_t)BOARD_PIN_MOTOR_IN1);
+    }
+    if (BOARD_PIN_MOTOR_IN2 >= 0 && BOARD_PIN_MOTOR_IN2 < 64) {
+        out->level_in2 = gpio_get_level((gpio_num_t)BOARD_PIN_MOTOR_IN2);
+    }
 }

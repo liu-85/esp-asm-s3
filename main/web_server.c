@@ -456,7 +456,10 @@ static esp_err_t h_status(httpd_req_t *req)
      *   不会出现"网页显示的和日志里不一致"这种最难查的问题。 */
     /* ★ 512 → 640：ams_describe_hardware_json 里新增了一整块 drive 回执，
      *   要保证 cJSON_Parse 拿到的是完整 JSON（见那边的余量检查注释）。 */
-    char hwbuf[640];
+    /* ★ 再提到 800：drive 块又多了 4 个回读字段（rb_in1/rb_in2/lv_in1/lv_in2）
+     *   和 dir，约 60 字节。缓冲不够的话 snprintf 会把 JSON 尾巴截掉 →
+     *   cJSON_Parse 失败 → 整个 hardware 面板消失（比不显示回读更糟）。 */
+    char hwbuf[800];
     if (ams_describe_hardware_json(hwbuf, sizeof(hwbuf)) > 0) {
         cJSON *hw = cJSON_Parse(hwbuf);
         if (hw) {
@@ -879,6 +882,65 @@ static esp_err_t h_hardware_test(httpd_req_t *req)
     char info[128];
     snprintf(info, sizeof(info), "通道%d 已开始%s，%.1f 秒后自动停止",
              channel, direction == 1 ? "进料" : "退料", ms / 1000.0);
+    cJSON_AddStringToObject(o, "info", info);
+    return send_json_obj(req, o);
+}
+
+/**
+ * 十一、辅助送料自检
+ * ==========================================================================
+ * ★ 为什么单独给一个接口（2026-09-23 现场反馈）：
+ *   用户报"辅助送料没作用、电磁吸合了但电机不转"。辅助送料平时是**由打印机
+ *   阶段（stg=8/19/0）驱动**的，想在机器上验证一次，得等下一轮打印轮到校准
+ *   阶段 —— 十几分钟起步，还未必复现。这个按钮把这件事变成"点一下"：
+ *
+ *     · 手动点动（全速 duty=255）能转、辅助送料自检（duty 随网页设置）不转
+ *         → 就是占空比不够，把网页上的辅助送料速度往上调（默认已改为 100%）
+ *     · 两个都不转
+ *         → 硬件链路：H 桥使能脚 / 离合齿轮打滑 / 接线，不是软件
+ *     · 回读两路 LEDC 都是 0
+ *         → 信号压根没写进硬件，是软件路径问题
+ *
+ * 三种结论对应三种完全不同的修法，而区分它们只需要这一次点击。
+ */
+static esp_err_t h_assist_test(httpd_req_t *req)
+{
+    cJSON *b = read_body_json(req);
+    int channel = json_int(b, "channel", 0);   /* 物理料盘位 1~4；0 = 用当前通道 */
+    cJSON_Delete(b);
+
+    if (channel < 0 || channel > BOARD_CHANNEL_COUNT) {
+        char info[64];
+        snprintf(info, sizeof(info), "通道 %d 不存在", channel);
+        return reply_ok(req, false, info);
+    }
+
+    if (ams_is_busy()) {
+        char info[96];
+        int busy_mat = ams_active_material();
+        if (busy_mat >= 0) {
+            snprintf(info, sizeof(info), "%s（料盘位%d）中，等它停下来再按",
+                     ams_state_text(), busy_mat + 1);
+        } else {
+            snprintf(info, sizeof(info), "%s中，等它停下来再按", ams_state_text());
+        }
+        return reply_ok(req, false, info);
+    }
+
+    int material = (channel > 0) ? channel - 1 : -1;
+    if (!ams_post_assist_test(material)) {
+        return reply_ok(req, false, "总线正忙，稍后再按");
+    }
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddBoolToObject(o, "running", true);
+    char info[160];
+    snprintf(info, sizeof(info),
+             "已按辅助送料配置（%u%% × %ums）驱动一次，"
+             "结果看「最近一次驱动」和日志",
+             (unsigned)config_get_assist_speed_pct(),
+             (unsigned)config_get_assist_ms());
     cJSON_AddStringToObject(o, "info", info);
     return send_json_obj(req, o);
 }
@@ -1452,6 +1514,7 @@ DEF_COUNTED(h_access_set)
 DEF_COUNTED(h_ap_set)
 DEF_COUNTED(h_current_channel_set)
 DEF_COUNTED(h_hardware_test)
+DEF_COUNTED(h_assist_test)
 DEF_COUNTED(h_jog_set)
 DEF_COUNTED(h_stop)
 DEF_COUNTED(h_sensor_set)
@@ -1530,6 +1593,7 @@ esp_err_t web_server_start(void)
 
         /* ---- 动作 ---- */
         { .uri = "/hardware_test", .method = HTTP_POST, .handler = h_hardware_test_counted },
+        { .uri = "/assist_test",   .method = HTTP_POST, .handler = h_assist_test_counted },
         { .uri = "/jog_set",       .method = HTTP_POST, .handler = h_jog_set_counted },
         { .uri = "/stop",          .method = HTTP_POST, .handler = h_stop_counted },
 

@@ -480,13 +480,14 @@
         html += '<div class="kv"><span>离合冲突次数</span><b' +
                 (cf ? ' class="err"' : ' class="ok"') + '>' + cf + '</b></div>';
 
-        /* ★ 最近一次驱动的执行回执（2026-09-23 新增）。
-         *   用户报"日志显示在辅助送料、电机却没动"，而日志是**先**打"辅助送料"
-         *   **再**调驱动的、驱动函数的返回值以前还被直接丢掉 —— 光看日志分不清
-         *   "根本没驱动"和"驱动了但带不动"。这里把**硬件真正收到的数**摆出来：
-         *     duty 是写进 LEDC 的原值（手动点动=全速 255，辅助送料 60%=153）。
-         *   于是三种情况一眼可分：没吸合 / 被幂等跳过 / 驱动了（那还不动就是
-         *   占空比带不动，属于物理问题）。 */
+        /* ★ 最近一次驱动的执行回执（2026-09-23 新增，同日补硬件回读）。
+         *   现场反复报"日志显示在辅助送料、电机却没动"，而日志是**先**打
+         *   "辅助送料"**再**调驱动的 —— 光看日志分不清"根本没驱动"和
+         *   "驱动了但带不动"。这里把**硬件真正收到的数**摆出来：
+         *     duty   = 我们请求写下去的原值（手动点动=255，辅助送料=按百分比）
+         *     rb_*   = **从 LEDC 寄存器读回来的原值**、引脚的**实际电平**
+         *   rb_in1 是 0 而 duty 非 0 → 信号压根没写进硬件（软件问题）；
+         *   rb_in1 非 0 而电机不转 → 占空比或机械（H 桥使能/离合打滑）。 */
         var dv = hw.drive;
         if (dv) {
             var dvTxt;
@@ -500,6 +501,22 @@
                         ' · 通电 ' + dv.ran_ms + 'ms</b>';
             }
             html += '<div class="kv"><span>最近一次驱动</span>' + dvTxt + '</div>';
+
+            if (dv.clutch_ok && !dv.skipped && dv.rb_in1 !== undefined) {
+                var rbOk = (dv.rb_in1 > 0 || dv.rb_in2 > 0);
+                html += '<div class="kv"><span>LEDC 回读</span><b' +
+                        (rbOk ? ' class="ok"' : ' class="err"') + '>' +
+                        'IN1=' + dv.rb_in1 + '/255（引脚' + dv.lv_in1 + '）　' +
+                        'IN2=' + dv.rb_in2 + '/255（引脚' + dv.lv_in2 + '）</b></div>';
+                if (!rbOk) {
+                    html += '<div class="err" style="font-size:12px">' +
+                            '⚠ 回读两路都是 0：信号没写进硬件，属于软件问题</div>';
+                } else if (dv.duty_raw && dv.duty_raw < 255) {
+                    html += '<div class="dim" style="font-size:12px">' +
+                            '信号确实出去了。若电机仍不转，就是占空比不够 —— ' +
+                            '把上面的速度调到 100%，或先用「手动点动」对照一次</div>';
+                }
+            }
         }
 
         html += '<div class="dim" style="margin-top:8px;font-size:13px">离合状态</div>' +
@@ -845,6 +862,177 @@
             toast((d && d.info) || '已切换', (d && d.ok) ? 'ok' : 'bad');
             refresh();
         });
+    }
+
+    /* 「立即自检」—— 按当前配置驱动一次辅助送料。
+     *
+     * ★ 为什么不靠"等下一轮打印"来验证（2026-09-23 现场反馈）：
+     *   辅助送料平时是由打印机阶段（校准/打印中）触发的，想验证一次得等
+     *   十几分钟。这个按钮让它立刻跑一次，并且用**硬件回读**把结果落在
+     *   「最近一次驱动」里：
+     *     点动（duty 255）转、自检不转 → 占空比不够
+     *     两个都不转                   → 硬件链路（H 桥使能 / 离合打滑 / 接线）
+     *     回读两路都是 0               → 信号没写进硬件，软件问题
+     */
+    function testAssist() {
+        post('/assist_test', {}, function (d) {
+            toast((d && d.info) || '已下发自检', (d && d.ok) ? 'ok' : 'bad');
+        });
+    }
+
+    /* =======================================================================
+       换色冲刷 G-code 生成器
+       =======================================================================
+       ★ 为什么只能"生成文本、让用户粘回切片器"，而不能"网页改一下打印机就变"
+
+         冲刷 / 擦嘴根本不是打印机固件的流程，它是切片机设置里的
+         change_filament_gcode（换料 G-code）—— **切片的那一刻就展开、写死进
+         G-code 文件了**。证据就在切片文件里：`切片G.txt` 第 1378 行起
+         ";===== 保留强化切刀（X260→X285）+ 固定冲刷量…"，下面 30/20/15/10mm
+         的四轮冲刷是写死的常量，连 `flush_length` 变量都没用。
+
+         切片器里的 `flush_volumes_matrix`（例子里是 0,36.1,62.7,45,...）现在
+         **是失效的** —— 因为宏不引用 `flush_length` 了，改它没用。
+
+         板子只能通过 MQTT 发**单条** gcode_line，既改不了已经切好的文件，
+         也没法在打印机执行宏的中途插进去。所以"Web 自定义"唯一可行的形态
+         就是：网页算好参数化的片段 → 一键复制 → 粘回切片器的换料 G-code。
+
+       ★ 生成的范围**故意限制在「冲刷」到「最终收尾」这一段**，不生成整个宏：
+         切刀段和暂停段（M73 P101 / M400 U1）是这套固件握手时序的关键，
+         让用户不小心改坏得不偿失。少生成一点，风险小很多。
+    */
+    function genFlushGcode() {
+        var rounds = parseInt(val('fl_rounds'), 10);
+        if (isNaN(rounds) || rounds < 1) rounds = 1;
+        if (rounds > 4) rounds = 4;
+
+        var mms = (val('fl_mms') || '').split(/[,，\s]+/)
+                    .map(function (s) { return parseFloat(s); })
+                    .filter(function (n) { return !isNaN(n) && n > 0; });
+        if (!mms.length) mms = [30];
+        while (mms.length < rounds) mms.push(mms[mms.length - 1]);
+
+        var first = parseInt(val('fl_first'), 10);
+        if (isNaN(first) || first < 0) first = 0;
+        var wipe = $('fl_wipe').checked;
+
+        var L = [];
+        function wipeBlock(n) {
+            if (!wipe) return;
+            L.push('; ===== 擦嘴 ' + n + ' =====');
+            L.push('M400');
+            L.push('M106 P1 S178');
+            L.push('M400 S3');
+            L.push('G1 X-38.2 F18000');
+            L.push('G1 X-48.2 F3000');
+            L.push('G1 X-38.2 F18000');
+            L.push('G1 X-48.2 F3000');
+            L.push('G1 X-38.2 F18000');
+            L.push('G1 X-48.2 F3000');
+            L.push('M400');
+            L.push('M106 P1 S0');
+            L.push('');
+        }
+
+        L.push('; ===== 换色冲刷（AMS 网页生成）=====');
+        L.push('; ===== 轮数 ' + rounds + '，每轮 ' + mms.slice(0, rounds).join('/') +
+               ' mm，首次额外 ' + first + ' mm，擦嘴 ' + (wipe ? '开' : '关') + ' =====');
+        L.push('');
+
+        for (var i = 0; i < rounds; i++) {
+            var mm = mms[i];
+            L.push('; ===== 冲刷 ' + (i + 1) + '（固定量 ' + mm + 'mm'
+                   + (i === 0 ? '' : '，脉冲式') + '）=====');
+            if (i === 0) {
+                /* 第一轮：匀速长冲，负责把旧颜色大块带走。
+                 * 前后包一层 set_filament_type，打印机据此算体积流量补偿。 */
+                L.push('M400');
+                L.push('M1002 set_filament_type:UNKNOWN');
+                L.push('M109 S[nozzle_temperature_range_high] ; 加热到最高温度');
+                L.push('M104 S[new_filament_temp] ; 余热冲刷到目标温度');
+                L.push('M106 P1 S60');
+                L.push('G1 E' + mm + ' F{old_filament_e_feedrate}');
+                L.push('M400');
+                L.push('M1002 set_filament_type:{filament_type[next_extruder]}');
+            } else {
+                /* 后续轮：脉冲式（小段挤出 + 微退），比匀速更容易把残色甩掉 */
+                var per = Math.round((mm / 5) * 10) / 10;
+                L.push('M106 P1 S60');
+                for (var k = 0; k < 5; k++) {
+                    L.push('G1 E' + per + ' F{new_filament_e_feedrate}');
+                    L.push('G1 E0.4 F50');
+                }
+                L.push('G1 E-[new_retract_length_toolchange] F1800');
+                L.push('G1 E[new_retract_length_toolchange] F300');
+            }
+            L.push('');
+            wipeBlock(i + 1);
+        }
+
+        if (first > 0) {
+            L.push('; ===== 首次换料额外冲刷 =====');
+            L.push('{if toolchange_count == 1}');
+            L.push('M400');
+            L.push('M104 S[new_filament_temp]');
+            L.push('M106 P1 S60');
+            L.push('G1 E' + first + ' F{old_filament_e_feedrate}');
+            L.push('G1 E-[new_retract_length_toolchange] F1800');
+            L.push('G1 E[new_retract_length_toolchange] F300');
+            L.push('{endif}');
+            L.push('');
+        }
+
+        L.push('; ===== 最终收尾 =====');
+        L.push('M400');
+        L.push('M106 P1 S60');
+        L.push('M109 S[new_filament_temp]');
+        L.push('G1 E5 F{new_filament_e_feedrate} ; 补偿温等期间漏料');
+        L.push('M400');
+        L.push('G92 E0');
+        L.push('G1 E-[new_retract_length_toolchange] F1800');
+        wipeBlock('（收尾）');
+        L.push('G1 Z{max_layer_z + 3.0} F3000');
+        L.push('M106 P1 S0');
+        L.push('{if layer_z <= (initial_layer_print_height + 0.001)}');
+        L.push('M204 S[initial_layer_acceleration]');
+        L.push('{else}');
+        L.push('M204 S[default_acceleration]');
+        L.push('{endif}');
+
+        $('fl_out').value = L.join('\n');
+
+        /* 粗算耗时：只用来比较参数之间的相对大小，不当精确值用。
+         * 速率取切片文件里实测的 old=199 / new=299 mm/min；擦嘴一次约 5 秒。 */
+        var total = 0;
+        for (var j = 0; j < rounds; j++) total += mms[j];
+        var secs = mms[0] / 3.32;
+        for (var m = 1; m < rounds; m++) secs += mms[m] / 4.98;
+        secs += first / 3.32;
+        secs += (wipe ? rounds + 1 : 0) * 5;
+        secs += 10;
+        $('fl_est').innerHTML = '冲 ' + total + ' mm'
+            + (first > 0 ? '（+首次 ' + first + '）' : '')
+            + ' · 约 ' + Math.round(secs) + ' 秒';
+        toast('已生成，点「复制」再粘回切片器的换料 G-code', 'ok');
+    }
+
+    function copyFlushGcode() {
+        var el = $('fl_out');
+        if (!el || !el.value) {
+            toast('先生成片段', 'bad');
+            return;
+        }
+        el.removeAttribute('readonly');
+        el.select();
+        var ok = false;
+        try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+        el.setAttribute('readonly', 'readonly');
+        if (ok) {
+            toast('已复制到剪贴板', 'ok');
+        } else {
+            toast('浏览器不让自动复制，请手动选中后 Ctrl+C', 'bad');
+        }
     }
 
     function saveAssistPct() {
@@ -1238,6 +1426,9 @@
         $('btn_src_toggle').onclick = toggleExtruderSrc;
         $('btn_ota_upload').onclick = otaUpload;
         $('btn_bootclear').onclick = resetBootCount;
+        $('btn_assist_test').onclick = testAssist;
+        $('btn_fl_gen').onclick = genFlushGcode;
+        $('btn_fl_copy').onclick = copyFlushGcode;
         $('btn_log_toggle').onclick = toggleLog;
         $('btn_log_clear').onclick = clearLogView;
         $('menu_btn').onclick = function () { toggleMenu(); };

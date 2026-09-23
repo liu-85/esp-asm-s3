@@ -235,12 +235,20 @@
             </label>
             <button class="primary" style="flex:1" id="btn_assist_save">保存</button>
           </div>
+          <div class="row" style="margin-top:10px">
+            <button class="ghost" style="flex:1" id="btn_assist_test">
+              ▶ 立即自检（按上面配置跑一次）
+            </button>
+          </div>
           <div class="tip">
             换色 / 校准挤出 / 流量校准 / 打印中，AMS 同步以该 PWM 推料，帮打印机齿轮咬住新料。
             <div class="hr"></div>
-            <b>PWM 速度</b>：默认 60%，范围 5%~100%。
+            <b>PWM 速度</b>：默认 <b>100%</b>，范围 5%~100%。
             ⚠️ <b>低于 60% 会带不动本机构的电机</b> —— 现场表现为"电机没动作、听不到声"，
             那是堵转不是没发指令。调的时候一边听电机声一边往上加，直到能听到明显转动。
+            <br>（2026-09-23 run7 实测：默认值原来是 60%，整轮打印的辅助送料回执全部正常
+            —— 离合吸合、duty=153 确实写出去了 —— <b>但料一动不动</b>；同一颗电机跑 100%
+            的退料/送料都正常。结论：60% 正好压在堵转线上，默认值已提到 100%。）
             <div class="hr"></div>
             <b>每次时长</b>：默认 1500ms，范围 200~10000ms。太短推不动料，太长会把料顶过头。
             <div class="hr"></div>
@@ -249,20 +257,70 @@
             校准阶段中途停一下是为了不把料一直顶死；<b>把"每次时长"往上调，校准时会更密</b>。
             默认 1500ms 下，校准时大约每 2 秒送一次（≈ 转 1.5 秒 / 停 0.6 秒）。
             <div class="hr"></div>
-            <b>怎么确认它真的动了</b>（这条最有用）：每次辅助送料后面都会跟一条
-            <b>执行回执</b>，形如
-            <code>辅助送料回执：离合已吸合 —— 通道2 PWM duty=153/255（60%），通电 1500ms</code>。
+            <b>怎么确认它真的动了</b>（这条最有用）：<b>先按上面的「立即自检」按钮</b>
+            —— 它会按你填的速度/时长立刻驱动一次当前通道，不用等下一轮打印。
+            每次辅助送料后面也会跟一条<b>执行回执</b>，形如
+            <code>辅助送料回执：离合已吸合 —— 通道2 PWM duty=153/255（60%），通电 1500ms；硬件回读 IN1=153/255(1) IN2=0/255(0)</code>。
             <br>
-            <code>duty</code> 是<b>硬件真正收到</b>的数（手动点动是全速 <code>duty=255</code>）。
-            对照着看就能立刻分清三种情况：
+            <code>duty</code> 是<b>请求写下去</b>的数；<code>硬件回读</code>是
+            <b>从 LEDC 寄存器读回来</b>的数和引脚的<b>实际电平</b>。
+            两个一对照，四种情况立刻分清：
             <br>· 只有「辅助送料…」却没有回执 → 电磁离合没吸合上，<b>根本没驱动电机</b>，
             与占空比无关；
-            <br>· 回执里 <code>duty=255/255</code> 电机还是不动 → 那是接线 / 硬件，不是参数；
-            <br>· 回执正常（<code>duty=153</code>、<code>通电 1500ms</code>）但电机不转 →
-            <b>就是 60% 带不动，把上面的 PWM 速度直接拉到 100% 再试一次</b>。
-            <br>网页「硬件状态 → 最近一次驱动」里也有同样的数，不用抓串口。
+            <br>· 回读 <code>IN1=0/255</code> 但 duty 非 0 → 信号<b>没写进硬件</b>，软件问题；
+            <br>· 回读 <code>IN1=153/255(1)</code>、通电 1500ms，电机还是不转 →
+            <b>占空比不够</b>，把 PWM 速度拉到 100% 再自检一次；
+            <br>· 100% 自检（<code>duty=255</code>）也不转 → 接线 / H 桥使能 / 离合打滑，
+            <b>不是参数问题</b>。此时用「手动点动」（同样是全速 255）对照，两者表现应当一致。
+            <br>网页「硬件状态 → 最近一次驱动 / LEDC 回读」里也有同样的数，不用抓串口。
             <div class="hr"></div>
             关闭总开关后换色/打印中都不再同步辅助送料。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>换色冲刷参数 <span class="sub">生成 change_filament_gcode 片段</span></h2>
+          <div class="row" style="align-items:center">
+            <label style="flex:1 1 120px;font-size:13px" class="dim">冲刷轮数
+              <input type="number" id="fl_rounds" min="1" max="4" step="1" value="2" style="width:70px">
+            </label>
+            <label style="flex:1 1 170px;font-size:13px" class="dim">每轮冲刷量 mm（逗号分隔）
+              <input type="text" id="fl_mms" value="30,15" style="width:120px">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">首次换料额外 mm
+              <input type="number" id="fl_first" min="0" max="200" step="5" value="50" style="width:70px">
+            </label>
+            <label style="flex:0 0 auto;display:flex;align-items:center;gap:6px;font-size:13px">
+              <input type="checkbox" id="fl_wipe" checked style="width:18px;height:18px;accent-color:#2f6fed">
+              <span>每轮后擦嘴</span>
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" style="flex:1" id="btn_fl_gen">生成片段</button>
+            <button class="ghost" style="flex:0 0 auto" id="btn_fl_copy">复制</button>
+          </div>
+          <div class="kv" style="margin-top:8px"><span>合计冲刷量 / 预计耗时</span>
+            <b id="fl_est">—</b></div>
+          <textarea id="fl_out" readonly rows="9" style="width:100%;margin-top:8px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.45"></textarea>
+          <div class="tip">
+            <b>这不是"打印机的固定流程"</b> —— 切刀、冲刷、擦嘴全部来自切片机器设置里的
+            <b>「换料 G-code」（change_filament_gcode）</b>，切片时就写死进 G-code 了，
+            板子改不了已经切好的文件。所以这里生成的是**给你粘回切片器**的片段。
+            <div class="hr"></div>
+            <b>怎么用</b>：在 Bambu Studio / Orca 里打开
+            「机器设置 → 换料 G-code」，把你现有宏里<b>「冲刷 1」那一行到「最终收尾」结束</b>
+            整段删掉，换成这里生成的内容，保存后重新切片。
+            切刀段、暂停段（<code>M73 P101</code> / <code>M400 U1</code>）、
+            末尾的 <code>M620/M621 / T{next_extruder}</code> 都不要动。
+            <div class="hr"></div>
+            <b>为什么要调</b>：默认的 4 轮（30/20/15/10 + 首次再加 50mm）是把旧颜色冲干净
+            的保守值。2026-09-23 run7 实测：一次换色里，从打印机暂停到它说"该你退料了"
+            （切刀 + 吐料）已经要 <b>18~24 秒</b>，resume 之后的 4 轮冲刷 + 擦嘴还要再占十几秒。
+            轮数减到 2、首次额外量减到 30，一般能省 <b>7~8 秒/次</b>（首次换色省得更多）；
+            代价是颜色交界处可能略微混色 —— 建议先只减轮数、别一次减太多。
+            <div class="hr"></div>
+            <b>预计耗时</b>是粗算（冲刷按 200/300 mm/min、每次擦嘴按 5 秒估的），
+            只用来比较不同参数的相对大小，不要当精确值。
           </div>
         </div>
 

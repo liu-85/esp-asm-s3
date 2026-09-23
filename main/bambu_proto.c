@@ -484,6 +484,7 @@ esp_err_t bambu_proto_parse(const char *json, size_t len, bambu_report_t *out)
 
     out->mc_percent         = json_int(print, "mc_percent", 0);
     out->mc_remaining_time  = json_int(print, "mc_remaining_time", 0);
+    out->layer_num          = json_int(print, "layer_num", 0);
     out->print_error        = json_int(print, "print_error", 0);
     out->stg_cur            = json_int(print, "stg_cur", 255);
 
