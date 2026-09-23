@@ -531,6 +531,18 @@ static bool has_any_sensor(void)
  * @param out_inplace  非 NULL 时返回"结束时挤出机是否已到位"
  * @return true = 硬件层没出错（到位与否看 out_inplace）
  */
+/* ★ 前置声明，别删。
+ *   poll_printer_inplace() 的**定义**在下面（闭环送料那一节的末尾，约 620 行），
+ *   但 load_closed_loop() 里要先用它。C 的规则是"调用点之前必须能看到声明或
+ *   定义"，看不到就是隐式声明 —— 而 ESP-IDF 默认带 `-Werror=all`，
+ *   隐式声明直接是**编译错误**。
+ *
+ *   2026-09-23 就是栽在这里：本机没有 gcc / ESP-IDF，全部本地自检
+ *   （check_c_static / check_printf_args / check_config_layout）都是绿的，
+ *   一推上去 CI 两个目标全红。为此补了 tools/check_c_call_order.py 专门盯这类
+ *   问题，它会明确报出这一行。 */
+static bool poll_printer_inplace(void);
+
 static bool load_closed_loop(int material_index, uint32_t total_ms,
                              bool *out_inplace)
 {

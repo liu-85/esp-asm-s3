@@ -61,7 +61,18 @@ jobs:
 
           # ---- 目标专属 sdkconfig（C3 走 sdkconfig.defaults.esp32c3）----
           idf.py set-target ${TARGET}
-          idf.py build
+
+          # ---- 编译 ----
+          # ★ 输出同时落一份到 /tmp/build.log：编译失败时，下一个 step 会从里面
+          #   提取错误行、以 ::error:: 注解的形式发出来。
+          #   为什么要这么绕：GitHub 的"下载 job 日志"接口需要仓库管理员权限，
+          #   而本机（开发用的那台 Windows）**没有 gcc / ESP-IDF**，本地根本
+          #   编不出来，只能靠 CI 给答案。没有日志就等于纯盲猜 ——
+          #   2026-09-23 那次就是这样，注释里只看到 "exit code 2"，白耗了一轮。
+          #   注解走的是 check-runs API，匿名就能读，所以把错误做成注解最省事。
+          #   pipefail：让管道里 idf.py 的失败码能传出来（否则 tee 的 0 会盖掉它）。
+          set -o pipefail
+          idf.py build 2>&1 | tee /tmp/build.log
 
           # ---- 合并为单文件刷写 ----
           idf.py merge-bin
@@ -96,6 +107,33 @@ jobs:
             echo "target: ${TARGET}"
           } > dist/version_${TARGET}.txt
           echo "--- artifacts for ${TARGET} ---" && ls -lh dist/
+
+      # =====================================================================
+      # 编译失败时，把错误行做成 GitHub 注解
+      # =====================================================================
+      # 目的：让"没有仓库权限、看不到 job 日志"的环境也能读到编译错误。
+      # 注解可以匿名通过 check-runs API 取到：
+      #   GET /repos/{owner}/{repo}/check-runs/{id}/annotations
+      # 而 job 日志接口（/actions/jobs/{id}/logs）要求管理员权限，匿名是 403。
+      # 本机没有 gcc / ESP-IDF，编译验证只能靠 CI —— 这条通道就是那双眼。
+      - name: Report compile errors as annotations
+        if: failure()
+        run: |
+          LOG=/tmp/build.log
+          if [ ! -f "$LOG" ]; then
+            echo "::error title=CI::没拿到编译日志 —— 失败发生在 idf.py build 之前（多半卡在 ESP-IDF 克隆/安装，或 mdns 组件拉取）"
+            exit 0
+          fi
+          echo "--- 提取编译错误（最多 10 条，转成注解）---"
+          grep -nE "error:|undefined reference|implicit declaration|ninja: build stopped|FAILED: " "$LOG" \
+            | head -10 \
+            | while IFS= read -r l; do
+                # 注解的正文不能有换行；% 要转义成 %25（GitHub 自己的转义规则）
+                msg=$(printf '%s' "$l" | tr -d '\r' | sed -e 's/%/%25/g' -e 's/\t/    /g' | cut -c1-900)
+                echo "::error title=编译错误::$msg"
+              done || true
+          echo "--- 日志尾部 40 行 ---"
+          tail -40 "$LOG" || true
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
