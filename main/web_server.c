@@ -454,7 +454,9 @@ static esp_err_t h_status(httpd_req_t *req)
      * ★ 这里复用 ams_controller 生成的那段 JSON，然后并进来。
      *   好处是离合/电机的字段定义只有一处，改那边这边自动跟上，
      *   不会出现"网页显示的和日志里不一致"这种最难查的问题。 */
-    char hwbuf[512];
+    /* ★ 512 → 640：ams_describe_hardware_json 里新增了一整块 drive 回执，
+     *   要保证 cJSON_Parse 拿到的是完整 JSON（见那边的余量检查注释）。 */
+    char hwbuf[640];
     if (ams_describe_hardware_json(hwbuf, sizeof(hwbuf)) > 0) {
         cJSON *hw = cJSON_Parse(hwbuf);
         if (hw) {

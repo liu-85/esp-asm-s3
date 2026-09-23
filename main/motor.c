@@ -53,8 +53,8 @@ static int         s_speed_pct;
 static uint32_t    s_dead_time_ms = MOTOR_DEFAULT_DEAD_MS;
 static int64_t     s_dir_started_us;   /* 当前方向是什么时候开始的 */
 
-/** 把百分比换算成 LEDC 的 duty 原值 */
-static inline uint32_t pct_to_duty(int pct)
+/** 把百分比换算成 LEDC 的 duty 原值。公开版本见 motor.h（诊断日志要用） */
+uint32_t motor_pct_to_duty(int pct)
 {
     if (pct <= 0) {
         return 0;
@@ -97,8 +97,8 @@ static void motor_apply(int in1_pct, int in2_pct)
         in2_pct = 0;
     }
 
-    const uint32_t d1 = pct_to_duty(in1_pct);
-    const uint32_t d2 = pct_to_duty(in2_pct);
+    const uint32_t d1 = motor_pct_to_duty(in1_pct);
+    const uint32_t d2 = motor_pct_to_duty(in2_pct);
 
     /* ---- 第一步：双路清零。到这一步结束，H 桥一定不会直通 ---- */
     ledc_set_duty(MOTOR_LEDC_MODE, MOTOR_LEDC_CH_IN1, 0);

@@ -339,6 +339,11 @@ static void led_update(void)
  * 三、总线守护：所有复合动作都从这里走
  * ========================================================================== */
 
+/** 最近一次驱动动作的回执；任何一次 drive_channel()/drive_channel_speed()
+ *  都会刷新它。诊断用，不参与任何控制逻辑。
+ *  类型定义与 getter 在 ams_controller.h（网页 /status 也要读它）。 */
+static drive_receipt_t s_last_drive;
+
 /**
  * 吸合通道 → 按方向转 ms 毫秒（可选：中途查停止微动）→ 停 → 断开全部离合。
  *
@@ -369,6 +374,15 @@ static bool drive_channel_speed(int material_index, int direction,
                                 uint8_t speed_pct, uint32_t max_ms,
                                 bool stop_on_sensor, bool *out_triggered)
 {
+    /* ★ 先把回执清成"什么都没发生"：任何一条提前 return 都会把它留在这个
+     *   状态 —— 调用方（尤其是辅助送料）据此就能知道"日志打了，但动作
+     *   其实没发生"。这是本轮修"日志在打、电机不动"的核心手段。 */
+    s_last_drive.clutch_ok = false;
+    s_last_drive.skipped   = false;
+    s_last_drive.speed_pct = speed_pct;
+    s_last_drive.duty_raw  = (uint16_t)motor_pct_to_duty(speed_pct);
+    s_last_drive.ran_ms    = 0;
+
     if (out_triggered) {
         *out_triggered = false;
     }
@@ -379,12 +393,13 @@ static bool drive_channel_speed(int material_index, int direction,
 
     esp_err_t err = clutch_engage(material_index + 1);
     if (err != ESP_OK) {
-        record_error("料盘位%d 离合吸合失败（%s）", material_index + 1,
-                     esp_err_to_name(err));
+        record_error("料盘位%d 离合吸合失败（%s）—— 本次**没有**驱动电机",
+                     material_index + 1, esp_err_to_name(err));
         clutch_release_all();
-        return false;
+        return false;                       /* 回执里 clutch_ok 保持 false */
     }
     clutch_set_busy(true);
+    s_last_drive.clutch_ok = true;          /* 离合真的吸合了 */
 
     bool triggered = false;
     bool use_sensor = stop_on_sensor && config_sensor_enabled(material_index) &&
@@ -405,12 +420,29 @@ static bool drive_channel_speed(int material_index, int direction,
                 break;
             }
         }
+        /* 微动分支走的是 motor_run()（全速），回执按全速记 */
+        s_last_drive.speed_pct = 100;
+        s_last_drive.duty_raw  = (uint16_t)motor_pct_to_duty(100);
+        s_last_drive.ran_ms    = elapsed;
         motor_stop();
     } else {
         /* ★ 关键：direction 是 int（±1），必须 cast 成 motor_dir_t。
          * 不 cast 的话 C 编译器可能把 -1 当 0（STOP）处理，
          * 退料方向就会丢，电机不转（之前 bug 的根因） */
-        motor_run_speed((motor_dir_t)direction, max_ms, speed_pct);
+        motor_dir_t dir = (motor_dir_t)direction;
+
+        /* ★ 幂等短路探测：motor_set_dir_speed() 遇到"同方向 + 同速度 +
+         *   已在转"会直接 return（**完全不碰硬件**）。这是"发了指令但车
+         *   没动"的另一条可能路径（见 drive_receipt_t）。先探再调，
+         *   把它记进回执，现场才能分清是没驱动还是驱动了带不动。 */
+        if (motor_get_dir() == dir &&
+            motor_get_speed_pct() == (int)speed_pct &&
+            motor_elapsed_ms() != 0) {
+            s_last_drive.skipped = true;
+        }
+
+        motor_run_speed(dir, max_ms, speed_pct);
+        s_last_drive.ran_ms = max_ms;
         motor_stop();
     }
 
@@ -423,6 +455,11 @@ static bool drive_channel_speed(int material_index, int direction,
      *   上面所有分支最后都落到这里。 */
     clutch_release_all_settled();
     return true;
+}
+
+const drive_receipt_t *ams_last_drive_receipt(void)
+{
+    return &s_last_drive;
 }
 
 /**
@@ -1816,6 +1853,18 @@ static void handle_report(const bambu_report_t *r)
         uint8_t  assist_pct = config_get_assist_speed_pct();
         uint16_t assist_ms  = config_get_assist_ms();
 
+        /* ★ 辅助送料必须**占住状态机**（AMS_STATE_ASSIST）。
+         *   以前这里不设状态，后果三条，都是现场踩出来的：
+         *     1. 网页状态永远是"空闲"、/status 的 busy 也是 false —— 用户没法
+         *        从任何界面看出"它到底动没动"，只能靠听电机声，于是就有了
+         *        "日志显示在辅助送料、可电机没动作"这种没法证伪的反馈；
+         *     2. ams_is_busy() 返回 false → 别的动作（微动自吸、手动点动）
+         *        以为总线空闲，能在辅助送料正跑着的时候抢走共享电机；
+         *     3. 状态灯不亮（led_update 靠 s_state != IDLE 判"动作中"）。
+         *   必须在**调用驱动之前**设，进入临界区前状态就已经是一致的。 */
+        ams_state_t prev_state = ams_get_state();
+        set_state(AMS_STATE_ASSIST, assist_mat);
+
         /* ★ 一条日志把"为什么送 / 占空比 / 时长 / 周期"都带上。
          *   真机教训：23% 这种低占空比在这个机构上**完全带不动电机**
          *   （20kHz 堵转几乎没有可听噪声），所以实际占空比必须印出来；
@@ -1843,8 +1892,43 @@ static void handle_report(const bambu_report_t *r)
                     assist_why, config_get_filament_current(),
                     (unsigned)assist_pct, (unsigned)assist_ms, skipped);
         }
-        (void)drive_channel_speed(assist_mat, 1, assist_pct, assist_ms,
-                                  false, NULL);
+
+        /* ★★ 这里是修"日志在打、电机却没动"的关键 ★★
+         *
+         *   以前这一行是 `(void)drive_channel_speed(...)` —— 返回值直接扔掉，
+         *   而"辅助送料…"那句日志在上面**已经打出去了**。
+         *   于是离合吸合失败时（残留吸合冲突 ESP_ERR_CLUTCH_CONFLICT，
+         *   或 3 秒拿不到锁 ESP_ERR_TIMEOUT），函数只是 record_error 再
+         *   return false，现场看到的**仍然**是"辅助送料（校准挤出）…"，
+         *   完全看不出"这一次根本没有电机被驱动过"。
+         *
+         *   现在把返回值接住，并读硬件回执：离合到底吸合没有、写进 LEDC 的
+         *   duty 原值是多少、电机真通了多久。**成功也打出来** —— 因为
+         *   "辅助送料 60%（duty 153/255）"和"手动点动 100%（duty 255/255）"
+         *   并排看，才能一眼判断是不是这个占空比带不动本机构的电机。 */
+        bool ok = drive_channel_speed(assist_mat, 1, assist_pct, assist_ms,
+                                      false, NULL);
+        const drive_receipt_t *rc = ams_last_drive_receipt();
+
+        if (!ok || !rc->clutch_ok) {
+            ams_log_err("辅助送料未执行：通道%d 电磁离合没吸合上"
+                        "（原因见上一条错误）—— 本次**没有**驱动电机。"
+                        "这与占空比无关，是吸合失败",
+                        config_get_filament_current());
+        } else if (rc->skipped) {
+            ams_log_warn("辅助送料被跳过：电机已在同方向同速度运行，"
+                         "本次没有重新驱动");
+        } else {
+            ams_log("  辅助送料回执：离合已吸合 —— 通道%d PWM duty=%u/255"
+                    "（%u%%），通电 %ums（手动点动是全速 duty=255，可对比）",
+                    config_get_filament_current(),
+                    (unsigned)rc->duty_raw, (unsigned)rc->speed_pct,
+                    (unsigned)rc->ran_ms);
+        }
+
+        /* 状态还回去（通常是"空闲"）—— 别让"辅助送料中"卡住状态机。
+         * 回到空闲时料盘位要跟着清成 -1，否则网页会显示"空闲（料盘位2）" */
+        set_state(prev_state, (prev_state == AMS_STATE_IDLE) ? -1 : assist_mat);
     }
 
     /* ---- 载入打印材料：打印机在等料，我们就主动往里送 ----
@@ -2330,7 +2414,12 @@ int ams_describe_hardware_json(char *buf, size_t buflen)
     /* 先让 clutch 写主体，再补微动和业务状态 */
     int off = clutch_describe_json(buf, buflen, (int)motor_get_dir(),
                                    ams_is_busy(), clutch_get_owner());
-    if (off <= 0 || (size_t)off >= buflen - 8) {
+    /* ★ 余量从 8 提到 200：下面要追加的不只是 limits/state/motor_speed，
+     *   还多了一整块 drive 回执（约 90 字节）。留 8 字节的话 snprintf 会把
+     *   尾巴截掉 → 生成一个**不完整**的 JSON → web_server 那边 cJSON_Parse
+     *   直接失败 → 整个 hardware 字段从网页上消失。那比不显示回执更糟。
+     *   这里宁可提前 return（buffer 里仍是 clutch 自己那份完整 JSON）。 */
+    if (off <= 0 || (size_t)off >= buflen - 200) {
         return off;
     }
 
@@ -2346,9 +2435,16 @@ int ams_describe_hardware_json(char *buf, size_t buflen)
     }
     off += snprintf(buf + off, buflen - off,
                     "],\"state\":%d,\"state_text\":\"%s\","
-                    "\"active_material\":%d,\"motor_speed\":%d}",
+                    "\"active_material\":%d,\"motor_speed\":%d,"
+                    "\"drive\":{\"clutch_ok\":%s,\"skipped\":%s,"
+                    "\"speed_pct\":%u,\"duty_raw\":%u,\"ran_ms\":%u}}",
                     (int)s_state, ams_state_text(), s_active_material,
-                    motor_get_speed_pct());
+                    motor_get_speed_pct(),
+                    s_last_drive.clutch_ok ? "true" : "false",
+                    s_last_drive.skipped   ? "true" : "false",
+                    (unsigned)s_last_drive.speed_pct,
+                    (unsigned)s_last_drive.duty_raw,
+                    (unsigned)s_last_drive.ran_ms);
     return off;
 }
 

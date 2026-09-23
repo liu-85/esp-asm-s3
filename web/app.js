@@ -480,6 +480,28 @@
         html += '<div class="kv"><span>离合冲突次数</span><b' +
                 (cf ? ' class="err"' : ' class="ok"') + '>' + cf + '</b></div>';
 
+        /* ★ 最近一次驱动的执行回执（2026-09-23 新增）。
+         *   用户报"日志显示在辅助送料、电机却没动"，而日志是**先**打"辅助送料"
+         *   **再**调驱动的、驱动函数的返回值以前还被直接丢掉 —— 光看日志分不清
+         *   "根本没驱动"和"驱动了但带不动"。这里把**硬件真正收到的数**摆出来：
+         *     duty 是写进 LEDC 的原值（手动点动=全速 255，辅助送料 60%=153）。
+         *   于是三种情况一眼可分：没吸合 / 被幂等跳过 / 驱动了（那还不动就是
+         *   占空比带不动，属于物理问题）。 */
+        var dv = hw.drive;
+        if (dv) {
+            var dvTxt;
+            if (!dv.clutch_ok) {
+                dvTxt = '<b class="err">离合没吸合 —— 本次没有驱动电机</b>';
+            } else if (dv.skipped) {
+                dvTxt = '<b>被跳过（电机已在同方向同速度运行）</b>';
+            } else {
+                dvTxt = '<b' + (dv.duty_raw >= 255 ? ' class="ok"' : '') + '>' +
+                        'duty ' + dv.duty_raw + '/255（' + dv.speed_pct + '%）' +
+                        ' · 通电 ' + dv.ran_ms + 'ms</b>';
+            }
+            html += '<div class="kv"><span>最近一次驱动</span>' + dvTxt + '</div>';
+        }
+
         html += '<div class="dim" style="margin-top:8px;font-size:13px">离合状态</div>' +
                 '<div class="badges">';
         for (var i = 0; i < channels.length; i++) {

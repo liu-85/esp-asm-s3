@@ -94,6 +94,19 @@ uint32_t motor_elapsed_ms(void);
 /** 换向死区时间（毫秒），初始化时从配置取 */
 void motor_set_dead_time_ms(uint32_t ms);
 
+/**
+ * 把占空比百分比换算成 LEDC 的 duty 原值（0~255）。
+ *
+ * ★ 为什么要把这个换算暴露出来（2026-09-23 现场反馈）：
+ *   用户报"日志显示在辅助送料，但电机没动作、电磁也没吸合"。
+ *   百分比（60%）对现场没有意义，**硬件真正收到的数**才是可验证的：
+ *     手动点动 = 全速 → duty 255
+ *     辅助送料 = 60%  → duty 153
+ *   两个数一比，就能立刻分清"指令根本没发下去"还是"这个占空比带不动电机"。
+ *   见 ams_controller.c 的 drive_receipt_t。
+ */
+uint32_t motor_pct_to_duty(int pct);
+
 #ifdef __cplusplus
 }
 #endif
