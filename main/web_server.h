@@ -37,7 +37,11 @@
  *   POST /mqtt_connect          保存打印机参数并重连
  *   POST /access_set            保存通道映射与颜色
  *   POST /hardware_test         单通道点动（网页"硬件调试"面板）
- *   POST /jog_set               改「进退响应时间」
+ *   POST /jog_set               {"seconds":1.0,"speed_pct":100}
+ *                               改「进退响应时间」**和手动点动 PWM**。
+ *                               两个都可选：只传一个也行，没传的保持原值。
+ *                               PWM 是现场用来一档一档试"多少占空比能带动
+ *                               电机和离合"的量法（2026-09-23 现场要求）。
  *   POST /ap_set                开 / 关配置热点
  *   POST /ota_upload            ★ 上传整机固件并升级（真正的双分区 OTA）
  *
@@ -49,12 +53,15 @@
  *   POST /stop                  紧急停止（停电机 + 断开全部离合）
  *
  *   ---- 现场可调项（2026-09-22：把写死的时序搬到网页上）----
- *   POST /assist_set            {"enabled","speed_pct","ms"}
+ *   POST /assist_set            {"enabled","speed_pct","ms","hold"}
  *                                辅助送料的占空比与**时长**（时长以前写死在代码里）。
  *                                重复周期跟着时长走、没有单独参数：
  *                                校准中（stg=8/19）周期 = 时长 + 0.5s，
  *                                打印中（stg=0）周期固定 5s —— 见 ams_controller.c
  *                                里 ASSIST_CAL_GAP_MS 的注释（为什么要 0.5 秒）。
+ *                                hold（2026-09-23 新增）：1 = 辅助阶段内离合
+ *                                保持吸合、只脉冲电机；0 = 老行为（每次吸合-断开）。
+ *                                注意 hold=0 是合法值，判"没传"用的是 -1。
  *   POST /retract_set           {"wait_ms","cont_ms","creep_ms","gap_ms","creep_max"}
  *                                退料四段时长：连续拉料上限 / 蠕动单次 / 蠕动间隔 /
  *                                蠕动轮数（0 = 只做连续退料）。没传的字段保持原值。

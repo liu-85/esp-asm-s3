@@ -1822,6 +1822,166 @@ static int64_t s_stage24_push_start_us;
 /** 「载入打印材料」阶段自动送料的占空比：全速。慢速在这个机构上带不动 */
 #define AMS_STAGE24_PUSH_PCT   100
 
+/* ==========================================================================
+ * 辅助送料「阶段内保持离合吸合」
+ * ============================================================================
+ * ★ 现场要求（2026-09-23）原话：
+ *     "在需要辅助送料阶段，全程保持吸合，值脉冲电机，其他阶段电磁断开。
+ *      这个红线是同时只能 1 路吸合。"
+ *
+ * 改动前的做法：每送一次都是**一整套**动作 ——
+ *     clutch_engage() → 转 assist_ms → motor_stop() → clutch_release_all_settled()
+ * 而校准阶段（stg=8）只停 0.5 秒就再来一次，于是 3 分 15 秒里
+ * **吸合-断开 97 次**（run7 实测数字）—— 离合线圈和齿轮在反复咬合脱开。
+ *
+ * 改动后：只要还处在"需要辅助送料的阶段"，离合就**一直吸着**，电机照旧
+ * 按周期脉冲（转 assist_ms → 停 → 再转）。离开这些阶段、或者打印机来了
+ * 换料请求、或者任何别的动作要用总线 → 立刻断开（"其他阶段电磁断开"）。
+ *
+ * ★★ 红线：任何时刻最多只允许 1 路吸合 ★★
+ *   这条**不靠本模块自己保证**，而是继续走 clutch_engage()：它内部第一步
+ *   就是"无条件把 4 路全写成断开 → 等机械脱开 → 回读复核 → 才吸合目标"，
+ *   所以"保持"永远不会退化成"又吸了一路"。同一路重复调用是幂等的
+ *   （clutch_engage 直接返回，不做机械动作），所以每拍调一次也不会抖。
+ *   主循环每周期还会调一次 clutch_assert_single(true) 兜底。
+ *
+ * ⚠️ 为什么保持期间**不设** AMS_STATE_ASSIST 状态：
+ *   设了会让 ams_is_busy() 在整段校准/打印期间恒为 true —— 手动点动会被
+ *   "设备正忙"挡住、状态灯一直亮、"载入打印材料"的补推也进不来。
+ *   保持的只是**离合的机械状态**，不是"总线被占"。所以状态照旧只在
+ *   真正脉冲的那 ms 里是"辅助送料中"。
+ */
+/** 当前为哪一路保持吸合；-1 = 没有保持 */
+static int      s_assist_hold_mat = -1;
+/** 保持期间累计脉冲了几次（日志/网页用，不参与控制） */
+static uint32_t s_assist_hold_pulses;
+/** 本轮保持的开始时刻（esp_timer，微秒）；0 = 没有在保持 —— 散热上限用 */
+static int64_t  s_assist_hold_start_us;
+/** 散热窗口的结束时刻；在这个时刻之前不重新吸合 */
+static int64_t  s_assist_hold_cool_until_us;
+
+/* ---- 连续保持的上限（安全阀，不是功能参数）----
+ *
+ * ★ 为什么"全程保持吸合"还必须有这个上限：
+ *   "打印中"（stg_cur=0）这个阶段是**整场打印**，几小时。真按字面"全程保持"
+ *   执行，电磁离合的线圈要连续通电几个小时 —— 那是实打实的发热（线圈按几瓦
+ *   算，摸上去会烫），而离合线圈过热会退磁、驱动板（ULN2803）也一直在抗那个
+ *   电流。机械寿命是保住了，线圈寿命要赔进去。
+ *
+ *   5 分钟这个数的取法：
+ *     · 校准阶段（stg=8）总共只有 3 分 15 秒（run7 实测）—— 上限**永远不会**
+ *       在校准里触发，所以"校准期间全程吸着"这个核心诉求原样保留；
+ *     · 打印中每小时最多断 12 次、每次只断 3 秒 → 相对原来"每 2 秒咬一次"
+ *       （每小时 1800 次）已经少了 99.3%，机械那笔账照样赚到了。
+ *
+ *   ★ 想让它彻底不松口（离合摸上去不烫就可以），把 ASSIST_HOLD_MAX_MS 调大
+ *     或改成 UINT32_MAX 即可 —— 但请先实测连续保持 10 分钟后的线圈温度。 */
+#define ASSIST_HOLD_MAX_MS   300000u  /* 连续保持最多 5 分钟 */
+#define ASSIST_HOLD_COOL_MS  3000u    /* 到点后断开散热 3 秒，再自动吸回去 */
+
+/**
+ * 结束保持：断开全部离合。不在辅助阶段 / 有别的动作要用总线时调它。
+ * 没在保持状态时是空操作，可以随便调。
+ */
+static void assist_hold_release(void)
+{
+    if (s_assist_hold_mat < 0) {
+        return;
+    }
+    int      mat = s_assist_hold_mat;
+    uint32_t n   = s_assist_hold_pulses;
+    s_assist_hold_mat    = -1;
+    s_assist_hold_pulses = 0;
+    /* 本轮计时清零：下一次吸合是**新的一轮**保持，散热阀的 5 分钟从头算。
+     * 不清的话，热保护断开 3 秒后吸回来时，start_us 还是 5 分钟前那个值
+     * → 下一拍立刻又被判超时 → 变成"每 3 秒断一次"，散热窗口白设。 */
+    s_assist_hold_start_us = 0;
+    clutch_release_all_settled();
+    ams_log("辅助送料保持结束：通道%d 离合已断开（本轮共脉冲 %u 次）",
+            mat + 1, (unsigned)n);
+}
+
+/**
+ * 保持模式下的一次脉冲：确保目标通道吸合，然后**只**让电机转 ms。
+ *
+ * 和 drive_channel_speed() 的唯一区别：收尾**不释放离合**。
+ *
+ * @return true = 离合吸合成功（不代表"带得动"，那要看回执里的硬件回读）
+ */
+static bool assist_hold_pulse(int material_index, uint8_t pct, uint32_t ms)
+{
+    /* 先把回执清成"什么都没发生"，任何提前 return 都会把它留在这个状态 ——
+     * 调用方据此就能分清"日志打了但动作没发生"。 */
+    s_last_drive.clutch_ok = false;
+    s_last_drive.skipped   = false;
+    s_last_drive.dir       = 1;
+    s_last_drive.speed_pct = pct;
+    s_last_drive.duty_raw  = (uint16_t)motor_pct_to_duty(pct);
+    s_last_drive.ran_ms    = 0;
+    s_last_drive.duty_in1  = 0;
+    s_last_drive.duty_in2  = 0;
+    s_last_drive.level_in1 = -1;
+    s_last_drive.level_in2 = -1;
+
+    if (material_index < 0 || material_index >= BOARD_CHANNEL_COUNT) {
+        record_error("辅助送料保持：料盘位 %d 不存在", material_index + 1);
+        return false;
+    }
+
+    /* ★ 红线在这里：走 clutch_engage() 而不是直接写引脚。
+     *   它内部无条件先全部断开再吸合目标；同一路重复调用幂等。 */
+    esp_err_t err = clutch_engage(material_index + 1);
+    if (err != ESP_OK) {
+        record_error("辅助送料保持：料盘位%d 离合吸合失败（%s）—— "
+                     "本次**没有**驱动电机", material_index + 1,
+                     esp_err_to_name(err));
+        clutch_release_all();
+        s_assist_hold_mat = -1;      /* 保持失效，下一拍重新吸 */
+        return false;
+    }
+    clutch_set_busy(true);
+    s_last_drive.clutch_ok = true;
+    s_assist_hold_mat      = material_index;
+    s_assist_hold_pulses++;
+
+    /* 本轮保持的起点：只在"刚吸上"那一拍记一次。
+     * 之后的每一拍 clutch_engage() 走幂等短路、不复位这个值 ——
+     * 否则散热阀的 5 分钟会被无限续期，永远不触发。 */
+    if (s_assist_hold_start_us == 0) {
+        s_assist_hold_start_us = esp_timer_get_time();
+    }
+
+    /* 幂等短路探测（同 drive_channel_speed）：motor_set_dir_speed 遇到
+     * "同方向 + 同速度 + 已在转"会直接返回、完全不碰硬件。 */
+    if (motor_get_dir() == MOTOR_DIR_FEED &&
+        motor_get_speed_pct() == (int)pct &&
+        motor_elapsed_ms() != 0) {
+        s_last_drive.skipped = true;
+    }
+
+    motor_run_speed(MOTOR_DIR_FEED, ms, pct);
+    s_last_drive.ran_ms = ms;
+
+    motor_readback_t rb = {0, 0, -1, -1};
+    motor_readback(&rb);          /* ★ 必须在 motor_stop() 之前读 */
+    motor_stop();                 /* ★ 只停电机 —— 离合**保持吸合** */
+
+    s_last_drive.duty_in1  = rb.duty_in1;
+    s_last_drive.duty_in2  = rb.duty_in2;
+    s_last_drive.level_in1 = (int8_t)rb.level_in1;
+    s_last_drive.level_in2 = (int8_t)rb.level_in2;
+    return true;
+}
+
+/**
+ * 当前保持吸合的料盘位 +1（1~4）；0 = 没有保持。网页「硬件状态」显示用。
+ * 只读一个 int，跨任务读不需要锁。
+ */
+int ams_assist_hold_channel(void)
+{
+    return (s_assist_hold_mat >= 0) ? (s_assist_hold_mat + 1) : 0;
+}
+
 static void handle_report(const bambu_report_t *r)
 {
     /* ---- 热床温度记忆（必须在用它之前做）----
@@ -1916,11 +2076,27 @@ static void handle_report(const bambu_report_t *r)
     bool stg0_is_really_printing = (r->stg_cur == 0) && r->is_printing &&
                                    (r->mc_percent > 0 || r->layer_num >= 1);
 
+    /* ★ 本拍是否**仍处在**需要辅助送料的阶段 —— 这跟"是否到了该送的时刻"
+     *   是两件事，别混（现场要求："全程保持吸合、只脉冲电机，其他阶段断开"）：
+     *     assist_want_hold >= 0 → 还在阶段里 → 离合要**一直吸着**，哪怕这一拍
+     *                             还没到脉冲时刻也不许断开；
+     *     assist_want_hold < 0  → 不在阶段里、或打印机来换料请求了
+     *                             → 立刻断开（= "其他阶段电磁断开"）。
+     *   改动前是"每送一次就吸合-断开一整套"，所以校准那 3 分 15 秒里
+     *   机械咬了 97 次（run7 实测）。 */
+    int assist_want_hold = -1;
+
     if (config_get_assist_enabled() &&
-        (r->stg_cur == 8 || r->stg_cur == 19 || stg0_is_really_printing)) {
+        (r->stg_cur == 8 || r->stg_cur == 19 || stg0_is_really_printing) &&
+        !r->change_needed) {
+        /* ★ 换料请求（change_needed）也算"不在辅助阶段"，所以把它并进上面的
+         *   条件里。理由：辅助送料会占住共享电机最多 assist_ms，而打印机在
+         *   ams_status=260 只留 ~2 秒窗口（260 → 318750723 只隔 2 秒），
+         *   晚一步退料它就报"请拉出耗材"。换料永远优先 —— 连保持也要收掉。 */
         int cur_ch = config_get_filament_current();
         int mat = (cur_ch > 0) ? config_material_index_of(cur_ch) : -1;
         if (mat >= 0) {
+            assist_want_hold = mat;
             if (r->stg_cur == 0) {
                 assist_why       = "打印中";
                 assist_period_ms = ASSIST_REPEAT_US / 1000;
@@ -1937,11 +2113,29 @@ static void handle_report(const bambu_report_t *r)
                        ((now - s_last_assist_time_us) >=
                         (int64_t)assist_period_ms * 1000);
 
-            /* ★ 打印机正等着换料时**绝不抢总线**。
-             *   辅助送料会占住共享电机最多 assist_ms，而打印机在
-             *   ams_status=260 只留 ~2 秒窗口（260 → 318750723 只隔 2 秒），
-             *   晚一步退料它就报"请拉出耗材"。换料永远优先。 */
-            if (due && !r->change_needed) {
+            /* ★ 连续保持的**散热阀**（ASSIST_HOLD_MAX_MS / ASSIST_HOLD_COOL_MS，
+             *   理由见上面那两个宏的注释）：到点断开散热，窗口内不打脉冲 ——
+             *   离合这时已经断开了，再打脉冲等于又吸一次，正好把散热窗口废掉。
+             *   窗口结束、且仍在辅助阶段 → 下一拍自动吸回（clutch_engage 幂等）。
+             *   校准阶段（stg=8）总共只有 3 分 15 秒，永远碰不到这个阀，
+             *   所以"校准期间全程吸着"这个核心诉求原样保留。 */
+            if (s_assist_hold_mat >= 0 && s_assist_hold_start_us > 0 &&
+                (now - s_assist_hold_start_us) >=
+                    (int64_t)ASSIST_HOLD_MAX_MS * 1000) {
+                assist_hold_release();
+                s_assist_hold_cool_until_us =
+                    now + (int64_t)ASSIST_HOLD_COOL_MS * 1000;
+                ams_log_warn("辅助送料保持已连续 %u 分钟，离合断开散热 %.1f 秒"
+                             "（保护线圈，不是故障）；若仍在辅助阶段会自动吸回",
+                             (unsigned)(ASSIST_HOLD_MAX_MS / 60000u),
+                             ASSIST_HOLD_COOL_MS / 1000.0);
+            }
+
+            if (now < s_assist_hold_cool_until_us) {
+                due = false;
+            }
+
+            if (due) {
                 assist_do  = true;
                 assist_mat = mat;
                 s_last_assist_time_us = now;
@@ -1949,9 +2143,18 @@ static void handle_report(const bambu_report_t *r)
         }
     }
 
+    /* ---- 不处在辅助送料阶段 → 电磁断开 ----
+     * 就是现场要的"其他阶段电磁断开"。放在这里（而不是等到下面那一大堆
+     * 换料逻辑之后）是为了让"离开阶段"这件事**立刻**生效：从校准阶段切到
+     * 别的阶段的那一拍，离合就断开了。 */
+    if (assist_want_hold < 0) {
+        assist_hold_release();
+    }
+
     if (assist_do) {
         uint8_t  assist_pct = config_get_assist_speed_pct();
         uint16_t assist_ms  = config_get_assist_ms();
+        bool     hold       = (config_get_assist_hold() != 0);
 
         /* ★ 辅助送料必须**占住状态机**（AMS_STATE_ASSIST）。
          *   以前这里不设状态，后果三条，都是现场踩出来的：
@@ -1975,17 +2178,18 @@ static void handle_report(const bambu_report_t *r)
          *   把阶段变化 / 退料 / 换料那几条真正有用的冲没了。
          *   参数或阶段一变 key 就变，会自动打新的一行；稳定时每 60 秒
          *   补一行"继续中"当心跳，保证能看出它一直在动。 */
-        char key[96];
-        snprintf(key, sizeof(key), "assist|%s|%d|%u|%u|%u",
+        char key[112];
+        snprintf(key, sizeof(key), "assist|%s|%d|%u|%u|%u|%d",
                  assist_why, config_get_filament_current(),
                  (unsigned)assist_pct, (unsigned)assist_ms,
-                 (unsigned)assist_period_ms);
+                 (unsigned)assist_period_ms, hold ? 1 : 0);
         int skipped = log_throttle(key, 60000);
         if (skipped == 0) {
-            ams_log("辅助送料（%s）：通道%d @%u%% × %ums（每 %ums 一次）",
+            ams_log("辅助送料（%s）：通道%d @%u%% × %ums（每 %ums 一次）%s",
                     assist_why, config_get_filament_current(),
                     (unsigned)assist_pct, (unsigned)assist_ms,
-                    (unsigned)assist_period_ms);
+                    (unsigned)assist_period_ms,
+                    hold ? "，阶段内保持离合吸合（只脉冲电机）" : "");
         } else if (skipped > 0) {
             ams_log("辅助送料（%s）：通道%d 继续中（@%u%% × %ums，"
                     "已省略 %d 条相同日志）",
@@ -2006,8 +2210,18 @@ static void handle_report(const bambu_report_t *r)
          *   duty 原值是多少、电机真通了多久。**成功也打出来** —— 因为
          *   "辅助送料 60%（duty 153/255）"和"手动点动 100%（duty 255/255）"
          *   并排看，才能一眼判断是不是这个占空比带不动本机构的电机。 */
-        bool ok = drive_channel_speed(assist_mat, 1, assist_pct, assist_ms,
-                                      false, NULL);
+        bool ok;
+        if (hold) {
+            /* 保持模式：离合吸着不放，**只**脉冲电机（现场要的就是这个） */
+            ok = assist_hold_pulse(assist_mat, assist_pct, assist_ms);
+        } else {
+            /* 老行为：每次一整套"吸合 → 转 → 停 → 断开"。
+             * 先 release 一次，防的是"刚才还在保持、网页上刚把保持关掉"
+             * 这个切换瞬间可能残留的吸合。没在保持时它是空操作。 */
+            assist_hold_release();
+            ok = drive_channel_speed(assist_mat, 1, assist_pct, assist_ms,
+                                     false, NULL);
+        }
         const drive_receipt_t *rc = ams_last_drive_receipt();
 
         if (!ok || !rc->clutch_ok) {
@@ -2019,9 +2233,10 @@ static void handle_report(const bambu_report_t *r)
             ams_log_warn("辅助送料被跳过：电机已在同方向同速度运行，"
                          "本次没有重新驱动");
         } else {
-            ams_log("  辅助送料回执：离合已吸合 —— 通道%d PWM duty=%u/255"
+            ams_log("  辅助送料回执：离合已吸合%s —— 通道%d PWM duty=%u/255"
                     "（%u%%），通电 %ums；**硬件回读** IN1=%u/255(%d) "
                     "IN2=%u/255(%d)（手动点动是全速 duty=255，可对比）",
+                    hold ? "（保持中，收尾不释放）" : "",
                     config_get_filament_current(),
                     (unsigned)rc->duty_raw, (unsigned)rc->speed_pct,
                     (unsigned)rc->ran_ms,
@@ -2339,14 +2554,17 @@ static void poll_trigger_switches(void)
 /**
  * 辅助送料自检：立刻按网页配置的占空比 / 时长**手动**驱动一次辅助送料。
  *
- * 和 do_jog（手动点动）的区别只有一个：速度。
- *   点动    → drive_channel()  = 全速 100%，duty 255
- *   本自检  → 网页设置的 assist_speed_pct / assist_ms
- * 所以这两个按钮合起来就是一次**受控对照实验**：
- *   点动转、自检不转 → 占空比不够（把网页上的速度往上调，默认已改 100%）
+ * 和 do_jog（手动点动）的区别在"用哪个参数"：
+ *   点动    → config_get_jog_speed_pct()（网页「手动点动」里那个 PWM 框）
+ *   本自检  → config_get_assist_speed_pct()（网页「辅助送料」里的 PWM 速度）
+ * 两个按钮合起来就是一次**受控对照实验**：
+ *   点动转、自检不转 → 两边占空比不一样，把低的那个往上调
  *   两个都不转       → 硬件链路问题（H 桥使能脚 / 离合齿轮 / 接线）
  * 这条实验是"辅助送料没作用"这个现场问题唯一能一次说清的做法 ——
  * 因为辅助送料正常是由打印机阶段驱动的，等一轮打印要十几分钟。
+ *
+ * ⚠️ 自检**故意不走"保持吸合"**：它是一次性动作，做完就断开，
+ *   免得用户以为按一下之后离合会一直吸着。
  */
 static void do_assist_test(int material_index)
 {
@@ -2400,18 +2618,56 @@ static void do_jog(int material_index, int direction, int ms)
         ms = config_get_jog_ms();
     }
     int dir = (direction < 0) ? -1 : 1;
+
+    /* ★ PWM 占空比现在可调（网页「手动点动」里那个框，2026-09-23 现场要求）：
+     *   目的是让用户**目测出"能带动电机和离合的临界占空比"** —— 从 5% 一档
+     *   档往上加，看电机什么时候能可靠转起来。原来写死全速，只能回答
+     *   "通不通"，回答不了"要多大才转得动"。0 = 未设置 → 默认全速 100%，
+     *   所以老配置下行为和改动前一模一样。 */
+    uint8_t pct = config_get_jog_speed_pct();
+
     set_state(AMS_STATE_JOG, material_index);
-    ams_log("手动点动：料盘位%d %s %dms", material_index + 1,
-            dir > 0 ? "进料" : "退料", ms);
+    ams_log("手动点动：料盘位%d %s %dms @%u%%（duty %u/255，网页可调）",
+            material_index + 1, dir > 0 ? "进料" : "退料", ms,
+            (unsigned)pct, (unsigned)motor_pct_to_duty(pct));
 
     /* 点动不做微动提前停止 —— 用户在手动调试，就是要它转满设定的时长 */
-    drive_channel(material_index, dir, (uint32_t)ms, false, NULL);
+    drive_channel_speed(material_index, dir, pct, (uint32_t)ms, false, NULL);
+
+    /* ★ 点动也打执行回执（含硬件回读）。
+     *   现场就是靠这个找临界值的：把速度调到 50% 按下点动，日志里能看到
+     *   "duty 128/255、回读 IN1=128/255(1)" —— 信号确实出去了；再对照
+     *   "电机转不转"，就能把临界点一档一档夹出来。只有百分比没有 duty，
+     *   现场没法跟别的动作（辅助送料 / 送料）横向比。 */
+    const drive_receipt_t *rc = ams_last_drive_receipt();
+    if (!rc->clutch_ok) {
+        ams_log_err("手动点动未执行：离合没吸合上 —— 本次**没有**驱动电机"
+                    "（原因见上一条错误）");
+    } else {
+        ams_log("  点动回执：离合已吸合 —— 料盘位%d @%u%% → duty=%u/255；"
+                "**硬件回读** IN1=%u/255(引脚%d) IN2=%u/255(引脚%d)，通电 %ums",
+                material_index + 1, (unsigned)rc->speed_pct,
+                (unsigned)rc->duty_raw,
+                (unsigned)rc->duty_in1, (int)rc->level_in1,
+                (unsigned)rc->duty_in2, (int)rc->level_in2,
+                (unsigned)rc->ran_ms);
+    }
     s_diag.jog_count++;
     set_state(AMS_STATE_IDLE, -1);
 }
 
 static void execute_cmd(const ams_cmd_t *cmd)
 {
+    /* ★ 任何一条明确指令都意味着"要正式动电机了" —— 先把辅助送料的
+     *   **保持吸合**收掉。不这么做有两个后果：
+     *     · 下一条指令的 clutch_engage() 会白等一次 CLUTCH_RELEASE_MS +
+     *       CLUTCH_SETTLE_MS（60+20ms）；
+     *     · 状态显示会打架（"保持吸合中"和"换料中"同时成立）。
+     *   收掉之后是一次性代价：下一拍报文来了如果仍在辅助阶段，
+     *   assist_hold_pulse() 会自动重新吸上（clutch_engage 幂等）。
+     *   没在保持状态时这是空操作。 */
+    assist_hold_release();
+
     switch (cmd->id) {
     case AMS_CMD_JOG:
         do_jog(cmd->channel, cmd->arg, cmd->ms);
@@ -2585,12 +2841,17 @@ int ams_describe_hardware_json(char *buf, size_t buflen)
     /* 先让 clutch 写主体，再补微动和业务状态 */
     int off = clutch_describe_json(buf, buflen, (int)motor_get_dir(),
                                    ams_is_busy(), clutch_get_owner());
-    /* ★ 余量从 8 提到 200：下面要追加的不只是 limits/state/motor_speed，
-     *   还多了一整块 drive 回执（约 90 字节）。留 8 字节的话 snprintf 会把
-     *   尾巴截掉 → 生成一个**不完整**的 JSON → web_server 那边 cJSON_Parse
-     *   直接失败 → 整个 hardware 字段从网页上消失。那比不显示回执更糟。
-     *   这里宁可提前 return（buffer 里仍是 clutch 自己那份完整 JSON）。 */
-    if (off <= 0 || (size_t)off >= buflen - 200) {
+    /* ★ 余量从 8 提到 320（原先 200 偏小）：
+     *   下面要追加的不只是 limits/state/motor_speed，还多了 assist_hold_ch
+     *   和一整块 drive 回执。逐段实测的最长尾巴：
+     *       limits 18 + state 12 + state_text 31 + active_material 21
+     *       + motor_speed 21 + assist_hold_ch 19 + drive 149 ≈ 271 字节
+     *   余量取 200 时，若 clutch 主体长到 600 字节就会被截掉尾巴 ——
+     *   而截断的后果不是"少显示几个字段"，是生成**不完整**的 JSON，
+     *   web_server 那边 cJSON_Parse 直接失败 → 整个 hardware 块从网页消失。
+     *   这里宁可提前 return（buffer 里仍是 clutch 自己那份完整 JSON）。
+     *   当前 hwbuf=800、clutch 主体约 140 字节，正常远碰不到这条线。 */
+    if (off <= 0 || (size_t)off >= buflen - 320) {
         return off;
     }
 
@@ -2607,11 +2868,13 @@ int ams_describe_hardware_json(char *buf, size_t buflen)
     off += snprintf(buf + off, buflen - off,
                     "],\"state\":%d,\"state_text\":\"%s\","
                     "\"active_material\":%d,\"motor_speed\":%d,"
+                    "\"assist_hold_ch\":%d,"
                     "\"drive\":{\"clutch_ok\":%s,\"skipped\":%s,\"dir\":%d,"
                     "\"speed_pct\":%u,\"duty_raw\":%u,\"ran_ms\":%u,"
                     "\"rb_in1\":%u,\"rb_in2\":%u,\"lv_in1\":%d,\"lv_in2\":%d}}",
                     (int)s_state, ams_state_text(), s_active_material,
                     motor_get_speed_pct(),
+                    ams_assist_hold_channel(),
                     s_last_drive.clutch_ok ? "true" : "false",
                     s_last_drive.skipped   ? "true" : "false",
                     (int)s_last_drive.dir,
@@ -2707,6 +2970,10 @@ esp_err_t ams_init(void)
     s_pending_fp = 0;
     s_bed_target_max = 0.0f;
     s_last_assist_time_us = 0;   /* 0 = 开机后允许立刻做第一次辅助送料 */
+    s_assist_hold_mat     = -1;  /* 开机没有保持吸合 */
+    s_assist_hold_pulses  = 0;
+    s_assist_hold_start_us     = 0;   /* 本轮保持计时未开始 */
+    s_assist_hold_cool_until_us = 0;  /* 没有待走的散热窗口 */
     s_state = AMS_STATE_IDLE;
     s_active_material = -1;
 

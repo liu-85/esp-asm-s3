@@ -205,15 +205,31 @@
         </div>
 
         <div class="card">
-          <h2>手动点动</h2>
+          <h2>手动点动 <span class="sub">4 个通道统一</span></h2>
           <div class="row">
             <input type="number" id="jog_seconds" min="0.2" max="60" step="0.5" value="1">
             <span style="align-self:center" class="dim">秒</span>
-            <button class="primary" style="flex:1" id="btn_jog_save">保存响应时间</button>
+            <button class="primary" style="flex:1" id="btn_jog_save">保存点动参数</button>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 auto;font-size:13px" class="dim">点动 PWM 占空比（5~100%）
+              <input type="number" id="jog_speed" min="5" max="100" step="5" style="width:90px">
+            </label>
+            <span id="jog_pwm_hint" class="dim" style="font-size:12px"></span>
           </div>
           <div class="tip">
-            这是 4 个通道<b>统一</b>的「进退响应时间」，只作用于手动点动，<b>不影响自动换料</b>。
-            填超范围会被自动夹到 0.2 ~ 60 秒。
+            <b>响应时间</b>：4 个通道<b>统一</b>的「进退响应时间」，只作用于手动点动，
+            <b>不影响自动换料</b>。填超范围会被自动夹到 0.2 ~ 60 秒。
+            <div class="hr"></div>
+            <b>点动 PWM</b>（2026-09-23 新增）：<b>就是拿来目测"多少占空比能带动电机和电磁离合"的</b>。
+            默认 <b>100%</b>（duty 255）。<b>从 5% 一档一档往上加</b>，每加一档按一次上面的「进料」，
+            一边听电机声一边看日志：
+            <br>· 日志里出现 <code>点动回执…duty=128/255；硬件回读 IN1=128/255(引脚1)</code>
+            —— 信号确实写进硬件了，<b>此时电机不转就是占空比不够</b>，继续往上加；
+            <br>· 回读 <code>IN1=0/255</code> 而 duty 不是 0 —— 信号没写进硬件，是软件问题；
+            <br>· 找到"能可靠转起来"的最小值后<b>留一点余量</b>（机构有阻力、料路有弯），
+            再把带余量的值填到下面「辅助送料」的 PWM 速度里。
+            辅助送料默认 100%，宁可有力、不要没力。
           </div>
         </div>
 
@@ -235,6 +251,13 @@
             </label>
             <button class="primary" style="flex:1" id="btn_assist_save">保存</button>
           </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 auto;display:flex;align-items:center;gap:8px;font-size:14px">
+              <input type="checkbox" id="assist_hold" style="width:20px;height:20px;accent-color:#2f6fed">
+              <span>阶段内保持离合吸合（只脉冲电机）</span>
+            </label>
+            <button class="ghost" id="btn_assist_hold" style="flex:0 0 auto">切换</button>
+          </div>
           <div class="row" style="margin-top:10px">
             <button class="ghost" style="flex:1" id="btn_assist_test">
               ▶ 立即自检（按上面配置跑一次）
@@ -242,6 +265,19 @@
           </div>
           <div class="tip">
             换色 / 校准挤出 / 流量校准 / 打印中，AMS 同步以该 PWM 推料，帮打印机齿轮咬住新料。
+            <div class="hr"></div>
+            <b>阶段内保持离合吸合</b>（2026-09-23 新增，默认<b>开</b>）：
+            在需要辅助送料的阶段里，电磁离合<b>全程吸着</b>，只有电机按周期脉冲（转 → 停 → 再转）；
+            离开这些阶段（或者打印机一来换料请求）<b>立刻断开</b>。
+            <br>为什么要这样：原来每送一次都是一整套"吸合 → 转 → 停 → 断开"，
+            而校准阶段只停 0.5 秒就再来一次 —— 实测那 <b>3 分 15 秒里离合咬合了 97 次</b>，
+            线圈和齿轮在反复咬合脱开。保持吸合之后，机械只咬一次。
+            <br>★ <b>硬件红线照旧守死：任何时刻最多 1 路吸合。</b>
+            吸合全部走 <code>clutch_engage()</code>（内部无条件先全断开、回读复核，再吸目标），
+            所以"保持"永远不会变成"又吸了一路"；主循环每周期还有一次体检兜底。
+            <b>「离合冲突次数」正常永远是 0。</b>
+            <br>⚠️ 若长时间保持后发现离合<b>发烫或有异响</b>，把这个开关关掉即可退回旧行为
+            （每次吸合-断开），不用换固件。
             <div class="hr"></div>
             <b>PWM 速度</b>：默认 <b>100%</b>，范围 5%~100%。
             ⚠️ <b>低于 60% 会带不动本机构的电机</b> —— 现场表现为"电机没动作、听不到声"，
@@ -271,7 +307,8 @@
             <br>· 回读 <code>IN1=153/255(1)</code>、通电 1500ms，电机还是不转 →
             <b>占空比不够</b>，把 PWM 速度拉到 100% 再自检一次；
             <br>· 100% 自检（<code>duty=255</code>）也不转 → 接线 / H 桥使能 / 离合打滑，
-            <b>不是参数问题</b>。此时用「手动点动」（同样是全速 255）对照，两者表现应当一致。
+            <b>不是参数问题</b>。此时用「手动点动」（默认也是全速 255，可在上面调）对照，
+            两者表现应当一致。
             <br>网页「硬件状态 → 最近一次驱动 / LEDC 回读」里也有同样的数，不用抓串口。
             <div class="hr"></div>
             关闭总开关后换色/打印中都不再同步辅助送料。

@@ -375,6 +375,10 @@ static esp_err_t h_status(httpd_req_t *req)
     /* ---- 业务 ---- */
     cJSON_AddNumberToObject(o, "current_access", config_get_filament_current());
     cJSON_AddNumberToObject(o, "jog_ms", config_get_jog_ms());
+    /* ★ 手动点动 PWM（2026-09-23 新增）：现场要一档一档试"多少占空比能带动
+     *   电机和离合"，所以这个值必须能在网页上读到、改到、并被 /status 回显
+     *   （网页靠回显判断"存进去了没有"）。 */
+    cJSON_AddNumberToObject(o, "jog_speed_pct", config_get_jog_speed_pct());
 
     cJSON *al = cJSON_AddArrayToObject(o, "access_list");
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
@@ -400,6 +404,9 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddBoolToObject(assist, "enabled", cfg->assist_enabled != 0);
     cJSON_AddNumberToObject(assist, "speed_pct", cfg->assist_speed_pct);
     cJSON_AddNumberToObject(assist, "ms", cfg->assist_ms);
+    /* ★ 阶段内保持离合吸合（2026-09-23 新增）：1 = 阶段内离合一直吸着、
+     *   只脉冲电机；0 = 老行为（每送一次吸合-断开一整套）。 */
+    cJSON_AddBoolToObject(assist, "hold", config_get_assist_hold() != 0);
 
     /* ---- 退料参数（全是现场要调的，网页「硬件调试」里可改） ---- */
     cJSON *retract = cJSON_AddObjectToObject(o, "retract");
@@ -879,9 +886,15 @@ static esp_err_t h_hardware_test(httpd_req_t *req)
     cJSON_AddBoolToObject(o, "ok", true);
     cJSON_AddBoolToObject(o, "running", true);
     cJSON_AddNumberToObject(o, "ms", ms);
-    char info[128];
-    snprintf(info, sizeof(info), "通道%d 已开始%s，%.1f 秒后自动停止",
-             channel, direction == 1 ? "进料" : "退料", ms / 1000.0);
+    cJSON_AddNumberToObject(o, "speed_pct", config_get_jog_speed_pct());
+    char info[192];
+    /* 把这次实际会用的占空比也说清楚 —— 现场就是靠这个数一档一档试
+     * "多少 PWM 能带动电机和离合"（数在「手动点动」卡片里改）。 */
+    snprintf(info, sizeof(info),
+             "通道%d 已开始%s，%.1f 秒后自动停止（@%u%%，duty %u/255）",
+             channel, direction == 1 ? "进料" : "退料", ms / 1000.0,
+             (unsigned)config_get_jog_speed_pct(),
+             (unsigned)motor_pct_to_duty(config_get_jog_speed_pct()));
     cJSON_AddStringToObject(o, "info", info);
     return send_json_obj(req, o);
 }
@@ -945,6 +958,16 @@ static esp_err_t h_assist_test(httpd_req_t *req)
     return send_json_obj(req, o);
 }
 
+/** POST /jog_set  body: {"seconds":1.0} 或 {"seconds":1.0,"speed_pct":60}
+ *
+ *  ★ 2026-09-23 现场要求："在这里加一个 PWM 值的设置，我来看看目测一下多少值
+ *    可以转动电机和电磁。" —— 所以这个接口现在同时管两件事：响应时间 +
+ *    点动 PWM。两个都是可选的，只传其中一个也行（没传的保持原值）。
+ *
+ *  PWM 是"能带动电机和离合的临界占空比"唯一的量法：一档一档往上试，
+ *  每按一次点动都会打一条带 duty 原值 + 硬件回读的执行回执，配合听声音
+ *  就能把临界值夹出来。找到之后，辅助送料/蠕动都要在它之上留余量。
+ */
 static esp_err_t h_jog_set(httpd_req_t *req)
 {
     cJSON *b = read_body_json(req);
@@ -960,29 +983,52 @@ static esp_err_t h_jog_set(httpd_req_t *req)
             seconds = seconds / 1000.0;
         }
     }
+    /* 可选：PWM 占空比。没传 = -1 = 保持原值 */
+    int want_pct = -1;
+    const cJSON *vp = b ? cJSON_GetObjectItemCaseSensitive(b, "speed_pct") : NULL;
+    if (cJSON_IsNumber(vp)) {
+        want_pct = (int)vp->valuedouble;
+    }
     cJSON_Delete(b);
 
-    if (seconds <= 0) {
-        return reply_ok(req, false, "请填一个大于 0 的秒数");
+    if (seconds <= 0 && want_pct < 0) {
+        return reply_ok(req, false, "请填一个大于 0 的秒数（或给 speed_pct）");
     }
 
-    int want_ms = (int)(seconds * 1000.0 + 0.5);
-    int got_ms = config_set_jog_ms(want_ms);
+    int got_ms  = config_get_jog_ms();
+    int got_pct = config_get_jog_speed_pct();
+    bool clamped_ms  = false;
+    bool clamped_pct = false;
+
+    if (seconds > 0) {
+        int want_ms = (int)(seconds * 1000.0 + 0.5);
+        got_ms = config_set_jog_ms(want_ms);
+        clamped_ms = (got_ms != want_ms);
+    }
+    if (want_pct >= 0) {
+        got_pct = config_set_jog_speed_pct(want_pct);
+        clamped_pct = (got_pct != want_pct);
+    }
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddBoolToObject(o, "ok", true);
     cJSON_AddNumberToObject(o, "jog_ms", got_ms);
-    char info[128];
-    if (got_ms != want_ms) {
+    cJSON_AddNumberToObject(o, "jog_speed_pct", got_pct);
+    char info[192];
+    if (clamped_ms || clamped_pct) {
         snprintf(info, sizeof(info),
-                 "已保存为 %.1f 秒（填的值超出 %.1f~%.1f 秒，已自动夹住）",
-                 got_ms / 1000.0, CONFIG_JOG_MIN_MS / 1000.0,
-                 CONFIG_JOG_MAX_MS / 1000.0);
+                 "已保存：%.1f 秒 @%d%%（填的值超出范围，已自动夹住 —— "
+                 "时间 %.1f~%.1f 秒，PWM %d~%d%%）",
+                 got_ms / 1000.0, got_pct,
+                 CONFIG_JOG_MIN_MS / 1000.0, CONFIG_JOG_MAX_MS / 1000.0,
+                 CONFIG_JOG_SPEED_MIN, CONFIG_JOG_SPEED_MAX);
     } else {
-        snprintf(info, sizeof(info), "已保存：%.1f 秒", got_ms / 1000.0);
+        snprintf(info, sizeof(info), "已保存：%.1f 秒 @%d%%（duty %u/255）",
+                 got_ms / 1000.0, got_pct,
+                 (unsigned)motor_pct_to_duty(got_pct));
     }
     cJSON_AddStringToObject(o, "info", info);
-    ams_log("进退响应时间已改为 %dms", got_ms);
+    ams_log("手动点动参数已更新：%dms @%d%%", got_ms, got_pct);
     return send_json_obj(req, o);
 }
 
@@ -1113,20 +1159,29 @@ static esp_err_t h_extruder_src_set(httpd_req_t *req)
     return reply_ok(req, true, info);
 }
 
-/** POST /assist_set  body: {"enabled":0/1, "speed_pct":60, "ms":1500}
+/** POST /assist_set  body: {"enabled":0/1, "speed_pct":60, "ms":1500, "hold":1}
  *
  *  ★ 占空比和时长都要能改：真机上 23% 这种低占空比完全带不动电机，
  *    用户看到的现象是"打印中辅助送料电机没动作"。现场需要能在网页上
- *    一边调一边听电机声，而不是每次改都重烧固件。 */
+ *    一边调一边听电机声，而不是每次改都重烧固件。
+ *
+ *  ★ hold（2026-09-23 新增）：阶段内是否保持离合吸合。
+ *    1（默认）= 校准/打印中离合全程吸着，只按周期脉冲电机 —— 离合不再
+ *    每送一次就"吸合-断开"折腾一遍（run7 实测校准 3 分 15 秒咬了 97 次）。
+ *    0 = 老行为，每次一整套吸合-断开。留这个开关是为了能一键退回旧行为：
+ *    万一连续通电让离合发热/异响，用户自己能关掉，不用等我出新固件。
+ *
+ *  ⚠️ hold=0 用的是 -1 判"没传"，所以 hold=0 是**合法值**，不能被当成缺省。 */
 static esp_err_t h_assist_set(httpd_req_t *req)
 {
     cJSON *b = read_body_json(req);
     int enabled = json_int(b, "enabled", -1);
     int pct     = json_int(b, "speed_pct", -1);
     int ms      = json_int(b, "ms", -1);
+    int hold    = json_int(b, "hold", -1);
     cJSON_Delete(b);
 
-    if (enabled < 0 && pct < 0 && ms < 0) {
+    if (enabled < 0 && pct < 0 && ms < 0 && hold < 0) {
         return reply_ok(req, false, "缺少参数");
     }
 
@@ -1139,12 +1194,18 @@ static esp_err_t h_assist_set(httpd_req_t *req)
     if (ms >= 0) {
         config_set_assist_ms(ms);
     }
+    if (hold >= 0) {
+        config_set_assist_hold(hold ? 1 : 0);
+    }
 
-    char info[128];
-    snprintf(info, sizeof(info), "辅助送料已保存：%s @%u%% × %ums",
+    char info[192];
+    snprintf(info, sizeof(info), "辅助送料已保存：%s @%u%% × %ums，%s",
              config_get_assist_enabled() ? "开启" : "关闭",
              (unsigned)config_get_assist_speed_pct(),
-             (unsigned)config_get_assist_ms());
+             (unsigned)config_get_assist_ms(),
+             config_get_assist_hold()
+                 ? "阶段内保持离合吸合（只脉冲电机）"
+                 : "每次吸合-断开");
     ams_log("%s", info);
     return reply_ok(req, true, info);
 }

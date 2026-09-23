@@ -53,7 +53,7 @@ extern "C" {
  * 设置。所以单独用一个 NVS 键当标记：没有这个键 = 打补丁前的配置，
  * 补一次并写下水位线；有键就完全信任存下来的值。 */
 #define CONFIG_KEY_PATCH       "cfgpatch"
-#define CONFIG_PATCH_LEVEL     1
+#define CONFIG_PATCH_LEVEL     2
 
 #define CONFIG_WIFI_MAX_PROFILES 3
 #define CONFIG_SSID_MAX          33   /* 含结尾 '\0' */
@@ -74,6 +74,24 @@ extern "C" {
 #define CONFIG_JOG_MIN_MS 200
 #define CONFIG_JOG_MAX_MS 60000
 #define CONFIG_JOG_DEF_MS 1000
+
+/* 手动点动的 PWM 占空比（%）。
+ *
+ * ★ 2026-09-23 现场要求原话："在这里加一个 PWM 值的设置，我来看看目测一下
+ *   多少值可以转动电机和电磁。"
+ *
+ * 为什么值得单开一个参数：手动点动原来写死全速（duty 255），于是它只能
+ * 回答"通不通"这一个问题。现场真正想知道的是"**能带动的临界占空比是多少**"
+ * —— 这个数只能一档一档试出来：从 5% 往上加，看电机什么时候能可靠转起来、
+ * 离合咬合时什么时候不丢步。知道临界值之后，辅助送料/蠕动才有依据在
+ * 临界值之上留余量（默认值 100% 就是这么来的：宁可有力，不要没力）。
+ *
+ * 这个值**只作用于手动点动**，不影响自动换料（换料走的是全速）。
+ * 0 = 未设置（老配置的字节就是 0）→ 按 CONFIG_JOG_SPEED_DEF 处理。
+ */
+#define CONFIG_JOG_SPEED_DEF 100
+#define CONFIG_JOG_SPEED_MIN 5
+#define CONFIG_JOG_SPEED_MAX 100
 
 /* 自吸流程收尾的"蠕动送料"参数
  *   挤出机到位信号来了之后，慢速短脉冲推 CREEP_TIMES 次，确保耗材被挤出机
@@ -229,8 +247,55 @@ typedef struct {
     uint16_t retract_gap_ms;       /* 两次蠕动之间等"挤出机已空"的间隔 */
     uint16_t assist_ms;            /* 每次辅助送料的持续时长 */
     uint8_t  retract_creep_max;    /* 蠕动最多几轮；0 = 不蠕动（只做连续退料） */
+
+    /* ---- 2026-09-23 新增（网页「手动点动」/「辅助送料」可改）----
+     *
+     * ★★ 这两个字段是**吃掉结构体尾部的对齐填充**塞进来的，不是把整体加长 ★★
+     *
+     *   本次改动前，结构体的尾部是（偏移由 tools/check_config_layout.py 实测）：
+     *       ... retract_creep_max[684] + reserved[685] + 对齐填充[686,687]
+     *   而这两个新字段放的正是"reserved + 那 2 字节填充"里的前两个字节：
+     *       ... retract_creep_max[684] + jog_speed_pct[685] + assist_hold[686]
+     *       + reserved[687]
+     *   结构体总长因而**保持 688 字节不变** —— 这一点必须牢牢守住，
+     *   因为 config.c 读 NVS 时有 `len != sizeof(s_cfg)` 的硬校验：
+     *   长度一变，用户设备上存的 WiFi 密码 / MQTT 访问码 / 通道映射会被
+     *   **整份丢弃**（现场表现就是"刷个固件，配置全没了"）。
+     *
+     *   验证方式（本机没编译器，只能这么验）：
+     *       python tools/check_config_layout.py
+     *   它按 C ABI 把新旧两个布局都建出来，断言 sizeof 不变、新字段落在旧
+     *   填充上、老字段偏移一个都没动。CI 编译时下面那条 _Static_assert
+     *   还会再兜一次。
+     *
+     * ⚠️ 老固件写下的这两字节是 0（config_load_defaults 里 memset 0，
+     *   reserved 从没被写过、填充字节从没被赋过值），所以：
+     *     · jog_speed_pct = 0 → config_get_jog_speed_pct() 按"未设置"处理，
+     *       返回默认全速 100%，行为不变；
+     *     · assist_hold   = 0 → 会被当成"关闭保持吸合"，但需求是开启，
+     *       所以由配置补丁 2（见 config.c 的 config_apply_patch_once）
+     *       显式置成 1。这也是 CONFIG_PATCH_LEVEL 从 1 提到 2 的原因。 */
+    uint8_t  jog_speed_pct;        /* 手动点动 PWM 占空比%；0 = 未设置（默认 100） */
+    uint8_t  assist_hold;          /* 1 = 辅助送料阶段内保持离合吸合、只脉冲电机 */
+
     uint8_t  reserved[16 - BOARD_CHANNEL_COUNT * 2 - 7];
 } ams_config_t;
+
+/* ★★ 结构体总长绝对不能变 ★★
+ *
+ * 这条断言是给 CI 用的最后一道闸门：本机没有 C 编译器，只能靠
+ * tools/check_config_layout.py 做等价校验；编译时再assert一次。
+ * 688 是 4 通道配置在本项目的 ABI（32 位、uint8/16/32 自然对齐）下的
+ * 实测值。**如果这条断言炸了**，说明有人加了字段/改了字段 ——
+ * 那就必须升 CONFIG_VERSION 并在 config_init 里写迁移，不能就这么编过去：
+ * 不升版本的话老配置会被整份丢回默认值。
+ *
+ * 反过来，如果换了 BOARD_CHANNEL_COUNT（改了板子通道数），这条断言也会炸，
+ * 那同样是对的：结构体长度确实变了，得按上面说的走版本迁移。 */
+_Static_assert(sizeof(ams_config_t) == 688,
+               "ams_config_t 长度变了！老 NVS 配置会被整份丢弃 —— 要么把新字段"
+               "塞进尾部填充（见 tools/check_config_layout.py），要么升 "
+               "CONFIG_VERSION 并写迁移代码");
 
 /* 预留区被上面这几个新字段吃掉之后不能变成负数 —— 真变负数说明
  * BOARD_CHANNEL_COUNT 变大了，那时候结构体长度会变，必须升 CONFIG_VERSION
@@ -279,6 +344,30 @@ uint16_t config_get_jog_ms(void);
  * 返回**实际生效**的值（可能和传入值不同），网页据此显示准确提示。
  */
 uint16_t config_set_jog_ms(int value);
+
+/**
+ * 手动点动的 PWM 占空比（%）。
+ *
+ * 用途只有一个：**现场目测"能带动电机和离合的临界占空比"**。从 5% 一档档
+ * 往上加，看电机什么时候能可靠转起来 —— 找到临界值后再给辅助送料/蠕动
+ * 留余量（它们默认都是 100%）。
+ *
+ * 0 是"未设置"（老配置那个字节就是 0）→ 返回 CONFIG_JOG_SPEED_DEF（全速）。
+ */
+uint8_t config_get_jog_speed_pct(void);
+
+/** 设置手动点动 PWM 占空比（%），返回**实际存进去**的值（已夹到区间） */
+uint8_t config_set_jog_speed_pct(int pct);
+
+/**
+ * 辅助送料是否"阶段内保持离合吸合"（1 = 是，默认）。
+ *
+ * 开了之后，在校准 / 打印中这些需要辅助送料的阶段里，离合**全程吸着**，
+ * 只有电机在按周期脉冲（转 assist_ms → 停 → 再转），不再每送一次就
+ * "吸合—断开"折腾一遍机械。离开这些阶段立刻断开。
+ */
+uint8_t config_get_assist_hold(void);
+void config_set_assist_hold(uint8_t on);
 
 /** 某一路是否装了微动组 */
 bool config_sensor_enabled(int channel_index);

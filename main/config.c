@@ -74,6 +74,7 @@ static void config_load_defaults(ams_config_t *c)
 
     /* ---- 动作参数 ---- */
     c->jog_ms          = CONFIG_JOG_DEF_MS;
+    c->jog_speed_pct   = CONFIG_JOG_SPEED_DEF;   /* 手动点动全速 */
     c->creep_times     = CONFIG_CREEP_TIMES_DEF;
     c->creep_pulse_ms  = CONFIG_CREEP_PULSE_MS_DEF;
     c->creep_speed_pct = CONFIG_CREEP_SPEED_PCT_DEF;
@@ -88,6 +89,7 @@ static void config_load_defaults(ams_config_t *c)
     c->assist_enabled   = 1;   /* 默认开启 */
     c->assist_speed_pct = CONFIG_ASSIST_PCT_DEF;
     c->assist_ms        = CONFIG_ASSIST_MS_DEF;
+    c->assist_hold      = 1;   /* 默认"阶段内保持离合吸合、只脉冲电机" */
 
     /* ---- 退料参数（C3 无微动降级模式） ---- */
     c->retract_wait_ms   = CONFIG_RETRACT_WAIT_MS_DEF;
@@ -183,6 +185,29 @@ static bool config_apply_patch_once(void)
     if (s_cfg.assist_ms == 0) {
         s_cfg.assist_ms = CONFIG_ASSIST_MS_DEF;
         changed = true;
+    }
+
+    /* ---- 补丁 2（2026-09-23）：新增字段，老配置里那两字节恒为 0 ----
+     *
+     * 新加的两个字段是塞在结构体尾部填充里的（见 config.h 的说明），
+     * 老固件从来没写过它们 → 读出来都是 0。而这两个 0 的含义并不一样：
+     *
+     *   · jog_speed_pct = 0 → config_get_jog_speed_pct() 把它当"没设置过"，
+     *     返回默认全速 100%。**不用在这里动**，保持 0 反而能把"老配置"
+     *     这个事实留在数据里（用户真去调过之后才会变成 5~100）。
+     *
+     *   · assist_hold   = 0 → 会被当成"关闭保持吸合"。可现场的要求是**开启**
+     *     （阶段内离合全程吸着、只脉冲电机，别每送一次就吸合-断开折腾机械）。
+     *     所以这里显式置 1。
+     *
+     * ⚠️ 只在打补丁这一次做。补丁水位线写下之后完全信任 NVS —— 用户以后
+     *    在网页上把"保持吸合"关掉，重启也不会被这里改回来。
+     *    （`lvl < 2` 而不是 `lvl < CONFIG_PATCH_LEVEL`：以后加补丁 3 时，
+     *     这段不会被重复执行，只做它该做的那一次。） */
+    if (lvl < 2) {
+        s_cfg.assist_hold = 1;
+        changed = true;
+        ams_log("配置补丁2：启用「辅助送料阶段内保持离合吸合」（只脉冲电机）");
     }
 
     config_mark_patched();
@@ -300,6 +325,14 @@ esp_err_t config_init(void)
         s_cfg.assist_ms > CONFIG_ASSIST_MS_MAX) {
         s_cfg.assist_ms = CONFIG_ASSIST_MS_DEF;
     }
+    /* ---- 2026-09-23 新增的两个字段 ----
+     * jog_speed_pct：0 是合法含义（"没设置过"→ 默认全速），所以只判上限；
+     *   越界（比如 NVS 被手改过）一律归 0，由 getter 落回默认值。
+     * assist_hold：规范化成 0/1，避免 NVS 里的脏值被当布尔用。 */
+    if (s_cfg.jog_speed_pct > CONFIG_JOG_SPEED_MAX) {
+        s_cfg.jog_speed_pct = 0;
+    }
+    s_cfg.assist_hold = s_cfg.assist_hold ? 1 : 0;
     for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
         if (s_cfg.access_list[i] == 0 ||
             s_cfg.access_list[i] > BOARD_CHANNEL_COUNT) {
@@ -423,6 +456,63 @@ uint16_t config_set_jog_ms(int value)
                 value / 1000.0, BOARD_CHANNEL_COUNT);
     }
     return s_cfg.jog_ms;
+}
+
+/* ---- 手动点动 PWM ----
+ *
+ * 0 的含义是"没设置过"，只可能来自**老配置**：这个字段是老固件留下的
+ * 尾部填充字节（见 config.h 的结构体说明），从没被写过，读出来就是 0。
+ * 全新安装走 config_load_defaults()，那里直接写 CONFIG_JOG_SPEED_DEF(100)。
+ * 所以 0 一律按默认值返回 —— 改动前点动就是全速，这样行为完全一致。 */
+uint8_t config_get_jog_speed_pct(void)
+{
+    uint8_t v = s_cfg.jog_speed_pct;
+    if (v == 0) {
+        return (uint8_t)CONFIG_JOG_SPEED_DEF;
+    }
+    if (v < CONFIG_JOG_SPEED_MIN) {
+        return (uint8_t)CONFIG_JOG_SPEED_MIN;
+    }
+    if (v > CONFIG_JOG_SPEED_MAX) {
+        return (uint8_t)CONFIG_JOG_SPEED_MAX;
+    }
+    return v;
+}
+
+uint8_t config_set_jog_speed_pct(int pct)
+{
+    if (pct < CONFIG_JOG_SPEED_MIN) {
+        pct = CONFIG_JOG_SPEED_MIN;
+    }
+    if (pct > CONFIG_JOG_SPEED_MAX) {
+        pct = CONFIG_JOG_SPEED_MAX;
+    }
+    bool changed = (s_cfg.jog_speed_pct != (uint8_t)pct);
+    s_cfg.jog_speed_pct = (uint8_t)pct;
+    config_save();
+    if (changed) {
+        /* 只打百分比，不在这里换 duty —— 换算的唯一定义在 motor_pct_to_duty()，
+         * 点动回执里会把真正的 duty 原值（含硬件回读）打出来。 */
+        ams_log("手动点动 PWM 已改为 %d%%（只影响手动点动，不影响自动换料）",
+                pct);
+    }
+    return s_cfg.jog_speed_pct;
+}
+
+uint8_t config_get_assist_hold(void)
+{
+    return s_cfg.assist_hold ? 1 : 0;
+}
+
+void config_set_assist_hold(uint8_t on)
+{
+    uint8_t v = on ? 1 : 0;
+    bool changed = (s_cfg.assist_hold != v);
+    s_cfg.assist_hold = v;
+    config_save();
+    if (changed) {
+        ams_log("辅助送料「阶段内保持离合吸合」已%s", v ? "开启" : "关闭");
+    }
 }
 
 bool config_sensor_enabled(int channel_index)
@@ -691,7 +781,8 @@ int config_describe(char *buf, size_t buflen)
     } else {
         P("当前料盘 : 未知\n");
     }
-    P("手动点动 : %.1f 秒\n", s_cfg.jog_ms / 1000.0);
+    P("手动点动 : %.1f 秒 @%u%%\n", s_cfg.jog_ms / 1000.0,
+      (unsigned)config_get_jog_speed_pct());
     P("自吸参数 : 蠕动 %u 次 × %ums @%u%%\n",
       (unsigned)s_cfg.creep_times, (unsigned)s_cfg.creep_pulse_ms,
       (unsigned)s_cfg.creep_speed_pct);
@@ -703,9 +794,13 @@ int config_describe(char *buf, size_t buflen)
           config_sensor_enabled(i) ? "已装" : "未装",
           i + 1 < BOARD_CHANNEL_COUNT ? "  " : "\n");
     }
-    P("辅助送料 : %s @%u%% × %ums\n",
+    P("辅助送料 : %s @%u%% × %ums，%s\n",
       s_cfg.assist_enabled ? "开启" : "关闭",
-      (unsigned)s_cfg.assist_speed_pct, (unsigned)s_cfg.assist_ms);
+      (unsigned)s_cfg.assist_speed_pct, (unsigned)s_cfg.assist_ms,
+      config_get_assist_hold() ? "阶段内保持离合吸合（只脉冲电机）"
+                               : "每次吸合-断开");
+    P("配置结构长度: %u 字节（改动必须保持不变，否则老配置会被丢弃）\n",
+      (unsigned)sizeof(ams_config_t));
     /* 退料现在是"连续退料优先"：先全速拉 retract_cont_ms（拉到打印机报
      * 无料就提前停），没拉出来再用蠕动拱 retract_creep_max 轮。 */
     P("退料参数 : 连续 %ums → 蠕动 %u 轮 × %ums（间隔 %ums）\n",

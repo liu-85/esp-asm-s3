@@ -164,6 +164,19 @@
     var accessFromDevice = false;
     var lastAccessSig = '';
     var jogMs = 1000;
+    var jogPct = 100;      /* 手动点动 PWM 占空比（%），2026-09-23 新增 */
+
+    /* 百分比 → LEDC duty 原值（0~255）。
+     * ★ 必须和后端 motor_pct_to_duty() 用同一种取整：那边是
+     *   (pct * 255 + 50) / 100 的整数除法，等价于四舍五入。
+     *   两边不一致的话，界面显示的 duty 会和日志里的对不上，
+     *   而现场就是拿这两个数在互相印证。 */
+    function pctToDuty(pct) {
+        pct = parseInt(pct, 10);
+        if (isNaN(pct) || pct <= 0) return 0;
+        if (pct > 100) pct = 100;
+        return Math.round(pct * 255 / 100);
+    }
 
     function dot(el, on) { el.className = 'dot' + (on ? ' on' : ''); }
 
@@ -357,8 +370,11 @@
             if (curSel.value !== curVal) curSel.value = curVal;
         }
 
-        /* ---- 点动时长 ---- */
+        /* ---- 点动时长 / 点动 PWM ---- */
         if (typeof d.jog_ms === 'number' && d.jog_ms > 0) syncJogInput(d.jog_ms);
+        if (typeof d.jog_speed_pct === 'number') {
+            syncJogPctInput(d.jog_speed_pct);
+        }
 
         /* ---- 硬件 ---- */
         updateHardware(d.hardware);
@@ -472,7 +488,16 @@
                     ' · 结束后自动断开</b></div>';
         }
         html += '<div class="kv"><span>进退响应时间</span><b>' +
-                (jogMs / 1000).toFixed(1) + ' 秒（4 个通道统一）</b></div>';
+                (jogMs / 1000).toFixed(1) + ' 秒 @' + jogPct +
+                '%（duty ' + pctToDuty(jogPct) + '/255）· 4 个通道统一</b></div>';
+        /* ★ 辅助送料「保持吸合」当前保持在哪一路 —— 保持期间状态机显示的是
+         *   "空闲"（保持的是离合的机械状态，不是总线占用），所以必须单独显示，
+         *   否则用户没法从界面判断"离合现在到底还吸着没有"。 */
+        if (hw.assist_hold_ch) {
+            html += '<div class="kv"><span>辅助送料保持</span><b class="ok">' +
+                    '通道' + hw.assist_hold_ch + ' 的离合保持吸合中' +
+                    '（其他阶段会自动断开）</b></div>';
+        }
         var md = (hw.motor_direction === undefined) ? 0 : hw.motor_direction;
         html += '<div class="kv"><span>电机方向</span><b>' + md +
                 '（1=进料　-1=退料　0=停止）</b></div>';
@@ -792,7 +817,7 @@
     }
 
     /* =======================================================================
-       点动时长
+       点动时长 + 点动 PWM
        ======================================================================= */
     function syncJogInput(ms) {
         jogMs = ms;
@@ -805,11 +830,43 @@
         }
     }
 
+    /* ★ 点动 PWM（2026-09-23 新增）：放这个框的**唯一目的**就是让用户
+     *   一档一档试出"能带动电机和离合的临界占空比"。所以旁边那个提示
+     *   （jog_pwm_hint）直接把当前档位换算成 duty 原值显示出来 ——
+     *   现场看到的是"50% → duty 128/255"，跟日志里的回执能直接对上。 */
+    function syncJogPctInput(pct) {
+        jogPct = pct;
+        var el = $('jog_speed');
+        if (el && document.activeElement !== el) {
+            if (String(pct) !== el.value) el.value = pct;
+        }
+        var hint = $('jog_pwm_hint');
+        if (hint) hint.textContent = '= duty ' + pctToDuty(pct) + '/255';
+    }
+
     function saveJog() {
         var v = parseFloat(val('jog_seconds'));
-        if (isNaN(v) || v <= 0) { toast('请填一个大于 0 的秒数', 'bad'); return; }
-        post('/jog_set', { seconds: v }, function (d) {
+        var p = parseInt(val('jog_speed'), 10);
+        /* 两个字段各自可选：只改 PWM 也行、只改时间也行（后端两个都是可选参数，
+         * 没传的保持原值）。所以这里不要因为其中一个空着就整体拒绝。 */
+        var body = {};
+        if (!isNaN(v) && v > 0) body.seconds = v;
+        if (!isNaN(p)) {
+            if (p < 5 || p > 100) {
+                toast('点动 PWM 请在 5~100 之间', 'bad');
+                return;
+            }
+            body.speed_pct = p;
+        }
+        if (body.seconds === undefined && body.speed_pct === undefined) {
+            toast('请填一个大于 0 的秒数，或一个 5~100 的 PWM', 'bad');
+            return;
+        }
+        post('/jog_set', body, function (d) {
             if (d && typeof d.jog_ms === 'number') syncJogInput(d.jog_ms);
+            if (d && typeof d.jog_speed_pct === 'number') {
+                syncJogPctInput(d.jog_speed_pct);
+            }
             toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
         });
     }
@@ -844,8 +901,10 @@
         var elCk = $('assist_enabled');
         var elSpd = $('assist_speed');
         var elMs = $('assist_ms');
+        var elHd = $('assist_hold');
         if (!elCk || !elSpd) return;
         elCk.checked = !!a.enabled;
+        if (elHd && typeof a.hold === 'boolean') elHd.checked = a.hold;
         if (typeof a.speed_pct === 'number' && document.activeElement !== elSpd) {
             if (String(a.speed_pct) !== elSpd.value) elSpd.value = a.speed_pct;
         }
@@ -858,6 +917,19 @@
         var el = $('assist_enabled');
         var on = el.checked;
         post('/assist_set', { enabled: on ? 0 : 1 }, function (d) {
+            el.checked = !on;
+            toast((d && d.info) || '已切换', (d && d.ok) ? 'ok' : 'bad');
+            refresh();
+        });
+    }
+
+    /* 「阶段内保持离合吸合」切换（2026-09-23 新增）。
+     * 单独给一个按钮而不是只靠「保存」：这是个**安全回退开关** ——
+     * 万一长时间保持让离合发烫或有异响，用户要能立刻关掉退回旧行为。 */
+    function toggleAssistHold() {
+        var el = $('assist_hold');
+        var on = el.checked;
+        post('/assist_set', { hold: on ? 0 : 1 }, function (d) {
             el.checked = !on;
             toast((d && d.info) || '已切换', (d && d.ok) ? 'ok' : 'bad');
             refresh();
@@ -1046,7 +1118,10 @@
             toast('每次时长请在 200~10000ms 之间', 'bad');
             return;
         }
-        post('/assist_set', { speed_pct: v, ms: ms }, function (d) {
+        var hd = $('assist_hold');
+        post('/assist_set', {
+            speed_pct: v, ms: ms, hold: (hd && hd.checked) ? 1 : 0
+        }, function (d) {
             toast((d && d.info) || '已保存', (d && d.ok) ? 'ok' : 'bad');
             refresh();
         });
@@ -1420,6 +1495,7 @@
         $('btn_jog_save').onclick = saveJog;
         $('btn_creep_save').onclick = saveCreep;
         $('btn_assist_toggle').onclick = toggleAssist;
+        $('btn_assist_hold').onclick = toggleAssistHold;
         $('btn_assist_save').onclick = saveAssistPct;
         $('btn_retract_save').onclick = saveRetract;
         $('btn_temper_save').onclick = saveTemper;
