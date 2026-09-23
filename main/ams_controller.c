@@ -441,11 +441,102 @@ static bool has_any_sensor(void)
     return sensor_enabled_mask() != 0;
 }
 
+/** 闭环送料每段的时长 —— 现场要求："信号没变化 → 2 秒 → 继续送入" */
+#define AMS_LOAD_SEGMENT_MS 2000
+/**
+ * 闭环送料的**总时长上限**。
+ *
+ * ★ 必须有的刹车：2026-09-23 现场事故 —— 送料因为等不到到位信号一直推，
+ *   把外挂料盘上的整卷料喂空，最后只能手动在打印机上点「耗材已加载」继续。
+ *   20 秒 = 10 段，按本机料路长度足够到位；到点还没信号就停机告警，
+ *   交给 handle_report 的"载入打印材料"逻辑下一拍再补推。
+ */
+#define AMS_LOAD_TOTAL_MS   20000
+
+/**
+ * 闭环送料：一段一段往前推，每段结束查一次「耗材已到挤出机」。
+ *
+ * ★ 现场要求的确切语义（2026-09-23，用户原话）：
+ *     "拉出或送入 → 等待信号 → 信号没变化 → 2 秒 → 继续拉出或送入
+ *      → 直到接收到需要的信号；送料过程中收到挤出机耗材到位信号后
+ *      立即停止送料，开始蠕动送料 5 次，每次 1 秒。"
+ *
+ * ★ 为什么不能"盲推 8000ms 再干等 15000ms"（旧做法，真机实测的毛病）：
+ *   旧版一次把 8000ms 推满，期间完全不看打印机状态 —— 料早到位了它还在推
+ *   （现场表现为空推、把料拱弯），料没到位它推完才进入 15 秒干等。
+ *   实测到的边界：打印机报「耗材已到挤出机」是 56:25.101，而我们的等待在
+ *   56:25.067 超时 —— 差 **34 毫秒**，就差了那么一条日志。
+ *   闭环之后这个边界不存在了：信号一到立刻停。
+ *
+ * 两个"必须"：
+ *   ① 到位标志只在**进入本函数时**清一次，中途绝不再清 —— 到位事件就是在
+ *      这两秒一段里来的，清一下就把刚拿到的信号丢了（这正是旧版
+ *      "日志说料到位了、我们还在傻等 15 秒"的根因）。
+ *   ② 一定要有总时长上限，见 AMS_LOAD_TOTAL_MS 的说明。
+ *
+ * @param out_inplace  非 NULL 时返回"结束时挤出机是否已到位"
+ * @return true = 硬件层没出错（到位与否看 out_inplace）
+ */
+static bool load_closed_loop(int material_index, uint32_t total_ms,
+                             bool *out_inplace)
+{
+    if (out_inplace) {
+        *out_inplace = false;
+    }
+    if (material_index < 0 || material_index >= BOARD_CHANNEL_COUNT) {
+        record_error("送料失败：料盘位 %d 不存在", material_index + 1);
+        return false;
+    }
+
+    esp_err_t err = clutch_engage(material_index + 1);
+    if (err != ESP_OK) {
+        record_error("送料：料盘位%d 离合吸合失败（%s）",
+                     material_index + 1, esp_err_to_name(err));
+        clutch_release_all();
+        return false;
+    }
+    clutch_set_busy(true);
+
+    extruder_inplace_clear();      /* 见上面 ① */
+
+    bool     inplace = false;
+    uint32_t elapsed = 0;
+    uint32_t seg     = 0;
+    while (elapsed < total_ms) {
+        uint32_t run = AMS_LOAD_SEGMENT_MS;
+        if (elapsed + run > total_ms) {
+            run = total_ms - elapsed;
+        }
+        seg++;
+        /* 全速推 —— 慢速占空比在这个机构上带不动电机（见 do_retract 的说明）。
+         * motor_run() 会阻塞 run 毫秒，所以"段"就是一次推进。 */
+        motor_run((motor_dir_t)1, run);
+        elapsed += run;
+
+        if (extruder_inplace_triggered()) {
+            inplace = true;
+            break;
+        }
+        /* 前两段报个进度，之后交给 handle_report 的节流日志，别刷屏 */
+        if (seg <= 2) {
+            ams_log("  送料（闭环）：第 %u 段推完 %ums，还没等到到位信号…",
+                    (unsigned)seg, (unsigned)run);
+        }
+    }
+    motor_stop();
+    clutch_release_all_settled();
+
+    if (out_inplace) {
+        *out_inplace = inplace;
+    }
+    return true;
+}
+
 /**
  * 送料：把指定料盘位的料往挤出机方向推。
  *
- * 有微动：分步推进，每步之后查「停止送料微动」，触发即停。
- * 无微动：按时间推进，总时长被 AMS_NO_LIMIT_LOAD_MS 封顶（**必须实测调整**）。
+ * 有「停止送料微动」：分步推进，每步之后查微动，触发即停。
+ * 无微动（C3 默认）：闭环送料 —— 2 秒一段，边推边看打印机的到位信号。
  *
  * @param wait_extruder 是否在送完之后等挤出机到位信号（自吸流程要，普通送料不要）
  */
@@ -453,36 +544,61 @@ static bool feed_until_extruder(int mat_new);  /* 前向声明（do_load 早于�
 static bool do_load(int material_index, bool wait_extruder)
 {
     set_state(AMS_STATE_LOAD, material_index);
-    ams_log("  进料：开始送料通道 %d（%s）", material_index + 1,
-            config_sensor_enabled(material_index) ? "按微动反馈" : "按时间推进");
 
-    uint32_t max_ms;
-    if (config_sensor_enabled(material_index)) {
-        max_ms = (uint32_t)AMS_LOAD_RETRY_TIMES * AMS_FILAMENT_STEP_MS;
+    /* ★ 到位标志在这里统一清一次。
+     *   以前是"哪里等、哪里清"，结果送料阶段收到的到位事件会被后面那次
+     *   clear() 抹掉 —— 真机表现为"料明明到位了，我们还在等 15 秒然后报
+     *   '料可能没咬住'"，紧接着打印机又报"耗材已到挤出机"，前后差 34ms。 */
+    extruder_inplace_clear();
+
+    if (config_sensor_enabled(material_index) &&
+        sensor_pin_present(material_index, SENSOR_STOP)) {
+        /* ---- 路径 A：有微动 → 分步推，微动触发即停 ---- */
+        ams_log("  进料：开始送料通道 %d（按微动反馈）", material_index + 1);
+        uint32_t max_ms = (uint32_t)AMS_LOAD_RETRY_TIMES * AMS_FILAMENT_STEP_MS;
         if (max_ms > AMS_NO_LIMIT_LOAD_MS) {
             max_ms = AMS_NO_LIMIT_LOAD_MS;
         }
+        bool triggered = false;
+        if (!drive_channel(material_index, 1, max_ms, true, &triggered)) {
+            return false;
+        }
+        s_diag.load_ok++;
+        if (triggered) {
+            ams_log("停止送料微动触发，送料结束");
+        } else {
+            ams_log_warn("  送料：推满 %ums 停止送料微动也没触发，"
+                         "可能是料没到位、或者料盘位 %d 的微动没接好",
+                         (unsigned)max_ms, material_index + 1);
+        }
     } else {
-        max_ms = AMS_NO_LIMIT_LOAD_MS;
-    }
+        /* ---- 路径 B：无微动（C3 默认）→ 闭环送料 ----
+         *
+         * ★ 这条路**不再提微动**。本机压根没装停止送料微动，旧版每次
+         *   都打"送料 8000ms 结束，但停止送料微动没触发" —— 现场反馈
+         *   这条警告是纯噪音（2026-09-23）。现在的判据是打印机的到位信号。 */
+        ams_log("  进料：开始送料通道 %d（闭环推进，最多 %ums）",
+                material_index + 1, (unsigned)AMS_LOAD_TOTAL_MS);
 
-    bool triggered = false;
-    if (!drive_channel(material_index, 1, max_ms, true, &triggered)) {
-        return false;
-    }
-    s_diag.load_ok++;
-    if (triggered) {
-        ams_log("停止送料微动触发，送料结束");
-    } else {
-        ams_log_warn("送料 %ums 结束，但停止送料微动没触发 —— "
-                     "可能是料没到位、或者 AMS_NO_LIMIT_LOAD_MS 设小了",
-                     (unsigned)max_ms);
+        bool inplace = false;
+        if (!load_closed_loop(material_index, AMS_LOAD_TOTAL_MS, &inplace)) {
+            return false;
+        }
+        s_diag.load_ok++;
+        if (inplace) {
+            ams_log("  送料：打印机已报「耗材已到挤出机」，立刻停送料");
+        } else {
+            ams_log_warn("  送料：推满 %ums 也没等到「耗材已到挤出机」，"
+                         "先停机（避免把料盘喂空）—— 下一拍「载入打印材料」"
+                         "阶段还会再补推一次",
+                         (unsigned)AMS_LOAD_TOTAL_MS);
+        }
     }
 
     /* ---- 等挤出机到位 → 蠕动收尾（自吸流程要，普通送料不要）---- */
     if (wait_extruder) {
         if (!feed_until_extruder(material_index)) {
-            ams_log_warn("等 %ums 没等到挤出机到位，跳过蠕动收尾。"
+            ams_log_warn("  等 %ums 没等到挤出机到位，跳过蠕动收尾。"
                          "若机器没有这根线，请把挤出机信号来源改成 MQTT",
                          (unsigned)AMS_EXTRUDER_WAIT_MS);
         }
@@ -492,8 +608,17 @@ static bool do_load(int material_index, bool wait_extruder)
 
 /** 连续退料时每次"跑一小段"的时长：分段跑，每段之间查一次信号，避免拉过头 */
 #define AMS_RETRACT_POLL_MS 250
-/** 收到"挤出机已空"之后再全速多拉这一小段，把料彻底退出挤出机齿轮 */
-#define AMS_RETRACT_TAIL_MS 500
+/**
+ * 收到"挤出机已空"之后再全速多拉这一小段，把料彻底退出挤出机齿轮。
+ *
+ * ★ 2026-09-23 按现场要求从 500ms 抬到 2000ms：
+ *   原来是"报空就立刻停 + 补 0.5 秒"。真机上出现过**打印机自己还没认账**
+ *   的情况 —— 它的 hw_switch_state 在某些时刻会先跳一下，
+ *   我们立刻停机，料其实还挂在挤出机齿轮上，下一轮进料就顶死。
+ *   多拉 2 秒是纯收益（多退一点料不会有害，顶多是料盘上多绕一小圈），
+ *   少退才是要命的。
+ */
+#define AMS_RETRACT_TAIL_MS 2000
 
 /**
  * 打印机有没有明确说"挤出机里现在没料"。
@@ -1116,27 +1241,43 @@ static void __attribute__((unused)) wait_printer_progress(int prev_stg, int prev
  */
 #define CREEP_DELAY_MS       1000
 #define CREEP_EXCHANGE_TIMES 5
+/**
+ * ★ 换料蠕动收尾的单次时长 = 1 秒（现场要求"5 次 × 1 秒"，2026-09-23）。
+ *
+ *   以前这里用的是全局的 config_get()->creep_pulse_ms（默认 400ms）——
+ *   那个参数是给"自吸"用的：料在料盘里、只需把它拱到微动位置。
+ *   换料场景不一样：料头刚顶进热端齿轮，400ms 拱不稳，打印机随后一拉
+ *   就可能脱开。这里刻意用独立常量，不去动自吸的参数。
+ */
+#define CREEP_EXCHANGE_MS    1000
 
-static bool feed_until_extruder(int mat_new)
+static bool feed_until_extruder_ms(int mat_new, uint32_t wait_ms)
 {
-    /* ① 等挤出机到位 */
-    extruder_inplace_clear();
-    ams_log("  进料（蠕动）：等待挤出机到位信号（最多 %ums）…",
-            (unsigned)AMS_EXTRUDER_WAIT_MS);
-    bool inplace = extruder_inplace_wait(AMS_EXTRUDER_WAIT_MS);
-    if (!inplace) {
-        ams_log_warn("  进料（蠕动）：等 %ums 没等到到位，料可能没咬住",
-                     (unsigned)AMS_EXTRUDER_WAIT_MS);
-        return false;
+    /* ① 等挤出机到位
+     *
+     * ★ 先看"是不是已经到位了"。送料那段（do_load）已经清过标志，并且
+     *   在 2 秒一段地盯着到位信号 —— 事件很可能在那边就来了。这里再
+     *   clear() 一次等于把刚拿到的信号扔掉，正是旧版把"差 34 毫秒"变成
+     *   "白等 15 秒、然后报料没咬住"的根因（真机日志：等超时在 56:25.067，
+     *   打印机报到位在 56:25.101）。 */
+    if (!extruder_inplace_triggered()) {
+        ams_log("  进料（蠕动）：等待挤出机到位信号（最多 %ums）…",
+                (unsigned)wait_ms);
+        if (!extruder_inplace_wait(wait_ms)) {
+            ams_log_warn("  进料（蠕动）：等 %ums 没等到到位，料可能没咬住",
+                         (unsigned)wait_ms);
+            return false;
+        }
     }
     ams_log("  进料（蠕动）：挤出机到位");
 
     /* ② 到位后等 1 秒，让打印机齿轮把料头咬稳 */
-    ams_log("  进料（蠕动）：间隔 %ums 后开始蠕动收尾（%u 次）",
-            (unsigned)CREEP_DELAY_MS, (unsigned)CREEP_EXCHANGE_TIMES);
+    ams_log("  进料（蠕动）：间隔 %ums 后开始蠕动收尾（%u 次 × %ums）",
+            (unsigned)CREEP_DELAY_MS, (unsigned)CREEP_EXCHANGE_TIMES,
+            (unsigned)CREEP_EXCHANGE_MS);
     vTaskDelay(pdMS_TO_TICKS(CREEP_DELAY_MS));
 
-    /* ③ 蠕动 5 次 */
+    /* ③ 蠕动 5 次 × 1 秒 */
     set_state(AMS_STATE_CREEP, mat_new);
     esp_err_t err = clutch_engage(mat_new + 1);
     if (err != ESP_OK) {
@@ -1145,10 +1286,11 @@ static bool feed_until_extruder(int mat_new)
         return false;
     }
     clutch_set_busy(true);
-    ams_log("  进料（蠕动）：5 次 × %u%% 速度",
+    ams_log("  进料（蠕动）：%u 次 × %ums @ %u%%",
+            (unsigned)CREEP_EXCHANGE_TIMES, (unsigned)CREEP_EXCHANGE_MS,
             (unsigned)config_get()->creep_speed_pct);
     for (int i = 0; i < CREEP_EXCHANGE_TIMES; i++) {
-        motor_run_speed(MOTOR_DIR_FEED, config_get()->creep_pulse_ms,
+        motor_run_speed(MOTOR_DIR_FEED, CREEP_EXCHANGE_MS,
                         config_get()->creep_speed_pct);
         motor_stop();
         if (i + 1 < CREEP_EXCHANGE_TIMES) {
@@ -1158,6 +1300,98 @@ static bool feed_until_extruder(int mat_new)
     clutch_release_all_settled();
     ams_log("  进料（蠕动）：蠕动收尾完成");
     return true;
+}
+
+static bool feed_until_extruder(int mat_new)
+{
+    return feed_until_extruder_ms(mat_new, AMS_EXTRUDER_WAIT_MS);
+}
+
+/* ==========================================================================
+ * 工具：日志节流 / 打印机弹窗自动确认
+ * ========================================================================== */
+
+/**
+ * 周期性动作的日志节流 —— 只记「变化」。
+ *
+ * ★ 现场反馈（2026-09-23）：辅助送料在校准阶段每 2 秒一条、打印中每 5 秒
+ *   一条，一次打印能刷出上百行一模一样的内容，把真正有用的那几条
+ *   （阶段变化 / 退料 / 换料）冲没了。现场原话是"像下面的报文只显示一个
+ *   就可以了"。
+ *
+ * 规则（key 就是"内容"，参数一变 key 就变，于是自动打新的一行）：
+ *   · key 不同            → 立刻打印，返回 0（首条，没有省略）
+ *   · key 相同、未到窗口   → 不打印，返回 -1（内部累加被压掉的条数）
+ *   · key 相同、已到窗口   → 打印，返回期间被压掉的条数（调用方拼 "+N 条"）
+ *
+ * @return -1 = 本条不打印；>= 0 = 打印，值 = 期间被省略的同内容条数
+ */
+static int log_throttle(const char *key, uint32_t window_ms)
+{
+    static char     last_key[96];
+    static int64_t  last_print_us;
+    static uint32_t skipped;
+
+    int64_t now = esp_timer_get_time();
+    if (!last_key[0] || strcmp(key, last_key) != 0) {
+        snprintf(last_key, sizeof(last_key), "%s", key);
+        last_print_us = now;
+        skipped       = 0;
+        return 0;
+    }
+    if ((now - last_print_us) < (int64_t)window_ms * 1000) {
+        skipped++;
+        return -1;
+    }
+    uint32_t n = skipped;
+    skipped       = 0;
+    last_print_us = now;
+    return (int)n;
+}
+
+/**
+ * 打印机弹窗自动确认。
+ *
+ * ★ 现场要求（2026-09-23）：换料时送料没到位，打印机会弹「耗材已加载 /
+ *   请拉出耗材」这类框，必须**手动在打印机屏上点一下**才能继续 ——
+ *   而那时料其实已经到位了，纯粹是在等人。
+ *
+ * 做法：换料流程走完（料确实送进去了）之后，如果打印机还挂着错误码，
+ *   就发一条 `clean_print_error` 把它按掉。
+ *
+ * ⚠️ 只在这一个位置发、只在"我们刚把料送好"之后发：
+ *   这个命令是按掉打印机**当前**的错误，无脑发会把真故障也一起吞掉。
+ *
+ * @param mat 刚送好的料盘位；< 0 表示没送到 —— 此时**不按**，别掩盖真故障
+ */
+static void auto_confirm_printer_dialog(int mat)
+{
+    if (mat < 0) {
+        return;
+    }
+    int err = 0;
+    if (xSemaphoreTake(s_report_lock, 0) == pdTRUE) {
+        err = s_last_report.print_error;
+        xSemaphoreGive(s_report_lock);
+    }
+    if (err == 0) {
+        return;    /* 没有弹窗，什么都不用做 */
+    }
+
+    char js[192];
+    int n = snprintf(js, sizeof(js),
+                     "{\"print\":{\"sequence_id\":\"%u\","
+                     "\"command\":\"clean_print_error\",\"print_error\":%d}}",
+                     (unsigned)(esp_timer_get_time() / 1000), err);
+    if (n <= 0 || n >= (int)sizeof(js)) {
+        return;
+    }
+    if (bambu_mqtt_publish(js, n) >= 0) {
+        ams_log("  弹窗自动确认：已按掉打印机的错误码 %d（料已就位）", err);
+    } else {
+        ams_log_warn("  弹窗自动确认失败（MQTT 未连接？），"
+                     "如果打印机还在等，请在屏上手动点一下");
+    }
 }
 
 /**
@@ -1259,12 +1493,16 @@ static bool do_exchange(int printer_channel)
      *  "切了再说不换"。我们这里判定在切刀之后，只能二选一 ——
      *  **既然已经切了，就必须退料 + 进料把它装回去**。
      *
-     *  结论：收到真正的换料请求，就老实走完整流程。不要再加"跳过"分支。
+     *  结论：**"跳过"这件事只能判定在切刀之前**。2026-09-23 已按现场要求
+     *  把它挪到 handle_report 的「② 同料判定」里 —— 那边判完直接 resume，
+     *  压根不会发出切刀。到了这个函数里的请求，一律是"料真的需要动"的那种，
+     *  老老实实走完整流程，**不要在这里再加"跳过"分支**（在这里跳 =
+     *  切了没人装回去）。
      * ---------------------------------------------------------------------- */
     if (current == printer_channel) {
-        ams_log("  注意：目标通道 %s 与记录的当前通道相同，但切刀已经发过了 —— "
-                "仍要退料 + 进料把料装回去（跳过会卡在 stg_cur=24 载入打印材料）",
-                new_txt);
+        ams_log("  注意：目标通道 %s 与记录的当前通道相同 —— 能走到这里说明"
+                "当时挤出机是空的（同料跳过那条要求「挤出机有料」才生效），"
+                "所以仍然要把料装回去", new_txt);
     }
 
     /* ---------- 步骤〇：★ 等打印机把"切刀 + 退到冲刷区"做完 ----------
@@ -1362,10 +1600,18 @@ static bool do_exchange(int printer_channel)
         return false;
     }
 
-    /* 蠕动收尾（等到位 → 蠕动），即使等不到也强制执行 */
-    if (!feed_until_extruder(mat_new)) {
+    /* 蠕动收尾（等到位 → 5 次 × 1 秒），即使等不到也强制执行。
+     * ★ 这里只再等 5 秒：do_load 已经闭环推了最多 20 秒，而且全程在盯
+     *   到位信号（信号一到就停）。再干等 15 秒只会让打印机在暂停态多停
+     *   十几秒 —— 现场反馈正是"等待过程太长"（2026-09-23）。 */
+    if (!feed_until_extruder_ms(mat_new, 5000)) {
         ams_log_warn("  未等到挤出机到位，料可能没咬住，仍尝试继续");
     }
+
+    /* ★ 收尾补救：如果打印机此时正挂着"缺料 / 请拉出耗材"这类弹窗，
+     *   而料其实已经被我们送进去了，就替现场把它按掉。
+     *   （现场要求："打印机如果弹窗了，能不能自动进行确认"） */
+    auto_confirm_printer_dialog(mat_new);
 
     /* ---------- 步骤三：记录状态 + resume ----------
      * 辅助送料不在这里做——正确的时机在 handle_report 的 stg=8/19/0 阶段。
@@ -1459,6 +1705,14 @@ static int auto_match_channel(int target_color)
  *      送料，帮打印机把料咬住。校准阶段（stg=8）本身要跑两三分钟，所以
  *      这里是反复做，不是只做一次 —— 见下方注释里 2026-09-22 的真机教训。
  */
+/** 「载入打印材料」阶段自动送料的起点（0 = 当前不在送）。见 handle_report */
+static int64_t s_stage24_push_start_us;
+
+/** 「载入打印材料」阶段自动送料的时长上限（秒）—— 到点就停，别把料盘喂空 */
+#define AMS_STAGE24_PUSH_MAX_S 45
+/** 「载入打印材料」阶段自动送料的占空比：全速。慢速在这个机构上带不动 */
+#define AMS_STAGE24_PUSH_PCT   100
+
 static void handle_report(const bambu_report_t *r)
 {
     /* ---- 热床温度记忆（必须在用它之前做）----
@@ -1565,13 +1819,91 @@ static void handle_report(const bambu_report_t *r)
         /* ★ 一条日志把"为什么送 / 占空比 / 时长 / 周期"都带上。
          *   真机教训：23% 这种低占空比在这个机构上**完全带不动电机**
          *   （20kHz 堵转几乎没有可听噪声），所以实际占空比必须印出来；
-         *   周期也印出来，否则现场没法判断"到底会不会再来一次"。 */
-        ams_log("辅助送料（%s）：通道%d @%u%% × %ums（每 %ums 一次）",
-                assist_why, config_get_filament_current(),
-                (unsigned)assist_pct, (unsigned)assist_ms,
-                (unsigned)assist_period_ms);
+         *   周期也印出来，否则现场没法判断"到底会不会再来一次"。
+         *
+         * ★ 但同一条只记一次（现场要求"只显示变化的信息"）：校准阶段每
+         *   2 秒一次、打印中每 5 秒一次，一晚上能刷上百行完全一样的内容，
+         *   把阶段变化 / 退料 / 换料那几条真正有用的冲没了。
+         *   参数或阶段一变 key 就变，会自动打新的一行；稳定时每 60 秒
+         *   补一行"继续中"当心跳，保证能看出它一直在动。 */
+        char key[96];
+        snprintf(key, sizeof(key), "assist|%s|%d|%u|%u|%u",
+                 assist_why, config_get_filament_current(),
+                 (unsigned)assist_pct, (unsigned)assist_ms,
+                 (unsigned)assist_period_ms);
+        int skipped = log_throttle(key, 60000);
+        if (skipped == 0) {
+            ams_log("辅助送料（%s）：通道%d @%u%% × %ums（每 %ums 一次）",
+                    assist_why, config_get_filament_current(),
+                    (unsigned)assist_pct, (unsigned)assist_ms,
+                    (unsigned)assist_period_ms);
+        } else if (skipped > 0) {
+            ams_log("辅助送料（%s）：通道%d 继续中（@%u%% × %ums，"
+                    "已省略 %d 条相同日志）",
+                    assist_why, config_get_filament_current(),
+                    (unsigned)assist_pct, (unsigned)assist_ms, skipped);
+        }
         (void)drive_channel_speed(assist_mat, 1, assist_pct, assist_ms,
                                   false, NULL);
+    }
+
+    /* ---- 载入打印材料：打印机在等料，我们就主动往里送 ----
+     *
+     * ★ 现场要求（2026-09-23）原话："接收到打印文件后，如果当前挤出机为
+     *   无耗材，他好像有一个进料的状态，在进料时送入目标通道的耗材。"
+     *
+     * 打印机停在 stg_cur=24（载入打印材料）时就是在**等料**，分两种情况：
+     *   · 它同时发了换料请求（change_needed）→ 走下面的换料流程，这里不碰；
+     *   · 它只是在等料（打印刚开始、挤出机空着）→ 我们主动推。
+     *
+     * 目标通道优先取报文里的热床信道（切片的 M140 S{next_extruder+1} 会把
+     * 目标通道送过来），取不到再退回"当前通道"。
+     *
+     * ★ 判据为什么是"无料"而不是"只要在这个阶段就推"：料已经在挤出机里
+     *   还硬推，会把料拱弯（现场见过的"空推"）。所以只在有**无料证据**时推：
+     *     · hint == 0  → 打印机明确报过无料；
+     *     · hint < 0   → 打印机从没报过这个字段，同时我们也没见过"到位"事件
+     *                    （extruder_inplace_triggered() 为假），按"可能空着"处理。
+     *
+     * ★ 每次只推 2 秒（一拍一段），要不要继续由打印机的下一拍报文决定 ——
+     *   "挤出机一到位就停"因此是天然成立的；也不会长时间占住共享电机
+     *   （打印机随时可能发来换料请求，换料永远优先）。
+     * ★ 另有 45 秒看门狗：真等不到就停手告警。现场出现过一直推、把外挂
+     *   料盘整卷喂空、最后只能手动在打印机上点「耗材已加载」的事故。 */
+    if (r->stg_cur == 24 && !r->change_needed && !ams_is_busy() &&
+        config_get_assist_enabled() &&
+        (r->extruder_inplace_hint == 0 ||
+         (r->extruder_inplace_hint < 0 && !extruder_inplace_triggered()))) {
+        int tgt = (r->bed_channel > 0) ? r->bed_channel
+                                       : config_get_filament_current();
+        int mat = (tgt > 0) ? config_material_index_of(tgt) : -1;
+        if (mat >= 0) {
+            int64_t now = esp_timer_get_time();
+            if (s_stage24_push_start_us == 0) {
+                s_stage24_push_start_us = now;
+            }
+            uint32_t pushed_s =
+                (uint32_t)((now - s_stage24_push_start_us) / 1000000);
+            if (pushed_s < AMS_STAGE24_PUSH_MAX_S) {
+                char key[64];
+                snprintf(key, sizeof(key), "stage24push|%d", mat);
+                if (log_throttle(key, 10000) >= 0) {
+                    ams_log("载入打印材料：挤出机无料 → 送入通道 %d "
+                            "（已送 %us，最多 %us）",
+                            tgt, (unsigned)pushed_s,
+                            (unsigned)AMS_STAGE24_PUSH_MAX_S);
+                }
+                (void)drive_channel_speed(mat, 1, AMS_STAGE24_PUSH_PCT,
+                                          AMS_LOAD_SEGMENT_MS, false, NULL);
+            } else if (pushed_s < AMS_STAGE24_PUSH_MAX_S + 1) {
+                ams_log_warn("载入打印材料：已连续送料 %us 仍没等到「耗材已到"
+                             "挤出机」，先停下（避免把料盘喂空）—— "
+                             "请检查料路是否卡住",
+                             (unsigned)AMS_STAGE24_PUSH_MAX_S);
+            }
+        }
+    } else if (r->stg_cur != 24 || r->change_needed) {
+        s_stage24_push_start_us = 0;    /* 离开这个阶段 → 看门狗归零 */
     }
 
     /* ---- 换料请求 ---- */
@@ -1698,7 +2030,43 @@ static void handle_report(const bambu_report_t *r)
         }
     }
 
-    /* ---- ② 快速退料：先让打印机动手 ----
+    /* ---- ② 同料判定：目标通道 == 当前通道 → 不切刀、不进退料，直接放行 ----
+     *
+     * ★ 现场要求（2026-09-23）原话："首次目标通道与当前通道一致，不要发送
+     *   切刀任务，直接按正常流程走，如果对比不一样再换料。"
+     *
+     * ★ 为什么必须在这里判、而不能等到 do_exchange 里再判：
+     *   切刀指令（M109 + M620/T255/M621）就是在下面 ③ 那一小段里发出去的。
+     *   一旦发出去，料**已经被切断、热端已经是空的**，那时再判"不用换"
+     *   就成了"切了没人装回去" —— do_exchange 里那段长注释记的正是
+     *   2026-09-22 的那次事故。判定必须赶在切刀**之前**。
+     *
+     * 这个做法与 Top-AMS 一致（main.cpp:298）：
+     *     同一耗材,无需换料 → 恢复床温 → 延时 1 秒 → print_resume
+     *
+     * ⚠️ 只在"挤出机里有料"（hint != 0）时才敢跳过。挤出机空着时不能跳 ——
+     *    那种情况下跳过就没人送料了，交给下面的正常流程
+     *    （它会跳过退料、只做进料）。 */
+    {
+        int  cur_ch  = config_get_filament_current();
+        bool same    = (cur_ch > 0 && cur_ch == printer_ch);
+        bool has_fil = (r->extruder_inplace_hint != 0);
+        if (same && has_fil) {
+            ams_log("  同一耗材：目标通道 %d 就是当前通道，且挤出机有料 —— "
+                    "不发切刀、不动电机，直接放行", printer_ch);
+            /* 归还热床温度在上面 ① 里已经发过了（bed_channel > 0 时发 M190） */
+            s_change_active = true;
+            s_pending_fp    = fp;
+            /* 等打印机把暂停动作做完再 resume（Top-AMS 也是等 1 秒），
+             * 太快发它会跟打印机自己的暂停流程抢时序 */
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            bambu_mqtt_send_resume();
+            ams_log("  已发送 resume，打印机继续走后续冲刷 / 校准");
+            return;
+        }
+    }
+
+    /* ---- ③ 快速退料：先让打印机动手 ----
      * 挤出机已经明确上报"无料"（hint == 0）就跳过 —— 没料可退，
      * 硬发 M620 只会白换一个 HMS 报错。hint == -1 表示还没收到过这个
      * 字段，按"有料"处理（宁可多发一次）。 */
