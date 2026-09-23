@@ -1587,6 +1587,20 @@ DEF_COUNTED(h_retract_set)
 DEF_COUNTED(h_temper_set)
 DEF_COUNTED(h_ota_upload)
 
+/* ★★ 接口名额上限 —— 这个数必须**大于** uris[] 的条数，不能相等。★★
+ *
+ *   2026-09-23 现场事故（能 ping 通、网页打不开）：
+ *     uris[] 那时是 26 条，而这里写的正是 26 —— 看着"刚好装满"，
+ *     实际是个地雷：为「辅助送料自检」加了一条 /assist_test 变成 27 条，
+ *     最后一条 /ota_upload 注册时返回 ESP_ERR_HTTPD_HANDLERS_FULL，
+ *     而当时注册循环里是"失败就 httpd_stop()"... 于是整个 Web 服务被关掉，
+ *     80 端口不再监听 → 浏览器打不开，curl 报 Connection refused，
+ *     而 ping 完全正常（WiFi/lwIP 都活着）—— 症状极具误导性。
+ *
+ *   留 8 个空位的理由：这个上限是**运行期**才生效的，
+ *   留余量 + 下面那条 _Static_assert，让"加接口忘了调大"变成**编译错误**。 */
+#define WEB_MAX_URI_HANDLERS 32
+
 esp_err_t web_server_start(void)
 {
     if (s_server) {
@@ -1611,7 +1625,8 @@ esp_err_t web_server_start(void)
 
     httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
     conf.server_port = WEB_SERVER_PORT;
-    conf.max_uri_handlers = 26;
+    /* 必须 > uris[] 条数，见上面 WEB_MAX_URI_HANDLERS 的说明 */
+    conf.max_uri_handlers = WEB_MAX_URI_HANDLERS;
     conf.lru_purge_enable = true;
     /* ★ 栈要够用：/wifi_scan 最坏要阻塞 2~3 秒、OTA 那个 handler 还要在栈上
      *   做临时拼接。（/wifi_connect 现在**不再**在 httpd 任务里等 20 秒了：
@@ -1636,6 +1651,13 @@ esp_err_t web_server_start(void)
         { .uri = "/index.html",.method = HTTP_GET,  .handler = h_index_counted },
         { .uri = "/app.js",    .method = HTTP_GET,  .handler = h_appjs_counted },
         { .uri = "/style.css", .method = HTTP_GET,  .handler = h_style_counted },
+
+        /* ---- ★ 升级（放这么靠前是刻意的）----
+         *   注册是**按顺序占名额**的，名额用完时**排在后面的先失败**。
+         *   2026-09-23 那次事故里 /ota_upload 正好在最后一条，于是它成了
+         *   第一个牺牲品 —— 网页刷不了，也就没法自己救回来，只能拆机接线。
+         *   自救通道必须排在前面：宁可少一个调试接口，也不能没有升级口。 */
+        { .uri = "/ota_upload", .method = HTTP_POST, .handler = h_ota_upload_counted },
 
         /* ---- 状态 ---- */
         { .uri = "/status",        .method = HTTP_GET, .handler = h_status_counted },
@@ -1669,19 +1691,58 @@ esp_err_t web_server_start(void)
         { .uri = "/retract_set",      .method = HTTP_POST, .handler = h_retract_set_counted },
         { .uri = "/temper_set",       .method = HTTP_POST, .handler = h_temper_set_counted },
 
-        /* ---- 升级 ---- */
-        { .uri = "/ota_upload", .method = HTTP_POST, .handler = h_ota_upload_counted },
     };
 
+    /* ★ 编译期断言：条数超过名额会让注册在运行时失败 —— 见 WEB_MAX_URI_HANDLERS
+     *   上面的说明。加这条断言后，"加接口忘了调大上限"直接是**编译错误**，
+     *   tools/check_c_static.py 里还有一条等价的静态比对，双保险。 */
+    _Static_assert(sizeof(uris) / sizeof(uris[0]) <= WEB_MAX_URI_HANDLERS,
+                   "路由条数超过 WEB_MAX_URI_HANDLERS，请调大它。"
+                   "否则 httpd 注册会在运行时失败（现场表现：能 ping 通、网页打不开）");
+
+    /* ★★ 注册失败**不能**把整个 Web 服务关掉 ★★
+     *
+     *   2026-09-23 事故的第二处错就在这里：原来是 "if 注册失败 → httpd_stop()"。
+     *   后果是把**所有**接口一起弄没了 —— 包括 OTA。于是现场陷入死局：
+     *   网页打不开 → 没法用网页刷回旧固件 → 只能拆机接串口。
+     *
+     *   教训（比这个 bug 本身更值钱）：
+     *     **启动路径上的失败处置，绝不能剥夺用户的自救通道。**
+     *     一个调试接口没注册上，服务该照常活着。
+     *
+     *   所以改成：失败就记一条错误、继续注册剩下的，最后只拿"首页在不在"
+     *   当作 Web 服务是否可用的判据（首页才是"网页能不能打开"的最低要求）。 */
+    int  uri_fail = 0;
+    bool index_ok = false;
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         err = httpd_register_uri_handler(s_server, &uris[i]);
         if (err != ESP_OK) {
-            ams_log_err("注册接口 %s 失败: %s", uris[i].uri,
-                        esp_err_to_name(err));
-            httpd_stop(s_server);
-            s_server = NULL;
-            return err;
+            ams_log_err("注册接口 %s 失败: %s（其余接口不受影响，"
+                        "Web 服务继续运行）", uris[i].uri, esp_err_to_name(err));
+            uri_fail++;
+            continue;
         }
+        if (strcmp(uris[i].uri, "/") == 0) {
+            index_ok = true;
+        }
+    }
+
+    /* 判据收窄成"首页在不在"。为什么不沿用"任一失败即判死"：
+     * main.c 是靠 web_server_start() 的返回值决定要不要
+     * esp_ota_mark_app_valid_cancel_rollback()，一旦返回失败，
+     * 固件就不确认有效、下次重启自动回滚。可"少了一个 /assist_test"
+     * 这种事并不值得把整个固件判死 —— 用户其实还能正常用网页。
+     * 只有连首页都注册不上，才是真的"网页打不开"，那时才该回滚。 */
+    if (!index_ok) {
+        ams_log_err("首页接口注册失败 —— 判定 Web 服务不可用，"
+                    "本次升级**不**确认有效，重启后将自动回滚到上一版固件");
+        httpd_stop(s_server);
+        s_server = NULL;
+        return ESP_FAIL;
+    }
+    if (uri_fail > 0) {
+        ams_log_warn("有 %d 个接口注册失败 —— Web 服务本身正常，"
+                     "受影响的只是那几个接口", uri_fail);
     }
 
     ams_log("Web 服务已启动，监听 0.0.0.0:%d（%u 个接口）",
