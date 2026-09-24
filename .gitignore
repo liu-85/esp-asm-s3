@@ -21,3 +21,9 @@ dependencies.lock
 *.a
 *.elf
 *.map
+
+# PyInstaller / 运行时生成物（tools/build_exe.py）
+tools/dist/
+tools/*.spec
+tools/esp_ams_tool.spec
+tools/后处理脚本该填什么.txt

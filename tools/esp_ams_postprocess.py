@@ -105,11 +105,23 @@ COLOR_NAME_TABLE: List[Tuple[str, Tuple[int, int, int]]] = [
 ]
 
 # 弹窗策略（配置里的 "popup" 键）
-#   auto（默认）—— 只在**需要人做决定**时才弹：有颜色匹配不上、有歧义、
+#   always（默认）—— 每次切片都弹映射确认窗。★ 这是**现场明确要求**的：
+#                    TOP AMS 的 EXE 就是每次切片都弹一个"耗材丝 ↔ 通道"确认窗，
+#                    用户能一眼看到"哪个切片槽 → 哪个料盘位"，不对劲当场就能改。
+#   auto        —— 只在**需要人做决定**时才弹：有颜色匹配不上、有歧义、
 #                  或者切片颜色比通道还多。一切正常就静默完成，不打断切片。
-#   always      —— 每次切片都弹映射确认窗（复刻 TOP AMS 的 EXE 行为）
 #   never       —— 从不弹，只写日志和 G-code 注释
 POPUP_AUTO, POPUP_ALWAYS, POPUP_NEVER = "auto", "always", "never"
+POPUP_DEFAULT = POPUP_ALWAYS
+
+# 弹窗无人操作时的自动确认秒数。
+# ★ 为什么要它：切片器是在「运行后处理脚本」这一步等我们退出的
+#   （进度条卡在 95%）。人要是走开了，窗口挂着 = 切片永远不结束。
+#   超时后按"窗口里当前显示的结论"自动确认，并在 `.ams.log` 里记一笔。
+POPUP_AUTO_DONE_SEC = 180
+
+# 配置文件名（写回 popup 偏好时用）
+SETTINGS_KEY_POPUP = "popup"
 
 # 各通道数默认颜色
 def _default_colors_for_channel_count(n: int) -> List[Tuple[int, int, int]]:
@@ -258,8 +270,24 @@ def default_settings(channel_count: int = 8) -> dict:
         "channel_count": channel_count,
         "selected_channel": 1,
         "first_filament": True,  # 首次换料开关
+        "popup": POPUP_DEFAULT,  # 每次切片都弹映射确认窗（见 POPUP_* 注释）
         "materials": materials,
     }
+
+
+def update_settings_key(path: Optional[str], key: str, value) -> bool:
+    """只改配置里的**一个键**，其余键原样保留。
+
+    ★ 为什么不能直接 `save_settings(default_settings(), path)`：那会把用户
+      配的通道颜色全部冲掉。确认窗里的"以后别再问了"就是走这条。
+    """
+    if not path:
+        return False
+    data = load_settings(path)
+    if not data:
+        return False
+    data[key] = value
+    return save_settings(data, path)
 
 
 def load_settings(path: str) -> Optional[dict]:
@@ -701,6 +729,14 @@ def find_settings_extended() -> Optional[str]:
 
 # ============================== 后处理脚本入口（Bambu Studio 用） ==============================
 
+# 「当前进程有没有可用的控制台」。
+# ★ main() 会把 None 的 stdout 换成黑洞（防 AttributeError），那就再也分不出
+#   "没控制台"了 —— 所以在换之前把真值记在这里。
+#   PyInstaller --windowed 的 EXE 从切片器/资源管理器启动时是 False，
+#   这时任何"打印说明给人看"的地方都必须改用窗口，否则用户什么都看不到。
+STDOUT_OK = True
+
+
 def safe_print(*args) -> None:
     """打印到控制台。
 
@@ -726,16 +762,16 @@ def load_config_for(gcode_path: str, explicit: Optional[str] = None):
         or find_settings_extended()
     ams_colors: Dict[int, Tuple[int, int, int]] = {}
     first_filament = True
-    popup_mode = POPUP_AUTO
+    popup_mode = POPUP_DEFAULT
 
     if settings_path:
         data = load_settings(settings_path)
         if data:
             ams_colors = get_ams_colors(data)
             first_filament = bool(data.get("first_filament", True))
-            popup_mode = str(data.get("popup", POPUP_AUTO)).lower()
+            popup_mode = str(data.get(SETTINGS_KEY_POPUP, POPUP_DEFAULT)).lower()
             if popup_mode not in (POPUP_AUTO, POPUP_ALWAYS, POPUP_NEVER):
-                popup_mode = POPUP_AUTO
+                popup_mode = POPUP_DEFAULT
         else:
             safe_print("[ESP-AMS] 警告：配置文件读不出来（不是有效 JSON？）：%s"
                        % settings_path)
@@ -773,12 +809,20 @@ def format_match_log(gcode_path: str, settings_path: Optional[str],
 
 
 def show_map_window(detail: List[Dict], ams_colors,
-                    gcode_path: str, settings_path: Optional[str],
-                    goto: str = "") -> None:
-    """弹一个"切片槽 → 物理通道"的确认窗（复刻 TOP AMS EXE 的交互）。
+                    gcode_path: str, settings_path: Optional[str] = None,
+                    mode: str = POPUP_DEFAULT,
+                    auto_close_sec: int = POPUP_AUTO_DONE_SEC) -> None:
+    """弹一个"切片槽 → 料盘位"的确认窗（复刻 TOP AMS EXE 的交互）。
 
-    只在两种情况下被调用：配置里写了 `popup=always`，或者映射需要人拍板。
-    窗口是**非阻塞收尾**的：确认即关，不会改变已经写好的 G-code。
+    ★ 现场要求（2026-09-24）："TOP AMS 用的是 EXE，切片后会弹出一个窗口
+      自动映射外部换料通道的颜色，可以拉起一个弹窗让确认" —— 所以默认
+      策略是 `always`（每次切片都弹），`auto` 只在需要拍板时弹。
+
+    ★ 窗口**会挡住切片**：切片器在"运行后处理脚本"这一步等本进程退出
+      （进度条 95%）。所以
+        ① 确认流程本身要一眼能看完（颜色方块 + 通道 + 结论）；
+        ② 人走开时必须能自己收场 —— `auto_close_sec` 秒后按当前结论
+           自动确认，否则切片会永远卡在 95%。
     """
     try:
         import tkinter as tk
@@ -792,20 +836,27 @@ def show_map_window(detail: List[Dict], ams_colors,
         # 无显示环境（或已经从别的 Tk 实例里起来）→ 静默跳过
         return
 
-    root.title("ESP-AMS 切片槽 → 物理通道 映射确认")
+    root.title("ESP-AMS 耗材丝 ↔ 料盘位 映射确认")
     root.resizable(False, False)
 
-    ttk.Label(root, text=f"文件名：{Path(gcode_path).name}",
-              padding=(12, 10, 12, 2)).pack(anchor="w")
-    ttk.Label(root, text=f"配置文件：{settings_path or '**没找到**'}",
-              padding=(12, 0, 12, 6)).pack(anchor="w")
+    ttk.Label(root, text="切片槽（切片软件里设的）  →  实际换料通道（板子上的料盘位）",
+              padding=(14, 12, 14, 6)).pack(anchor="w")
 
-    box = ttk.Frame(root, padding=(12, 0, 12, 6))
-    box.pack(fill=tk.X)
-    ttk.Label(box, text="切片槽", width=8).grid(row=0, column=0)
-    ttk.Label(box, text="切片里设的颜色", width=16).grid(row=0, column=1)
-    ttk.Label(box, text="→ 实际换料通道", width=16).grid(row=0, column=2)
-    ttk.Label(box, text="结论", width=18).grid(row=0, column=3)
+    head = ttk.Frame(root, padding=(14, 0, 14, 2))
+    head.pack(fill=tk.X)
+    ttk.Label(head, text="文件名", width=10).grid(row=0, column=0, sticky="w")
+    ttk.Label(head, text=Path(gcode_path).name).grid(row=0, column=1, sticky="w")
+    ttk.Label(head, text="配置文件", width=10).grid(row=1, column=0, sticky="w")
+    ttk.Label(head, text=settings_path or "**没找到**（只能按通道号换料）") \
+        .grid(row=1, column=1, sticky="w")
+
+    ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=14, pady=6)
+
+    cols = ttk.Frame(root, padding=(14, 0, 14, 4))
+    cols.pack(fill=tk.X)
+    for c, (txt, w) in enumerate([("切片槽", 8), ("切片里设的颜色", 20),
+                                  ("→ 实际料盘位", 22), ("结论", 20)]):
+        ttk.Label(cols, text=txt, width=w).grid(row=0, column=c, sticky="w")
 
     status_text = {
         "ok": "✓ 已按颜色对上",
@@ -814,23 +865,54 @@ def show_map_window(detail: List[Dict], ams_colors,
         "no_slice": "⚠ 切片没给颜色",
         "no_cfg": "⚠ 项目未配置颜色",
     }
+    err_box = ttk.Frame(root, padding=(14, 0, 14, 4))
+    err_box.pack(fill=tk.X)
+
     for i, d in enumerate(detail, start=1):
         c = d["color"] or (0, 0, 0)
-        hexs = rgb_to_hex(*c) if d["color"] else "（无）"
-        ttk.Label(box, text=f"第 {d['idx'] + 1} 个").grid(row=i, column=0)
-        ttk.Label(box, text=hexs).grid(row=i, column=1)
-        ch_txt = f"通道 {d['ch']}"
-        if d["status"] == "ok" and d["dist"] >= 0:
-            ch_txt += f"（色差 {d['dist']:.1f}）"
-        ttk.Label(box, text=ch_txt).grid(row=i, column=2)
-        ttk.Label(box, text=status_text.get(d["status"], d["status"])) \
-            .grid(row=i, column=3)
+        hexs = rgb_to_hex(*c) if d["color"] else "#DDDDDD"
+        ttk.Label(err_box, text="第 %d 个" % (d["idx"] + 1), width=8) \
+            .grid(row=i, column=0, sticky="w")
+        # 颜色方块 —— TOP AMS 也是这么让人"一眼看出对不对"的
+        ttk.Label(err_box, text="", background=hexs, width=3, relief="solid",
+                  borderwidth=1).grid(row=i, column=1, sticky="w", padx=(0, 6))
+        ttk.Label(err_box, text=(rgb_to_hex(*c) if d["color"] else "（无）"),
+                  width=12).grid(row=i, column=1, sticky="w", padx=(28, 0))
+        ch_c = ams_colors.get(d["ch"])
+        ch_txt = "通道 %d" % d["ch"]
+        if ch_c:
+            ch_txt += " · %s" % rgb_to_hex(*ch_c)
+        ttk.Label(err_box, text=ch_txt, width=22).grid(row=i, column=2, sticky="w")
+        ttk.Label(err_box, text=status_text.get(d["status"], d["status"]),
+                  width=20).grid(row=i, column=3, sticky="w")
 
-    ttk.Label(root, text="映射已写进 G-code（搜 ESP-AMS 就能看到这几行），"
-                         "确认无误直接关窗即可。",
-              padding=(12, 4, 12, 2), wraplength=420).pack(anchor="w")
+    bad = [d for d in detail if d["status"] != "ok"]
+    if bad:
+        tip = ("有 %d 个切片槽没匹配上（见上面的 ⚠）。映射已经写进 G-code，"
+               "但它们**会按切片槽号原样发**——想改就点「打开配置工具改颜色」，"
+               "把料盘颜色配成和切片里一致，然后重新切片。" % len(bad))
+    else:
+        tip = "全部按颜色对上，映射已写进 G-code（搜 ESP-AMS 就能看到这几行）。"
+    ttk.Label(root, text=tip, padding=(14, 2, 14, 4), wraplength=460,
+              justify="left").pack(anchor="w")
 
-    btns = ttk.Frame(root, padding=(12, 6, 12, 12))
+    # ---- 下次还弹不弹（写回配置文件，不动其它键）----
+    pref = tk.StringVar(value=POPUP_ALWAYS if mode == POPUP_ALWAYS else mode)
+    pref_box = ttk.LabelFrame(root, text="下次切片", padding=(10, 4, 10, 6))
+    pref_box.pack(fill=tk.X, padx=14, pady=(2, 4))
+    state = "normal" if settings_path else "disabled"
+    ttk.Radiobutton(pref_box, text="还是每次都弹（和 TOP AMS 一样）",
+                    variable=pref, value=POPUP_ALWAYS, state=state) \
+        .grid(row=0, column=0, sticky="w")
+    ttk.Radiobutton(pref_box, text="只在需要拍板时弹（颜色匹配不上 / 有歧义）",
+                    variable=pref, value=POPUP_AUTO, state=state) \
+        .grid(row=1, column=0, sticky="w")
+    if not settings_path:
+        ttk.Label(pref_box, text="（没找到配置文件，这一项改不了）",
+                  foreground="#888888").grid(row=2, column=0, sticky="w")
+
+    left = tk.IntVar(value=auto_close_sec)
+    btns = ttk.Frame(root, padding=(14, 6, 14, 12))
     btns.pack(fill=tk.X)
 
     def _open_tool():
@@ -848,12 +930,43 @@ def show_map_window(detail: List[Dict], ams_colors,
             pass
         root.destroy()
 
-    ttk.Button(btns, text="确定", command=root.destroy).pack(side=tk.LEFT, padx=6)
+    def _confirm():
+        # 只在用户真的改了这个选择时才写文件（免得每次切片都动配置文件）
+        if settings_path and pref.get() != mode:
+            update_settings_key(settings_path, SETTINGS_KEY_POPUP, pref.get())
+        root.destroy()
+
+    ok_btn = ttk.Button(btns, text="确定", command=_confirm)
+    ok_btn.pack(side=tk.LEFT, padx=6)
     ttk.Button(btns, text="打开配置工具改颜色", command=_open_tool) \
         .pack(side=tk.LEFT, padx=6)
+    hint = ttk.Label(btns, text="")
+    hint.pack(side=tk.RIGHT)
+
+    def _tick():
+        n = left.get() - 1
+        left.set(n)
+        if n <= 0:
+            safe_print("[ESP-AMS] 确认窗无人操作，已按当前结论自动确认"
+                       "（%d 秒）" % auto_close_sec)
+            root.destroy()
+            return
+        hint.config(text="%d 秒后自动确认" % n)
+        root.after(1000, _tick)
+
+    if auto_close_sec > 0:
+        hint.config(text="%d 秒后自动确认" % left.get())
+        root.after(1000, _tick)
 
     try:
         root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        root.update_idletasks()
+        # 放到屏幕中间偏上，别挡住切片器的进度条
+        x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+        root.geometry("+%d+%d" % (max(0, x), 120))
     except Exception:
         pass
     root.mainloop()
@@ -871,7 +984,7 @@ def process_file(in_path: str, out_path: Optional[str] = None,
     """
     settings_path, ams_colors, first_filament, cfg_popup = \
         load_config_for(in_path, explicit_config)
-    mode = (popup_mode or cfg_popup or POPUP_AUTO).lower()
+    mode = (popup_mode or cfg_popup or POPUP_DEFAULT).lower()
 
     try:
         with open(in_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -915,10 +1028,17 @@ def process_file(in_path: str, out_path: Optional[str] = None,
             safe_print("[ESP-AMS] 明细日志：%s" % log_file)
 
     # ---- 弹窗判定 ----
+    #   always：每切一次都弹（现场要求的默认值，对齐 TOP AMS 的 EXE）
+    #   auto  ：只在需要人拍板时弹（有颜色匹配不上 / 有歧义 / 切片色多于通道）
     need_popup = (mode == POPUP_ALWAYS) or \
                  (mode == POPUP_AUTO and summary.get("needs_human"))
     if do_popup and need_popup and detail:
-        show_map_window(detail, ams_colors, in_path, settings_path)
+        if verbose:
+            safe_print("[ESP-AMS] 弹映射确认窗（策略=%s）" % mode)
+        show_map_window(detail, ams_colors, in_path, settings_path, mode=mode)
+    elif do_popup and need_popup and not detail:
+        # 切片里连颜色都没解析到 → 弹一个空表没意义，写进日志即可
+        safe_print("[ESP-AMS] 没有可展示的映射（切片里没解析到颜色），跳过确认窗")
 
     return {"ok": True, "settings_path": settings_path, "log_lines": log_lines,
             "summary": summary, "detail": detail, "log_file": log_file,
@@ -1227,6 +1347,22 @@ def _run_gui():
 
     ttk.Button(btn_frame, text="G-code 匹配预览", command=_do_match_preview).pack(side=tk.LEFT, padx=8)
 
+    def _do_setup_help():
+        """把「切片器里该填哪一行」原样展示出来 —— 现场就是在这里填错的。"""
+        text, _entry = _setup_text()
+        out = None
+        try:
+            out = _setup_file_path()
+            out.write_text(text + "\n", encoding="utf-8")
+        except OSError:
+            out = None
+        if out:
+            text = text + "\n\n（同样内容已存成文件：%s）" % out
+        _show_text_window("ESP-AMS：后处理脚本该填什么", text, parent=root)
+
+    ttk.Button(btn_frame, text="后处理脚本该填什么",
+               command=_do_setup_help).pack(side=tk.LEFT, padx=8)
+
     def _show_export_dialog(export_path):
         """导出后弹窗确认，显示通道颜色配置（第二个截图的效果）"""
         ams_colors = get_ams_colors(state["data"])
@@ -1350,54 +1486,200 @@ def _find_pythonw() -> Optional[str]:
     return None
 
 
-def rv_escape(p: str) -> str:
-    """把路径转成 Bambu Studio 配置里那种转义写法（反斜杠双写 + 整体 \\"）。"""
-    return '\\"' + p.replace("\\", "\\\\") + '\\"'
+def rv_escape(cmd: str) -> str:
+    """把**整条命令行**转成 Bambu Studio 配置里那种转义写法。
+
+    正确形式就是 JSON 字符串（内部 `"` → `\\"`，反斜杠双写），例如：
+
+        "\\"C:\\\\x\\\\pythonw.exe\\" \\"D:\\\\y\\\\pp.py\\""
+
+    ★ 踩过（2026-09-24）：把整条命令当成**一个路径**去转义，结果内部的引号
+      没被转义 → 切片器读到的是半条路径 + 半条参数。必须按"整条命令行"转。
+      对照组：TOP AMS 在文件头留下的是 `; post_process = "\\"D:\\\\kx\\\\a1duose\\\\topasm.exe\\""`。
+    """
+    return json.dumps(cmd, ensure_ascii=False)
+
+
+def _pick_entry() -> Tuple[str, str, str]:
+    """挑出「后处理脚本」框里该填的那**一条**命令。
+
+    ★ 选优顺序是有讲究的（2026-09-24 踩过）：
+      1. **EXE**：单一路径、无参数、无需引号（只要路径没空格），
+         和 TOP AMS 的 `"D:\\kx\\a1duose\\topasm.exe"` 完全同型。
+         用户只要复制一行就行，最不容易填错。
+      2. **pythonw.exe + 脚本路径**：两段、必须带引号，而且 `python` 不在
+         PATH 上时切片器会直接报 "The configured post-processing script
+         does not exist: python" —— 这正是现场那次报错。
+      3. **.bat**：会闪黑窗，但输出落盘，排错方便。
+    返回 (填框用的那一行, 说明, 备选行列表)
+    """
+    base = _app_base()
+    exe = base / "esp_ams_tool.exe"
+    script = os.path.abspath(__file__)
+    pyw = _find_pythonw()
+
+    if exe.is_file():
+        return str(exe), "不需要 Python、不闪窗、单一路径无参数", []
+    if pyw:
+        return ('"%s" "%s"' % (pyw, script),
+                "用系统 Python 的 pythonw.exe（无控制台窗口）", [])
+    # 兜底
+    bat = base / "esp_ams_postprocess.bat"
+    return ('"%s"' % bat, "找不到 Python/EXE，退回 .bat（会闪一下黑窗）", [])
+
+
+def _setup_text() -> Tuple[str, str]:
+    """算出「该往切片器里填什么」，返回 (整段说明, 该填的那一行)。
+
+    ★★ 这一版是**照现场报错重写的**（2026-09-24）：
+       用户把上一版的说明文字连同 `<路径>` 占位符一起粘进了框里、还带上
+       了 `setup` 子命令，切片器直接提示
+       "The configured post-processing script does not exist: python"。
+       教训：给用户的**必须是能整行复制的一条命令**，说明文字要放到它下面，
+       并且要显式写清"不要写 python / 不要写 setup / 不要带尖括号"。
+    """
+    entry, why, _ = _pick_entry()
+    pyw = _find_pythonw()
+    script = os.path.abspath(__file__)
+    base = _app_base()
+    exe = base / "esp_ams_tool.exe"
+    cfg = find_settings_extended()
+    mode_now = POPUP_DEFAULT
+    if cfg:
+        d = load_settings(cfg)
+        if d:
+            v = str(d.get(SETTINGS_KEY_POPUP, POPUP_DEFAULT)).lower()
+            mode_now = v if v in (POPUP_AUTO, POPUP_ALWAYS, POPUP_NEVER) \
+                else POPUP_DEFAULT
+    mode_cn = {POPUP_ALWAYS: "每次都弹（默认）", POPUP_AUTO: "只在需要时弹",
+               POPUP_NEVER: "从不弹"}.get(mode_now, mode_now)
+
+    L = []
+    L.append("=" * 68)
+    L.append("★ 就填这一行 ★")
+    L.append("  位置：Bambu Studio → 偏好设置 → 其他 → 「后处理脚本」")
+    L.append("")
+    L.append("  " + entry)
+    L.append("")
+    L.append("  （%s）" % why)
+    L.append("=" * 68)
+    L.append("")
+    L.append("★ 那个框里【只能有这一行】。下面这些是现场踩过的坑，逐条对照：")
+    L.append("   ✗ 不要写 `python` 三个字母开头 —— 切片器不认 PATH，"
+             "会报")
+    L.append("     \"The configured post-processing script does not exist: python\"")
+    L.append("   ✗ 不要写 `setup` / `--dry-run` 之类的参数（那是给我自己看的）")
+    L.append("   ✗ 不要保留说明书里的 `<路径>` 尖括号")
+    L.append("   ✗ 不要粘两行（框里放两条命令 = 第二条被当成第一条的参数）")
+    if " " in entry.strip('"') and not entry.startswith('"'):
+        L.append("   ⚠ 这条路径里有空格，整条要用英文双引号包起来")
+    L.append("")
+    L.append("-" * 68)
+    L.append("自检（现在是这台机器上的真实情况）")
+    L.append("  配置文件    ：%s" % (cfg or "**没有** —— 先双击 esp_ams_tool 配一次通道颜色"))
+    L.append("  esp_ams_tool.exe：%s" % (exe if exe.is_file() else "**没有**"))
+    L.append("  pythonw.exe ：%s" % (pyw or "**没找到**"))
+    L.append("  弹窗策略    ：%s（改法见下）" % mode_cn)
+    L.append("")
+    L.append("-" * 68)
+    L.append("备选（一般用第一条就够了）")
+    if pyw:
+        L.append('  pythonw 版 ："%s" "%s"' % (pyw, script))
+    L.append('  bat 版      ："%s"（会闪黑窗，输出落盘好排错）'
+             % (base / "esp_ams_postprocess.bat"))
+    L.append('  vbs 版      ："wscript.exe" "%s"（不闪窗）'
+             % (base / "esp_ams_hidden.vbs"))
+    L.append("")
+    L.append("要粘到 .3mf / 打印机配置里的**转义**写法（整体加 \\\"，反斜杠双写）：")
+    L.append("  " + rv_escape(entry))
+    L.append("")
+    L.append("-" * 68)
+    L.append("弹窗：默认「每次切片都弹」一个映射确认窗（和 TOP AMS 一样），")
+    L.append("      在窗口里选一次就会记住。想直接改，编辑上面那个配置文件里的")
+    L.append('      %s 键："%s" 每次弹 / "%s" 只在需要时弹 / "%s" 从不弹。'
+             % (SETTINGS_KEY_POPUP, POPUP_ALWAYS, POPUP_AUTO, POPUP_NEVER))
+    L.append("      也可以临时用参数：--popup always|auto|never 或 --no-popup。")
+    L.append("")
+    L.append("填完**必须重新切片** —— 已切好的 .gcode 里存的是旧通道号。")
+    return "\n".join(L), entry
+
+
+def _setup_file_path() -> Path:
+    return _app_base() / "后处理脚本该填什么.txt"
+
+
+def _show_text_window(title: str, text: str, parent=None) -> None:
+    """把一个长文本框弹出来给人看（带"复制全部"按钮）。
+
+    ★ 为什么需要：`esp_ams_tool.exe` 是 PyInstaller `--windowed` 打的包，
+      从切片器/资源管理器启动时 **没有控制台**，`sys.stdout is None`，
+      于是 `setup` 打印的东西全被吞掉 —— 用户看到的就是"跑了，什么都没出来"。
+      所以没有控制台时必须改用窗口呈现。
+
+    `parent` 给了就开 Toplevel（配置 GUI 里调用），没给就自己开 Tk + mainloop。
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception:
+        return
+    try:
+        win = tk.Toplevel(parent) if parent is not None else tk.Tk()
+    except Exception:
+        return
+    win.title(title)
+    ttk.Label(win, text="把「就填这一行」那一段整行复制到 "
+                        "Bambu Studio → 偏好设置 → 其他 → 后处理脚本",
+              padding=(12, 10, 12, 4)).pack(anchor="w")
+    frame = ttk.Frame(win, padding=(12, 0, 12, 6))
+    frame.pack(fill=tk.BOTH, expand=True)
+    sb = ttk.Scrollbar(frame, orient="vertical")
+    txt = tk.Text(frame, width=96, height=26, wrap="none",
+                  yscrollcommand=sb.set, font=("Consolas", 9))
+    sb.config(command=txt.yview)
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+    txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    txt.insert("1.0", text)
+    txt.config(state="disabled")
+
+    bar = ttk.Frame(win, padding=(12, 0, 12, 12))
+    bar.pack(fill=tk.X)
+
+    def _copy():
+        try:
+            win.clipboard_clear()
+            win.clipboard_append(text)
+            ttk.Label(bar, text="已复制").pack(side=tk.LEFT, padx=6)
+        except Exception:
+            pass
+
+    ttk.Button(bar, text="复制全部", command=_copy).pack(side=tk.LEFT)
+    ttk.Button(bar, text="关闭", command=win.destroy).pack(side=tk.LEFT, padx=6)
+    try:
+        win.attributes("-topmost", True)
+    except Exception:
+        pass
+    if parent is None:
+        win.mainloop()
 
 
 def _cmd_setup():
-    """把「该往切片器里填什么」算好并打印出来（含 JSON 转义形式）。
-
-    为什么要有：Bambu Studio 的后处理字段是**带转义的 JSON 字符串**
-    （`; post_process = "\\"...\\""`），手工拼极容易错；而填错的表现是
-    "切片时窗口一闪就没了" —— 极难自查。
-    """
-    pyw = _find_pythonw()
-    script = os.path.abspath(__file__)
-    lines = []
-    lines.append("=" * 66)
-    lines.append("Bambu Studio → 偏好设置 → 其他 → 「后处理脚本」里填下面其中一条")
-    lines.append("=" * 66)
-    lines.append("")
-    if pyw:
-        lines.append("【推荐 · 完全不会闪窗】")
-        lines.append('  "%s" "%s"' % (pyw, script))
-    else:
-        lines.append("（没找到 pythonw.exe —— 装 Python 时勾上 Add to PATH 就有了）")
-    lines.append("")
-    exe = _app_base() / "esp_ams_tool.exe"
-    if exe.is_file():
-        lines.append("【也行 · 不需要 Python】")
-        lines.append('  "%s"' % exe)
-        lines.append("")
-    lines.append("【最后选择 · 会闪一下黑窗，但输出会落盘方便排查】")
-    lines.append('  "%s"' % (_app_base() / "esp_ams_postprocess.bat"))
-    lines.append("")
-    lines.append("【连 pythonw 都不想用（wscript 版，也不用 Python 控制台）】")
-    lines.append('  "wscript.exe" "%s"' % (_app_base() / "esp_ams_hidden.vbs"))
-    lines.append("")
-    lines.append("-" * 66)
-    lines.append("要粘到 .3mf / 打印机配置里的**转义**写法（整体加 \\\"，反斜杠双写）：")
-    if pyw:
-        esc = (rv_escape(pyw) + ' ' + rv_escape(script))
-        lines.append('  "' + esc + '"')
-    lines.append("")
-    lines.append("-" * 66)
-    lines.append("现在能找到的配置文件：%s" % (find_settings_extended() or "**没有**"))
-    lines.append("（先双击 esp_ams_tool 配一次通道颜色，否则只能按通道号换料）")
-    lines.append("")
-    lines.append("填完**必须重新切片** —— 已切好的 .gcode 里存的是旧通道号。")
-    safe_print("\n".join(lines))
+    """命令行 `setup`：打印 + 落盘 + （没有控制台时）弹窗。"""
+    text, _entry = _setup_text()
+    out = None
+    try:
+        out = _setup_file_path()
+        out.write_text(text + "\n", encoding="utf-8")
+    except OSError:
+        out = None
+    safe_print(text)
+    if out:
+        safe_print("")
+        safe_print("（同样内容已存成文件：%s）" % out)
+    if not STDOUT_OK:
+        # windowed EXE 没有控制台 → 必须用窗口，否则用户什么都看不到
+        extra = ("\n\n（同样内容已存成文件：%s）" % out) if out else ""
+        _show_text_window("ESP-AMS：后处理脚本该填什么", text + extra)
 
 
 def _cmd_export_config():
@@ -1466,6 +1748,8 @@ def main():
     #    sys.stderr 都是 **None**。这时候连 argparse 自己报个错都会
     #    AttributeError（它内部直接 file.write），于是现象就是"窗口一闪、
     #    什么都没发生"。这里先把它们换成黑洞，保证任何路径都不会因此崩。
+    global STDOUT_OK
+    STDOUT_OK = sys.stdout is not None
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
