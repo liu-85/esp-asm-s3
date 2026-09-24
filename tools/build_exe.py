@@ -92,7 +92,9 @@ def main():
     size_mb = exe.stat().st_size / (1024 * 1024)
     print(f"\n编译成功：{exe}  ({size_mb:.1f} MB)")
     print("运行方式：双击 esp_ams_tool.exe 或命令行 esp_ams_tool.exe")
-    print("Bambu Studio 后处理脚本：仍使用 esp_ams_postprocess.py（需 Python 环境）")
+    print("Bambu Studio 后处理脚本：填这个 EXE 的绝对路径（一行、无参数）。")
+    print("  注意：框里不要写 python / 不要写 setup / 不要带尖括号。")
+    print("  跑一次 esp_ams_tool.exe setup 会给出「★ 就填这一行 ★」并落盘 txt。")
 
 
 if __name__ == "__main__":
