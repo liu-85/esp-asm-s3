@@ -246,6 +246,78 @@ int ams_current_printer_channel(void)
     return config_get_filament_current();
 }
 
+/**
+ * 把 0xRRGGBB 说成人话（"橙色"）。
+ *
+ * ★ 现场要求（2026-09-24）原话："（报文未携带颜色信息，按通道号换料）实际是
+ *   通道号就有颜色，把这个颜色在日志中显示出来。"
+ *   —— 通道颜色在网页「通道设置」里早就配好了，日志却只报通道号，看日志的
+ *   人还得回头翻网页才知道那是哪个料。带上颜色名，一眼就能对上料盘。
+ *
+ * 判据是 HSV 里最朴素的那套，不做色彩管理：
+ *   · 三通道差 < 32            → 黑 / 灰 / 白（灰度系没有色相可谈）
+ *   · 亮而偏暗的暖色（20~45°） → 棕
+ *   · 其余按色相分档
+ * 认不出来宁可按色相给个近似名，也**不返回空串** —— 日志里空着等于没写。
+ */
+static const char *color_name_of(uint32_t rgb)
+{
+    int r = (int)((rgb >> 16) & 0xFFu);
+    int g = (int)((rgb >> 8) & 0xFFu);
+    int b = (int)(rgb & 0xFFu);
+
+    int mx = r, mn = r;
+    if (g > mx) mx = g;
+    if (b > mx) mx = b;
+    if (g < mn) mn = g;
+    if (b < mn) mn = b;
+    int d = mx - mn;
+
+    if (d < 32) {
+        if (mx < 60)  return "黑";
+        if (mx < 170) return "灰";
+        return "白";
+    }
+
+    /* 色相 0~359 度，整数算 —— 为了一句日志不值得引入浮点 */
+    int h;
+    if (mx == r)           h = 60 * (g - b) / d;
+    else if (mx == g)      h = 120 + 60 * (b - r) / d;
+    else                   h = 240 + 60 * (r - g) / d;
+    if (h < 0) h += 360;
+
+    if (h < 15 || h >= 345) return "红";
+    if (h < 45)  return (mx < 140) ? "棕" : "橙";
+    if (h < 70)  return "黄";
+    if (h < 165) return "绿";
+    if (h < 200) return "青";
+    if (h < 255) return "蓝";
+    if (h < 290) return "紫";
+    if (h < 330) return "品红";
+    return "粉";
+}
+
+/**
+ * 某个打印机通道的颜色，写成日志片段：`橙色 #FF8000`。
+ *
+ * ⚠️ 配置里 0 表示"没配过颜色"（见 config.h 的 color_list），所以纯黑
+ *   （#000000）在这个语义下没法表达，会显示成"未配颜色" —— 这是配置层的
+ *   既有约定，不是这里的判断错。
+ */
+static void color_text_of_channel(int printer_ch, char *buf, size_t buflen)
+{
+    if (!buf || buflen == 0) {
+        return;
+    }
+    int mat = (printer_ch > 0) ? config_material_index_of(printer_ch) : -1;
+    uint32_t c = (mat >= 0) ? (config_get_color(mat) & 0xFFFFFFu) : 0u;
+    if (c == 0) {
+        snprintf(buf, buflen, "未配颜色");
+        return;
+    }
+    snprintf(buf, buflen, "%s #%.6lX", color_name_of(c), (unsigned long)c);
+}
+
 int ams_channel_text(int printer_channel, char *buf, size_t buflen)
 {
     if (!buf || buflen == 0) {
@@ -258,8 +330,14 @@ int ams_channel_text(int printer_channel, char *buf, size_t buflen)
     if (mat < 0) {
         return snprintf(buf, buflen, "通道 %d（未映射）", printer_channel);
     }
-    return snprintf(buf, buflen, "通道 %d（料盘位 %d）",
-                    printer_channel, mat + 1);
+    /* ★ 带上颜色名（见 color_name_of 的说明）。这里**只放名字、不放 #RRGGBB**
+     *   是因为调用方给的是 48 字节的 cur_txt / new_txt，中文一个字 3 字节，
+     *   再加 7 个字符的十六进制会顶到边界；要十六进制的地方在
+     *   color_text_of_channel()，那边有独立的缓冲。 */
+    uint32_t c = config_get_color(mat) & 0xFFFFFFu;
+    return snprintf(buf, buflen, "通道 %d（料盘位 %d · %s）",
+                    printer_channel, mat + 1,
+                    (c == 0) ? "未配颜色" : color_name_of(c));
 }
 
 static void record_error(const char *fmt, ...)
@@ -1433,41 +1511,90 @@ static bool feed_until_extruder(int mat_new)
  * ========================================================================== */
 
 /**
- * 周期性动作的日志节流 —— 只记「变化」。
+ * 日志「状态变化才显示」—— 周期性动作的降噪。
  *
- * ★ 现场反馈（2026-09-23）：辅助送料在校准阶段每 2 秒一条、打印中每 5 秒
- *   一条，一次打印能刷出上百行一模一样的内容，把真正有用的那几条
- *   （阶段变化 / 退料 / 换料）冲没了。现场原话是"像下面的报文只显示一个
- *   就可以了"。
+ * ★ 现场要求（2026-09-24）原话："精简设备日志只显示主要信息，连续的报文
+ *   只显示一条…只有在状态变化时显示。"
  *
- * 规则（key 就是"内容"，参数一变 key 就变，于是自动打新的一行）：
- *   · key 不同            → 立刻打印，返回 0（首条，没有省略）
- *   · key 相同、未到窗口   → 不打印，返回 -1（内部累加被压掉的条数）
- *   · key 相同、已到窗口   → 打印，返回期间被压掉的条数（调用方拼 "+N 条"）
+ * 演进过程（两个版本，别退回去）：
+ *   v1 log_throttle(key, window) —— 按**时间**节流：key 不变也每 window 打
+ *      一行。校准阶段每 2 秒一次、打印中每 5 秒一次，一小时能刷出上百行；
+ *      而且那句"继续中（已省略 28 条相同日志）"**本身也是噪音** ——
+ *      现场截图里投诉的正是它。
+ *   v2 本函数 —— 按**内容**节流：key 变了才打。同样的动作重复一万次
+ *      也只留一行，日志从"采样流"变回"事件流"。
  *
- * @return -1 = 本条不打印；>= 0 = 打印，值 = 期间被省略的同内容条数
+ * 为什么还留一个 ttl_ms：完全不重复的话，连续几小时的打印期间日志会安静得
+ * 让人怀疑是不是卡死了。ttl_ms 到点后允许再打一行当**慢心跳**（措辞会说明
+ * 是心跳）；填 0 = 永不重复，只认变化。
+ *
+ * slot 是"记忆槽"：不同用途的日志各记一槽，否则两种日志会互相把对方的
+ * key 顶掉，变成轮流刷屏 —— 那比不节流还糟。
  */
-static int log_throttle(const char *key, uint32_t window_ms)
-{
-    static char     last_key[96];
-    static int64_t  last_print_us;
-    static uint32_t skipped;
+enum {
+    /** 辅助送料主行（为什么送 / 占空比 / 时长 / 周期） */
+    LOGSLOT_ASSIST = 0,
+    /** 辅助送料执行回执（离合、duty、硬件回读） */
+    LOGSLOT_ASSIST_RC,
+    /** 「载入打印材料」阶段的主动推料 */
+    LOGSLOT_STAGE24,
+    LOGSLOT_COUNT          /* 必须放在最后 */
+};
 
-    int64_t now = esp_timer_get_time();
-    if (!last_key[0] || strcmp(key, last_key) != 0) {
-        snprintf(last_key, sizeof(last_key), "%s", key);
-        last_print_us = now;
-        skipped       = 0;
-        return 0;
+/** 每个槽上次打过的 key；空串 = 没打过（下一发一定通过） */
+static char    s_log_key[LOGSLOT_COUNT][112];
+/** 每个槽上次打印的时刻 */
+static int64_t s_log_key_us[LOGSLOT_COUNT];
+
+/**
+ * 只在 key 变化（或距上次已过 ttl_ms）时返回"该打"。
+ *
+ * @param slot   记忆槽，见 LOGSLOT_*
+ * @param ttl_ms 允许重复的最短间隔；**0 = 永不重复**（纯变化触发）
+ * @return -1 = 本次不打印；
+ *          0 = key 变化后的第一行（调用方按"状态变化"措辞）；
+ *          1 = 到了 ttl_ms 的慢心跳（调用方按"仍在继续"措辞）
+ */
+static int log_changed(int slot, uint32_t ttl_ms, const char *key)
+{
+    if (slot < 0 || slot >= LOGSLOT_COUNT) {
+        return 0;              /* 槽号写错了就当"每次都打"，别把日志吞掉 */
     }
-    if ((now - last_print_us) < (int64_t)window_ms * 1000) {
-        skipped++;
-        return -1;
+    int64_t now  = esp_timer_get_time();
+    bool    same = (s_log_key[slot][0] != '\0') &&
+                   (strcmp(key, s_log_key[slot]) == 0);
+
+    if (same) {
+        if (ttl_ms == 0 ||
+            (now - s_log_key_us[slot]) < (int64_t)ttl_ms * 1000) {
+            return -1;
+        }
+        s_log_key_us[slot] = now;
+        return 1;
     }
-    uint32_t n = skipped;
-    skipped       = 0;
-    last_print_us = now;
-    return (int)n;
+
+    snprintf(s_log_key[slot], sizeof(s_log_key[slot]), "%s", key);
+    s_log_key_us[slot] = now;
+    return 0;
+}
+
+/**
+ * 清空记忆槽。slot < 0 = 全部清空。
+ *
+ * ★ 必须挂在"一次换色"的边界上（do_exchange 开头）：不变量是"标注过的东西
+ *   要能重新标注"。如果不请，第二次换色时辅助送料的回执会被判成"和上次
+ *   一样"而再也不打 —— 现场会以为功能坏了，反过来又变成一次新的"电机没动"
+ *   悬案。这条边界和打印机的一次换料对话是重合的。
+ */
+static void log_changed_reset(int slot)
+{
+    for (int i = 0; i < LOGSLOT_COUNT; i++) {
+        if (slot >= 0 && i != slot) {
+            continue;
+        }
+        s_log_key[i][0]  = '\0';
+        s_log_key_us[i]  = 0;
+    }
 }
 
 /**
@@ -1542,6 +1669,16 @@ static bool do_exchange(int printer_channel)
     }
 
     set_state(AMS_STATE_EXCHANGE, mat_new);
+
+    /* ★ 一次换色的起点。
+     *   它有两个用途：
+     *     ① 给日志算出"本次换色耗时"（现场要求：换色完成时给出时长）；
+     *     ② 清空"日志状态变化"记忆槽 —— 见 log_changed_reset 的说明，
+     *        不清的话下一轮换色的辅助送料回执会被判成"和上次一样"而消失。 */
+    int64_t t_all          = esp_timer_get_time();
+    int64_t t_wait_done    = 0;   /* 等到打印机报"该退料了"的时刻 */
+    int64_t t_retract_done = 0;   /* 退料做完的时刻 */
+    log_changed_reset(-1);
 
     /* ★ 日志样式对齐 Top-AMS 的现场显示（用户要求一眼能看懂换到第几次、换哪一路）：
      *     ######## 开始第 N 次换色 ########
@@ -1641,6 +1778,7 @@ static bool do_exchange(int printer_channel)
      * 这一步就是把它那半场等完。等不到（超时 / 机器不给这个字段）也会继续，
      * 只是日志会显式告警 —— 宁可退得糙一点，也不能把打印机卡在暂停态。 */
     wait_printer_need_withdraw_ms(AMS_UNLOAD_READY_TIMEOUT_MS);
+    t_wait_done = esp_timer_get_time();
 
     /* ---------- 步骤一：退料 ----------
      * 把当前通道的料从挤出机/缓冲区收回到料盘。
@@ -1680,6 +1818,8 @@ static bool do_exchange(int printer_channel)
     } else {
         ams_log("  退料：打印机已报挤出机无料，跳过退料步骤");
     }
+
+    t_retract_done = esp_timer_get_time();
 
     /* ---------- 步骤二：进料 + 蠕动 ----------
      * 把新通道的料送到挤出机入口，等到位后蠕动收尾确保咬住。
@@ -1741,8 +1881,42 @@ static bool do_exchange(int printer_channel)
     config_set_filament_current(printer_channel);
     s_diag.exchange_ok++;
     ams_log("送料完成：通道 %s 已装载到挤出机", new_txt);
-    ams_log("换色完成：%s → %s，发送 resume（后续冲刷由切片的 FLUSH 块执行）",
-            cur_txt, new_txt);
+
+    /* ★ 本次换色耗时（现场要求 2026-09-24："在日志中换色完成后增加一个本次
+     *   换色时长"）。
+     *
+     *   为什么还要跟一条分段明细：只给总数的话，38 秒到底是"等切刀等掉了"
+     *   还是"我们自己的进度慢"，光看总数分不出来 —— 而这两件事的处置完全
+     *   相反（前者要找打印机/切片侧，后者要调板子的参数）。
+     *   口径（与 run7 的板子侧统计一致）：
+     *     等切刀 = 开始换色 → 打印机报 ams_status=260（切刀 + 吐料 + 移床）
+     *     退料   = 260 → 料收回料盘
+     *     进料   = 退料完 → 料送到挤出机并蠕动收尾
+     *   ⚠️ 不包含后面"发送 resume 之后"的冲刷 / 校准 —— 那段是切片宏在跑，
+     *      不在本函数的计时范围里。 */
+    {
+        int64_t t_end = esp_timer_get_time();
+        /* ⚠️ 这一行**必须短**：超出 AMS_LOG_LINE_MAX 会被静默截断，而截掉的
+         *   恰好是后面那半句（"本次耗时"就在后半段）。
+         *   所以这里只给通道号，颜色在 上面的 "正在退出当前通道 …" /
+         *   "开始送入通道 …" 两行里已经有了。
+         *   通道号不能用 config_get_filament_current() —— 上一行
+         *   config_set_filament_current() 刚把它改成新通道，那样会打印成
+         *   "通道3→通道3"。源通道是 current。 */
+        char from_lbl[16];
+        if (current > 0) {
+            snprintf(from_lbl, sizeof(from_lbl), "通道%d", current);
+        } else {
+            snprintf(from_lbl, sizeof(from_lbl), "未知");
+        }
+        ams_log("换色完成 %s→通道%d 本次耗时 %.1f 秒（已发 resume）",
+                from_lbl, printer_channel,
+                (double)(t_end - t_all) / 1000000.0);
+        ams_log("  明细：等切刀 %ums 退料 %ums 进料 %ums",
+                (unsigned)((t_wait_done - t_all) / 1000),
+                (unsigned)((t_retract_done - t_wait_done) / 1000),
+                (unsigned)((t_end - t_retract_done) / 1000));
+    }
     set_state(AMS_STATE_IDLE, -1);
 
     /* resume 让打印机的 G-code 从 M73 P101 之后继续执行：
@@ -1791,12 +1965,7 @@ static int auto_match_channel(int target_color)
     int best_mat = -1;
     uint32_t dist = config_color_match((uint32_t)target_color, &best_mat);
     if (best_mat < 0) {
-        ams_log_warn("自动匹配失败：所有通道都未配置颜色，退回按通道号换料");
-        for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
-            uint32_t c = config_get_color(i);
-            ams_log("  通道%d 颜色: %s", i + 1,
-                    c ? "" : "未配置");
-        }
+        ams_log_warn("自动匹配失败：4 个通道都没配颜色，退回按通道号换料");
         return -1;
     }
     int printer_ch = config_printer_channel_of(best_mat);
@@ -1804,13 +1973,11 @@ static int auto_match_channel(int target_color)
         ams_log_warn("自动匹配到料盘位 %d，但未映射到打印机通道", best_mat + 1);
         return -1;
     }
-    /* 打印各通道颜色，方便排查 */
-    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
-        uint32_t c = config_get_color(i);
-        ams_log("  通道%d 颜色: %s 0x%.6lX", i + 1,
-                (i == best_mat) ? "(命中)" : "", (unsigned long)c);
-    }
-    ams_log("自动匹配：目标 0x%.6X → 通道%d（色差%lu）",
+    /* ★ 一行说完就够了（现场要求"只显示主要信息"）。
+     *   原来这里跟一段"通道N 颜色: 0x……"的 4 行循环 —— 那是排查期的草稿：
+     *   颜色在网页「通道设置」一眼就能看到，日志里刷 4 行只会把真正的事件
+     *   （换色开始 / 退料 / 送料）冲散。 */
+    ams_log("自动匹配：目标 0x%.6X → 通道%d（色差 %lu）",
             (unsigned int)(target_color & 0xFFFFFF),
             printer_ch, (unsigned long)dist);
     return printer_ch;
@@ -2180,33 +2347,38 @@ static void handle_report(const bambu_report_t *r)
         ams_state_t prev_state = ams_get_state();
         set_state(AMS_STATE_ASSIST, assist_mat);
 
-        /* ★ 一条日志把"为什么送 / 占空比 / 时长 / 周期"都带上。
-         *   真机教训：23% 这种低占空比在这个机构上**完全带不动电机**
+        /* ★ 一条日志把"为什么送 / 哪一路 / 占空比 / 时长 / 周期"都带上。
+         *   真机教训：60% 这种低占空比在这个机构上**带不动电机**
          *   （20kHz 堵转几乎没有可听噪声），所以实际占空比必须印出来；
          *   周期也印出来，否则现场没法判断"到底会不会再来一次"。
          *
-         * ★ 但同一条只记一次（现场要求"只显示变化的信息"）：校准阶段每
-         *   2 秒一次、打印中每 5 秒一次，一晚上能刷上百行完全一样的内容，
-         *   把阶段变化 / 退料 / 换料那几条真正有用的冲没了。
-         *   参数或阶段一变 key 就变，会自动打新的一行；稳定时每 60 秒
-         *   补一行"继续中"当心跳，保证能看出它一直在动。 */
+         * ★ 降噪（现场要求 2026-09-24 "只在状态变化时显示"）：同一条**只打
+         *   一次**，参数或阶段变了才打新的（见 log_changed）。
+         *   校准阶段每 2 秒、打印中每 5 秒各一次，原来一小时能刷上百行完全
+         *   一样的内容，把阶段变化 / 退料 / 换料那几条真正有用的冲没了。
+         *   10 分钟给一次"仍在继续"的慢心跳，免得多小时的打印里看着像卡死。
+         *
+         * ★ 行必须短：AMS_LOG_LINE_MAX 之外会被静默截断。所以这里用
+         *   "通道2=橙色"这种紧凑写法，不写整句。 */
         char key[112];
         snprintf(key, sizeof(key), "assist|%s|%d|%u|%u|%u|%d",
                  assist_why, config_get_filament_current(),
                  (unsigned)assist_pct, (unsigned)assist_ms,
                  (unsigned)assist_period_ms, hold ? 1 : 0);
-        int skipped = log_throttle(key, 60000);
-        if (skipped == 0) {
-            ams_log("辅助送料（%s）：通道%d @%u%% × %ums（每 %ums 一次）%s",
-                    assist_why, config_get_filament_current(),
+        int ast = log_changed(LOGSLOT_ASSIST, 600000u, key);
+        if (ast == 0) {
+            char acol[32];
+            color_text_of_channel(config_get_filament_current(),
+                                  acol, sizeof(acol));
+            ams_log("辅助送料 %s：通道%d=%s @%u%% × %ums 每%ums%s",
+                    assist_why, config_get_filament_current(), acol,
                     (unsigned)assist_pct, (unsigned)assist_ms,
                     (unsigned)assist_period_ms,
-                    hold ? "，阶段内保持离合吸合（只脉冲电机）" : "");
-        } else if (skipped > 0) {
-            ams_log("辅助送料（%s）：通道%d 继续中（@%u%% × %ums，"
-                    "已省略 %d 条相同日志）",
-                    assist_why, config_get_filament_current(),
-                    (unsigned)assist_pct, (unsigned)assist_ms, skipped);
+                    hold ? " 保持吸合" : "");
+        } else if (ast > 0) {
+            ams_log("辅助送料 %s：通道%d 仍在继续（状态无变化，"
+                    "每 10 分钟提示一次）",
+                    assist_why, config_get_filament_current());
         }
 
         /* ★★ 这里是修"日志在打、电机却没动"的关键 ★★
@@ -2237,23 +2409,34 @@ static void handle_report(const bambu_report_t *r)
         const drive_receipt_t *rc = ams_last_drive_receipt();
 
         if (!ok || !rc->clutch_ok) {
-            ams_log_err("辅助送料未执行：通道%d 电磁离合没吸合上"
-                        "（原因见上一条错误）—— 本次**没有**驱动电机。"
-                        "这与占空比无关，是吸合失败",
+            ams_log_err("辅助送料未执行 通道%d 离合没吸合（见上一条错误）"
+                        "→ 本次没有驱动电机，与占空比无关",
                         config_get_filament_current());
-        } else if (rc->skipped) {
-            ams_log_warn("辅助送料被跳过：电机已在同方向同速度运行，"
-                         "本次没有重新驱动");
         } else {
-            ams_log("  辅助送料回执：离合已吸合%s —— 通道%d PWM duty=%u/255"
-                    "（%u%%），通电 %ums；**硬件回读** IN1=%u/255(%d) "
-                    "IN2=%u/255(%d)（手动点动是全速 duty=255，可对比）",
-                    hold ? "（保持中，收尾不释放）" : "",
-                    config_get_filament_current(),
-                    (unsigned)rc->duty_raw, (unsigned)rc->speed_pct,
-                    (unsigned)rc->ran_ms,
-                    (unsigned)rc->duty_in1, (int)rc->level_in1,
-                    (unsigned)rc->duty_in2, (int)rc->level_in2);
+            /* ★ 回执行同样"状态变化才打"（现场要求见 log_changed 的说明）：
+             *   占空比 / 时长不变的话，每脉冲一次都印一遍完全相同的数字
+             *   没有任何信息量 —— 原来校准阶段这一条就刷了 90 多遍。
+             *   ttl=0 = 纯变化触发；一次换色结束会清槽（do_exchange 开头），
+             *   所以下一轮换色照样能看见它，不会"第一次之后就再也不打"。 */
+            char rkey[96];
+            snprintf(rkey, sizeof(rkey), "assistrc|%d|%u|%u|%lu|%d|%d",
+                     rc->skipped ? 1 : 0, (unsigned)rc->speed_pct,
+                     (unsigned)rc->duty_raw, (unsigned long)rc->ran_ms,
+                     (int)rc->level_in1, (int)rc->level_in2);
+            if (log_changed(LOGSLOT_ASSIST_RC, 0, rkey) >= 0) {
+                if (rc->skipped) {
+                    ams_log_warn("辅助送料被跳过：电机已在同方向同速度运行");
+                } else {
+                    ams_log("辅助送料回执 通道%d duty=%u/255(%u%%) %lums%s"
+                            " 回读 IN1=%u/255(%d) IN2=%u/255(%d)",
+                            config_get_filament_current(),
+                            (unsigned)rc->duty_raw, (unsigned)rc->speed_pct,
+                            (unsigned long)rc->ran_ms,
+                            hold ? " 保持" : "",
+                            (unsigned)rc->duty_in1, (int)rc->level_in1,
+                            (unsigned)rc->duty_in2, (int)rc->level_in2);
+                }
+            }
         }
 
         /* 状态还回去（通常是"空闲"）—— 别让"辅助送料中"卡住状态机。
@@ -2301,18 +2484,21 @@ static void handle_report(const bambu_report_t *r)
             if (pushed_s < AMS_STAGE24_PUSH_MAX_S) {
                 char key[64];
                 snprintf(key, sizeof(key), "stage24push|%d", mat);
-                if (log_throttle(key, 10000) >= 0) {
-                    ams_log("载入打印材料：挤出机无料 → 送入通道 %d "
-                            "（已送 %us，最多 %us）",
-                            tgt, (unsigned)pushed_s,
+                /* 只在开始推时打一条 + 每 10 分钟慢心跳：这个动作最长持续
+                 * 45 秒、每 2 秒一轮，逐轮记会把日志刷满
+                 * （现场要求见 log_changed 的说明）。 */
+                if (log_changed(LOGSLOT_STAGE24, 600000u, key) >= 0) {
+                    char tcol[32];
+                    color_text_of_channel(tgt, tcol, sizeof(tcol));
+                    ams_log("载入打印材料 通道%d=%s 无料→推料（已送 %us/%us）",
+                            tgt, tcol, (unsigned)pushed_s,
                             (unsigned)AMS_STAGE24_PUSH_MAX_S);
                 }
                 (void)drive_channel_speed(mat, 1, AMS_STAGE24_PUSH_PCT,
                                           AMS_LOAD_SEGMENT_MS, false, NULL);
             } else if (pushed_s < AMS_STAGE24_PUSH_MAX_S + 1) {
-                ams_log_warn("载入打印材料：已连续送料 %us 仍没等到「耗材已到"
-                             "挤出机」，先停下（避免把料盘喂空）—— "
-                             "请检查料路是否卡住",
+                ams_log_warn("载入打印材料 连续送料 %us 仍没等到挤出机到位，"
+                             "先停下（料路可能卡住）",
                              (unsigned)AMS_STAGE24_PUSH_MAX_S);
             }
         }
@@ -2332,16 +2518,61 @@ static void handle_report(const bambu_report_t *r)
      * 默认：报文里的通道号（0 起，+1 转成 1 起） */
     int printer_ch = r->filament_next + 1;
 
-    /* 打印触发原因（让用户知道是哪条通路触发的） */
+    /* ======================================================================
+     * ★★ 先挡重复上报，**再**打日志 ★★
+     * ======================================================================
+     * 现场要求（2026-09-24）原话："连续的报文只显示一条，只有在状态变化时
+     * 显示。" 而打印机在等着换料的每一秒都会重发**同一条**请求。
+     *
+     * 原来这三段日志（收到打印机指令 / 颜色匹配 / 报文未携带颜色）写在两道
+     * 守卫**之前**，于是同一个请求被原样打了 N 遍 —— 现场贴的日志里
+     * 73:01.989 和 73:03.043 就是同一个请求的两份复印件，中间只差一秒。
+     *
+     * 现在把两道守卫提到最前面：
+     *   ① s_change_active —— 这个请求已经在处理了；
+     *   ② 触发指纹去重   —— 换料完成后打印机还会用旧状态继续上报，见下面注释。
+     * 只有**真的要走后续流程**的那一拍才会往下走，日志自然就一条。
+     */
+    if (s_change_active) {
+        return;
+    }
+
+    /* ---- 触发指纹去重（见 s_change_fp 的说明）----
+     * 换料完成后打印机还会用旧状态继续上报 change_needed=true，
+     * 指纹没变就当它是残留上报，直接忽略 —— 否则同一个颜色会被换两次。
+     * 指纹变了（切片真的要求换到别的通道）立刻放行，连续换色不受影响。
+     * ⚠️ 这里用**原始通道号**算指纹（颜色匹配还没做），必须和下面
+     *    s_pending_fp = fp 处用的是同一个口径，否则两边对不上。 */
+    int fp = 0;
     if (r->bed_channel > 0) {
-        ams_log("收到打印机指令：热床信道 → 通道 %d"
-                "（切片写了 M140 S{next_extruder+1}）", r->bed_channel);
+        fp = 1000 + r->bed_channel;
     } else if (r->mc_percent == 101) {
-        ams_log("收到打印机指令：M73 P101 换料请求（通道 %d）", r->filament_next + 1);
+        fp = 2000 + printer_ch;
     } else if (r->ams_stage == 1) {
-        ams_log("收到打印机指令：M400 U1 等待 AMS 换料（通道 %d）", r->filament_next + 1);
-    } else {
-        ams_log("收到打印机指令：换料请求（通道 %d，触发原因未知）", r->filament_next + 1);
+        fp = 3000 + printer_ch;
+    }
+    if (fp != 0 && fp == s_change_fp &&
+        (esp_timer_get_time() - s_change_fp_us) <
+            (int64_t)AMS_EXCHANGE_RESIDUAL_MS * 1000) {
+        return;
+    }
+
+    /* ===================== 到这里才是一条**新的**换料请求 ===================== */
+
+    /* 打印触发原因（让用户知道是哪条通路触发的），并带上这个通道的颜色 —— 
+     * 现场要求："通道号就有颜色，把这个颜色在日志中显示出来"。 */
+    {
+        char ch_buf[64];
+        ams_channel_text(r->filament_next + 1, ch_buf, sizeof(ch_buf));
+        if (r->bed_channel > 0) {
+            ams_log("收到指令：热床信道 → %s（切片写的 M140 S{next+1}）", ch_buf);
+        } else if (r->mc_percent == 101) {
+            ams_log("收到指令：M73 P101 换料请求 → %s", ch_buf);
+        } else if (r->ams_stage == 1) {
+            ams_log("收到指令：M400 U1 等待换料 → %s", ch_buf);
+        } else {
+            ams_log("收到指令：换料请求 → %s（触发原因未知）", ch_buf);
+        }
     }
 
     /* ★ 自动颜色匹配：如果报文带目标颜色且本机配置了颜色，优先用匹配结果 */
@@ -2357,7 +2588,12 @@ static void handle_report(const bambu_report_t *r)
             ams_log("  自动匹配失败，退回原始通道 %d", printer_ch);
         }
     } else {
-        ams_log("  报文未携带颜色信息，按通道号换料");
+        /* ★ 现场原话："实际是通道号就有颜色，把这个颜色在日志中显示出来。"
+         *   报文确实不带颜色，但本机在网页上配过 —— 直接把配的那份印出来，
+         *   看日志的人不用再回头翻网页。 */
+        char col[40];
+        color_text_of_channel(printer_ch, col, sizeof(col));
+        ams_log("  报文未携带颜色 → 按通道号换料：通道%d=%s", printer_ch, col);
     }
 
     if (printer_ch < 1 || printer_ch > BOARD_CHANNEL_COUNT) {
@@ -2368,29 +2604,6 @@ static void handle_report(const bambu_report_t *r)
                          printer_ch, BOARD_CHANNEL_COUNT);
             s_change_active = true;
         }
-        return;
-    }
-
-    /* 已经在处理这个请求了（打印机每秒都会重复上报）→ 不重复排队 */
-    if (s_change_active) {
-        return;
-    }
-
-    /* ---- 触发指纹去重（见 s_change_fp 的说明）----
-     * 换料完成后打印机还会用旧状态继续上报 change_needed=true，
-     * 指纹没变就当它是残留上报，直接忽略 —— 否则同一个颜色会被换两次。
-     * 指纹变了（切片真的要求换到别的通道）立刻放行，连续换色不受影响。 */
-    int fp = 0;
-    if (r->bed_channel > 0) {
-        fp = 1000 + r->bed_channel;
-    } else if (r->mc_percent == 101) {
-        fp = 2000 + printer_ch;
-    } else if (r->ams_stage == 1) {
-        fp = 3000 + printer_ch;
-    }
-    if (fp != 0 && fp == s_change_fp &&
-        (esp_timer_get_time() - s_change_fp_us) <
-            (int64_t)AMS_EXCHANGE_RESIDUAL_MS * 1000) {
         return;
     }
 
@@ -2466,8 +2679,10 @@ static void handle_report(const bambu_report_t *r)
         bool same    = (cur_ch > 0 && cur_ch == printer_ch);
         bool has_fil = (r->extruder_inplace_hint != 0);
         if (same && has_fil) {
-            ams_log("  同一耗材：目标通道 %d 就是当前通道，且挤出机有料 —— "
-                    "不发切刀、不动电机，直接放行", printer_ch);
+            char scol[32];
+            color_text_of_channel(printer_ch, scol, sizeof(scol));
+            ams_log("  同一耗材：通道%d=%s 就是当前通道且有料 → 不发切刀、不动",
+                    printer_ch, scol);
             /* 归还热床温度在上面 ① 里已经发过了（bed_channel > 0 时发 M190） */
             s_change_active = true;
             s_pending_fp    = fp;

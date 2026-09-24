@@ -36,7 +36,15 @@
         </span>
       </div>
       <span class="alertbar" id="alertbar"></span>
+      <!-- 日志列收起后的入口（只在收起时出现，见 style.css 的 .only-logoff） -->
+      <button class="ghost only-logoff" id="btn_log_show" style="margin-left:auto">显示日志</button>
     </div>
+
+    <!-- =====================================================================
+         body = 中间设置区 + 右侧日志区（桌面三列中的后两列）
+         日志列固定不滚动：滚动条只出现在 .content 里（见 style.css）
+         ===================================================================== -->
+    <div class="body">
 
     <div class="content">
 
@@ -524,17 +532,19 @@
 
     </div><!-- /content -->
 
-    <!-- ===================== 日志 ===================== -->
-    <div class="logbox" id="logbox">
-      <div class="head">
-        <b>设备日志</b>
-        <span class="sp"></span>
-        <span class="dim" id="log_mem"></span>
-        <button id="btn_log_clear">清屏</button>
-        <button id="btn_log_toggle">折叠</button>
+      <!-- ===================== 日志（右列，固定不滚动） ===================== -->
+      <div class="logbox" id="logbox">
+        <div class="head">
+          <b>设备日志</b>
+          <span class="sp"></span>
+          <span class="dim" id="log_mem"></span>
+          <button id="btn_log_clear">清屏</button>
+          <button id="btn_log_toggle">收起</button>
+        </div>
+        <pre class="logpre" id="log_lines">等待日志…</pre>
       </div>
-      <pre class="logpre" id="log_lines">等待日志…</pre>
-    </div>
+
+    </div><!-- /body -->
 
   </div><!-- /main -->
 </div><!-- /wrap -->

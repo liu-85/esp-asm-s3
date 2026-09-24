@@ -77,13 +77,28 @@ html, body {
 }
 
 /* ==========================================================================
-   布局
-   ========================================================================== */
-.wrap { display: flex; min-height: 100vh; }
+   布局 —— 桌面三列：菜单 | 设置 | 日志
+   ==========================================================================
+ * ★ 为什么这么切（现场要求 2026-09-24）：
+ *   "修改为三列，日志固定不滚动，中间设置选项不变，右侧菜单宽度适当调整。"
+ *   （截图里红框标在设置区右侧，所以最终采用：菜单在左、设置在中、日志在右。）
+ *
+ *   .wrap    一行三块，高度锁死 100vh，**整页不再滚动**
+ *   .side    菜单（左）
+ *   .main    = .topbar（状态条）+ .body
+ *   .body    = .content（设置，自己滚）+ .logbox（日志，固定）
+ *
+ *   关键点：100vh 容器不滚，滚动收敛到 .content 这**一个**元素上 ——
+ *   这样翻设置时日志永远杵在原处，不会被滚出视野。
+ *   窄屏（<=1100px）退回"日志在底部"的老样子，见文件末尾的 @media。
+ * ========================================================================== */
+.wrap { display: flex; height: 100vh; overflow: hidden; }
 
 .side {
-    width: 208px;
-    flex: 0 0 208px;
+    /* 208 → 190：三列之后横向空间更紧，菜单文字都不长，缩一点把宽度
+     * 让给设置区和日志区（现场说的"右侧菜单宽度适当调整"）。 */
+    width: 190px;
+    flex: 0 0 190px;
     background: var(--panel);
     border-right: 1px solid var(--border);
     padding: 14px 10px;
@@ -127,7 +142,18 @@ html, body {
     color: var(--text-faint);
 }
 
-.main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.main {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+/* 设置区 + 日志区。min-height:0 是必须的 —— 否则 flex 子项按内容撑高，
+ * 里面的 overflow-y:auto 永远不生效（滚动条不出现，内容被裁掉）。 */
+.body { flex: 1 1 auto; display: flex; min-height: 0; }
 
 .topbar {
     position: sticky;
@@ -164,7 +190,15 @@ html, body {
 .alertbar { display: none; margin-left: auto; font-size: 13px; color: var(--warn); }
 .alertbar.show { display: inline; }
 
-.content { padding: 14px; flex: 1 1 auto; }
+/* ★ 唯一会滚的元素（桌面）。
+ *   padding 里留一点右边距，滚动条就不会贴着卡片。 */
+.content {
+    padding: 14px;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
 .page { display: none; }
 .page.on { display: block; }
 
@@ -261,6 +295,40 @@ button.danger {
 .tip.err  { border-left-color: var(--err);  background: var(--err-dim);  color: var(--text); }
 .tip.ok   { border-left-color: var(--ok);   background: var(--ok-dim);   color: var(--text); }
 
+/* ---- 说明块：可折叠，默认折叠 ----
+ * ★ 现场要求（2026-09-24）："将说明类的多行的增加可折叠选项，默认折叠，
+ *   需要查看时手动打开。" —— 三列之后设置区只有原来一半多宽，满屏的说明
+ *   文字会把真正的设置项挤到看不见的地方。
+ *
+ * 结构不是手写的，是 app.js 的 collapseTips() 在现场改写的：
+ *     <div class="tip">…</div>
+ *  →  <details class="tip"><summary>说明</summary><div class="tipin">…</div></details>
+ * 这样静态的 19 处和 JS 动态生成的那些都能覆盖，不用手改一大片 HTML，
+ * 以后新加的说明块也自动获得折叠能力。 */
+details.tip > summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: inherit;
+    user-select: none;
+}
+details.tip > summary::-webkit-details-marker { display: none; }
+details.tip > summary::before {
+    content: '▸';
+    color: var(--text-faint);
+    font-size: 11px;
+    line-height: 1;
+    transition: transform .15s;
+}
+details.tip[open] > summary::before { transform: rotate(90deg); }
+details.tip[open] > summary { margin-bottom: 7px; color: var(--text); }
+.tipin { color: var(--text-dim); }
+.tip.warn .tipin,
+.tip.err  .tipin,
+.tip.ok   .tipin { color: var(--text); }
+
 .hr { height: 1px; background: var(--border); margin: 12px 0; }
 
 /* ==========================================================================
@@ -341,17 +409,30 @@ button.danger {
 .acc-row .cur { font-size: 11px; color: var(--ok); }
 
 /* ==========================================================================
-   日志面板
-   ========================================================================== */
+   日志面板 —— 桌面下是**右侧固定一列**
+   ==========================================================================
+ * 它不是浮在内容上的层，而是 .body 里的第二个 flex 子项：
+ *   宽度  clamp(300px, 30vw, 460px)  —— 窄屏给下限、宽屏给上限，
+ *                                       中间随窗口伸缩（现场要的"调整宽度"）
+ *   高度  撑满 .body（= 撑满窗口减掉顶栏）
+ *   滚动  只在 .logpre 内部发生 → 这就是"固定不滚动"
+ * 折叠（.closed）是把**整列**收掉，顶栏会出现「显示日志」把它叫回来
+ * （见文件下方 .only-logoff）。
+ * ========================================================================== */
 .logbox {
-    margin: 0 14px 14px;
+    flex: 0 0 clamp(300px, 30vw, 460px);
+    width: clamp(300px, 30vw, 460px);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    margin: 0;
     background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow);
+    border-left: 1px solid var(--border);
     overflow: hidden;
 }
+.logbox.closed { display: none; }
 .logbox .head {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -362,11 +443,17 @@ button.danger {
 .logbox .head b { font-size: 13px; }
 .logbox .head .sp { margin-left: auto; }
 .logbox .head button { padding: 4px 10px; font-size: 12px; }
-.logbox.closed .logpre { display: none; }
+
+/* 「显示日志」按钮：只在日志列被收起时出现，否则用户没有入口把它叫回来 */
+.only-logoff { display: none; }
+body.logoff .only-logoff { display: inline-block; }
+
 .logpre {
+    /* flex:1 + overflow-y:auto = 日志自己滚，列本身不动 */
+    flex: 1 1 auto;
+    min-height: 0;
     margin: 0;
     padding: 10px 11px;
-    max-height: 240px;
     overflow-y: auto;
     font-family: var(--mono);
     font-size: 12px;
@@ -440,6 +527,29 @@ button.danger {
     width: 0;
     background: var(--brand);
     transition: width .12s linear;
+}
+
+/* ==========================================================================
+   中屏 / 窄屏：退回"设置在上、日志在下"的两段式
+   ==========================================================================
+ * 三列在 1100px 以下会把设置区挤成一条，还不如让日志回到页面底部 ——
+ * 这时用户多半是手机 / 小平板，一屏本来也装不下两块东西。
+ * ★ 必须把 .wrap / .main 的 100vh 锁死解开：外层 overflow:hidden 的话，
+ *   页面根本滚不到底部的日志，等于日志"消失"了。 */
+@media (max-width: 1100px) {
+    .wrap { display: block; height: auto; min-height: 100vh; overflow: visible; }
+    .main { height: auto; overflow: visible; }
+    .body { display: block; }
+    .content { overflow: visible; }
+    .logbox {
+        flex: none;
+        width: auto;
+        margin: 0 14px 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+    }
+    .logpre { flex: none; max-height: 45vh; }
 }
 
 /* ==========================================================================

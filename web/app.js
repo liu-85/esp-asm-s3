@@ -186,6 +186,70 @@
         el.className = 'alertbar' + (msg ? ' show' : '');
     }
 
+    /* =======================================================================
+       说明块折叠（默认折叠）
+       =======================================================================
+     * ★ 现场要求（2026-09-24）："将说明类的多行的增加可折叠选项，默认折叠，
+     *   需要查看时手动打开。" —— 改成三列之后设置区只有原来一半多宽，
+     *   满屏的说明文字会把真正的设置项挤出视野。
+     *
+     * 做法是**运行时改写**，不是手改 HTML：把每个
+     *     <div class="tip">…</div>
+     * 换成
+     *     <details class="tip"><summary>说明</summary><div class="tipin">…</div></details>
+     * 好处：19 处静态说明一次搞定，JS 动态生成的也同样吃得到，
+     * 以后再加说明块也不用记得"手动包一层 details"。
+     *
+     * ⚠️ 两个必须守住的点：
+     *   ① 空说明不显示 —— 有些 tip 是留给 JS 填的占位（status_tip），
+     *      没内容时留个空灰条很丑；
+     *   ② 已折叠的不重复包 —— details 里再套 details 会把摘要吃掉。
+     *      可 JS 覆写 innerHTML 会破坏结构，所以写入用 tipSet()，
+     *      它写进 .tipin，不动 summary。 */
+    var TIP_SUMMARY      = '说明（点开看）';
+    var TIP_SUMMARY_WARN = '注意事项（点开看）';
+
+    function collapseTips(root) {
+        var scopes = root ? [root] : [document];
+        var i, j;
+        for (i = 0; i < scopes.length; i++) {
+            var tips = scopes[i].querySelectorAll('div.tip');
+            for (j = 0; j < tips.length; j++) {
+                var d = tips[j];
+                if (!d.parentNode) { continue; }
+                if (d.textContent.replace(/\s+/g, '') === '') {
+                    d.style.display = 'none';   /* 占位用的空说明，先藏起来 */
+                    continue;
+                }
+                var det = document.createElement('details');
+                det.className = d.className;
+                var sum = document.createElement('summary');
+                sum.textContent = (d.className.indexOf('warn') >= 0)
+                    ? TIP_SUMMARY_WARN : TIP_SUMMARY;
+                var inner = document.createElement('div');
+                inner.className = 'tipin';
+                while (d.firstChild) { inner.appendChild(d.firstChild); }
+                det.appendChild(sum);
+                det.appendChild(inner);
+                if (d.id) { det.id = d.id; }   /* 保留 id：JS 还要按它找 */
+                d.parentNode.replaceChild(det, d);
+            }
+        }
+    }
+
+    /** 往说明块里写内容 —— 折叠后必须写进 .tipin，直接写 innerHTML 会把
+     *  summary 一起冲掉（那个块就再也展不开了）。 */
+    function tipSet(el, html) {
+        if (!el) { return; }
+        var box = el.querySelector ? el.querySelector('.tipin') : null;
+        var tgt = box || el;
+        /* /status 每 2 秒来一次，内容没变就别重写 —— 重写会清掉用户在
+         * 说明块里的选区，还会让浏览器白做一次排版 */
+        if (tgt.innerHTML === html) { return; }
+        tgt.innerHTML = html;
+        el.style.display = '';
+    }
+
     function applyStatus(d) {
         d = d || {};
         var wifiOn = !!d.wifi_isconnected;
@@ -332,16 +396,17 @@
         var board = d.board || {};
         if (board.name) {
             $('brand_name').textContent = board.name;
-            /* OTA 提示文案按板型动态显示正确的文件名 */
-            var tip = $('ota_tip');
-            if (tip) {
-                var chip = board.name.indexOf('C3') >= 0 ? 'c3' : 's3';
-                tip.innerHTML = '要传的是 <code>idf.py build</code> 出来的 ' +
-                    '<code>esp-ams-' + chip + '.bin</code>' +
-                    '（或 <code>build/esp-ams-' + chip + '.bin</code>）。' +
-                    '传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，' +
-                    '不是就直接中止，分区一个字节都不动。';
-            }
+            /* OTA 提示文案按板型动态显示正确的文件名。
+             * ★ 必须走 tipSet()：这段说明已经被 collapseTips() 包成
+             *   <details><summary>…</summary><div class="tipin"> 了，
+             *   直接 el.innerHTML= 会把 summary 一起冲掉 → 以后再也展不开。 */
+            var chip = board.name.indexOf('C3') >= 0 ? 'c3' : 's3';
+            tipSet($('ota_tip'),
+                '要传的是 <code>idf.py build</code> 出来的 ' +
+                '<code>esp-ams-' + chip + '.bin</code>' +
+                '（或 <code>build/esp-ams-' + chip + '.bin</code>）。' +
+                '传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，' +
+                '不是就直接中止，分区一个字节都不动。');
         }
         if (board.spare_pins && board.spare_pins.length) {
             var sp = board.spare_pins.map(function (p) {
@@ -1379,13 +1444,27 @@
         }, true);
     }
 
-    function toggleLog() {
+    /* 日志列的显示 / 收起。
+     * 桌面下"收起"= 整列让位给设置区（.logbox.closed → display:none）。
+     * ★ 收起之后顶栏会出现「显示日志」按钮（body.logoff 控制），
+     *   否则收起就没有任何入口能再打开它 —— 按钮自己被一起藏起来了。 */
+    function setLogVisible(on) {
         var box = $('logbox');
-        var closed = !box.classList.contains('closed');
-        box.className = 'logbox' + (closed ? ' closed' : '');
-        $('btn_log_toggle').textContent = closed ? '展开' : '折叠';
-        store(LOG_KEY, closed ? '1' : '0');
-        if (!closed) pollLog();
+        if (!box) { return; }
+        box.className = 'logbox' + (on ? '' : ' closed');
+        if (on) {
+            document.body.classList.remove('logoff');
+        } else {
+            document.body.classList.add('logoff');
+        }
+        var t = $('btn_log_toggle');
+        if (t) { t.textContent = on ? '收起' : '展开'; }
+        store(LOG_KEY, on ? '0' : '1');
+        if (on) { pollLog(); }
+    }
+
+    function toggleLog() {
+        setLogVisible($('logbox').classList.contains('closed'));
     }
 
     function clearLogView() {
@@ -1468,6 +1547,11 @@
     function boot() {
         buildMenu();
 
+        /* 说明块全部折叠成一行（现场要求：多行说明默认折叠，要看再点开）。
+         * 放在最前面：后面的 applyStatus 会往 ota_tip 里写文案，
+         * 那时它已经是 details 了，必须走 tipSet() 写进 .tipin。 */
+        collapseTips();
+
         /* ★ 先用默认值把界面画出来，不等接口。
            接口慢的时候整页也不会停在"加载中…"。 */
         renderAccess([1, 2, 3, 4], DEFAULT_COLORS, 0);
@@ -1479,10 +1563,8 @@
         });
         updateSensors({ sensors: { enabled: 15, extruder: 0, ch: [] } });
 
-        if (store(LOG_KEY) === '1') {
-            $('logbox').className = 'logbox closed';
-            $('btn_log_toggle').textContent = '展开';
-        }
+        /* 日志列默认显示；上次点过"收起"的话恢复成收起状态 */
+        setLogVisible(store(LOG_KEY) !== '1');
 
         $('btn_ap').onclick = toggleAp;
         $('btn_stop').onclick = emergencyStop;
@@ -1507,6 +1589,8 @@
         $('btn_fl_copy').onclick = copyFlushGcode;
         $('btn_log_toggle').onclick = toggleLog;
         $('btn_log_clear').onclick = clearLogView;
+        /* 顶栏的「显示日志」：日志列收起后唯一的回程入口 */
+        $('btn_log_show').onclick = toggleLog;
         $('menu_btn').onclick = function () { toggleMenu(); };
         $('scrim').onclick = function () { toggleMenu(false); };
 
