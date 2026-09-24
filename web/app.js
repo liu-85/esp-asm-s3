@@ -415,6 +415,16 @@
             box.innerHTML += '<div class="kv" style="display:block"><span>剩余可用 IO</span>' +
                 '<div class="badges">' + sp + '</div></div>';
         }
+        /* 完整接线表：以前它只出现在开机日志里，而日志里那段每次开机都
+         * 一模一样、还把换料日志挤出 48 行的环形缓冲，所以在固件侧精简掉了。
+         * 这里补回来 —— 接好线上电最需要的就是"我接的到底对不对"。
+         * 默认折叠：天天看的东西不该占屏幕。 */
+        if (board.pins_text) {
+            box.innerHTML += '<details class="tip" style="margin-top:8px">' +
+                '<summary>接线表 / 业务配置（点开看）</summary>' +
+                '<div class="tipin"><pre>' + esc(board.pins_text) + '</pre></div>' +
+                '</details>';
+        }
 
         /* ---- 通道设置 ---- */
         var al = d.access_list || [], cl = d.color_list || [];

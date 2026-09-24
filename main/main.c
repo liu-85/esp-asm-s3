@@ -97,27 +97,40 @@
  * 一、启动横幅
  * ========================================================================== */
 
+/**
+ * 把一整段多行文本打到**串口**（不进网页那圈 48 行的日志缓冲）。
+ *
+ * ★★ 为什么要区分"串口"和"网页日志"（2026-09-24 现场要求）★★
+ *   现场原话：「启动后间隔一直在发自检的日志，自检一次就可以了，
+ *   把日志再精简一下。」
+ *
+ *   根因是**环形缓冲只有 48 行**，而开机一次就要往里塞约 30 行
+ *   （横幅 10 行 + 接线表 8 行 + 业务配置 12 行）。于是网页上一点开，
+ *   满屏全是"每次开机都一模一样"的自检信息，真正有用的换料日志
+ *   （阶段 / 收到指令 / 退料 / 进料 / 换色完成）全被顶出去了。
+ *
+ *   这些东西的价值是"**接好线第一次上电时看一遍**"，不是"每次都看"。
+ *   所以：完整内容走串口（`idf.py monitor` 或任意串口工具都看得到），
+ *   网页上只留一行摘要。业务配置本来网页「设置」面板里全都有，
+ *   接线表也可以在网页「上电诊断」里展开看（web_set_pins_text）。
+ */
+static void serial_block(const char *text)
+{
+    if (!text || !text[0]) {
+        return;
+    }
+    fputs(text, stdout);
+    size_t n = strlen(text);
+    if (text[n - 1] != '\n') {
+        fputc('\n', stdout);
+    }
+    fflush(stdout);
+}
+
 static void print_banner(void)
 {
     const esp_app_desc_t *app = esp_app_get_description();
     const esp_partition_t *part = esp_ota_get_running_partition();
-
-    ams_log("============================================================");
-#if defined(CONFIG_IDF_TARGET_ESP32C3)
-    ams_log("  ESP-AMS-C3  ——  拓竹打印机自动换料系统（ESP-IDF 版）");
-    ams_log("  共享电机 + 2 路电磁离合 | 完全依赖 MQTT 事件 + 超时模式");
-#else
-    ams_log("  ESP-AMS-S3  ——  拓竹打印机自动换料系统（ESP-IDF 版）");
-    ams_log("  共享电机 + 4 路电磁离合 | 每路 3 个微动");
-#endif
-    ams_log("============================================================");
-    ams_log("  版本    : %s", app ? app->version : "?");
-    ams_log("  编译    : %s %s", app ? app->date : "?", app ? app->time : "?");
-    ams_log("  IDF     : %s", app ? app->idf_ver : "?");
-    ams_log("  运行分区: %s", part ? part->label : "?");
-    /* ★ 芯片信息必须用 esp_chip_info() 取，不存在 esp_get_revision() 这个 API。
-     *   chip.revision 的格式随 IDF 版本变过：v5.0 起是 100*大版本 + 小版本，
-     *   v4.x 只有大版本号。这里按版本分支处理，免得打出 "rev0.1" 这种怪值。 */
     esp_chip_info_t chip = {0};
     esp_chip_info(&chip);
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
@@ -127,12 +140,35 @@ static void print_banner(void)
     unsigned chip_major = (unsigned)chip.revision;
     unsigned chip_minor = 0;
 #endif
-    ams_log("  芯片    : %s rev%u.%u，%d 核 @ %dMHz",
-            CONFIG_IDF_TARGET, chip_major, chip_minor, chip.cores,
-            CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
-    ams_log("  空闲内存: %u 字节", (unsigned)esp_get_free_heap_size());
-    ams_log("  复位原因: %d", (int)esp_reset_reason());
-    ams_log("============================================================");
+
+    /* ===== 完整横幅：只给串口 ===== */
+    printf("============================================================\n");
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+    printf("  ESP-AMS-C3  ——  拓竹打印机自动换料系统（ESP-IDF 版）\n");
+    printf("  共享电机 + 2 路电磁离合 | 完全依赖 MQTT 事件 + 超时模式\n");
+#else
+    printf("  ESP-AMS-S3  ——  拓竹打印机自动换料系统（ESP-IDF 版）\n");
+    printf("  共享电机 + 4 路电磁离合 | 每路 3 个微动\n");
+#endif
+    printf("============================================================\n");
+    printf("  版本    : %s\n", app ? app->version : "?");
+    printf("  编译    : %s %s\n", app ? app->date : "?", app ? app->time : "?");
+    printf("  IDF     : %s\n", app ? app->idf_ver : "?");
+    printf("  运行分区: %s\n", part ? part->label : "?");
+    printf("  芯片    : %s rev%u.%u，%d 核 @ %dMHz\n",
+           CONFIG_IDF_TARGET, chip_major, chip_minor, chip.cores,
+           CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+    printf("  空闲内存: %u 字节\n", (unsigned)esp_get_free_heap_size());
+    printf("  复位原因: %d\n", (int)esp_reset_reason());
+    printf("============================================================\n");
+    fflush(stdout);
+
+    /* ===== 网页日志里只留一行摘要 ===== */
+    ams_log("开机：%s · 分区 %s · 空闲 %uB · 复位原因 %d（详细横幅见串口）",
+            CONFIG_IDF_TARGET,
+            part ? part->label : "?",
+            (unsigned)esp_get_free_heap_size(),
+            (int)esp_reset_reason());
 }
 
 /**
@@ -141,26 +177,31 @@ static void print_banner(void)
  * 这一段是从 MicroPython 版搬过来的，因为它的价值被反复验证过：
  * 用户第一次接完线通电，最需要的不是"启动成功"，而是
  * **"我接的到底对不对、哪只脚接到了哪儿"**。
+ *
+ * ★ 接线表走串口 + 网页「上电诊断」；网页日志里只留一行"自检通过"。
+ *   （原来这一句在 main.c 和 web_server.c 里**各打了一遍**，
+ *     每次开机都能看到两条一模一样的"引脚配置自检通过"。）
  */
 static bool print_wiring_and_check(void)
 {
     char buf[400];   /* C3 的 main 栈只有 4KB，不能放 1400 字节大缓冲 */
     board_pins_describe(buf, sizeof(buf));
-    ams_log("%s", buf);
+    serial_block(buf);
+    web_set_pins_text(buf);      /* 网页「上电诊断」里可展开看 */
 
     char err[160] = {0};
     if (board_pins_validate(err, sizeof(err))) {
-        ams_log("引脚配置自检通过：全部输出脚都在安全引脚上");
+        ams_log("接线自检通过：全部输出脚都在安全引脚上"
+                "（完整接线表见串口，或网页「上电诊断」）");
         return true;
     }
 
-    ams_log_err("========================================================");
-    ams_log_err("引脚配置自检未通过：");
-    ams_log_err("%s", err);
+    /* ★ 自检**未通过**是必须让人看见的：保持进网页日志，且多条一起打。
+     *   这不是噪音，是"电机一直叫 / 反复重启"的根因提示。 */
+    ams_log_err("引脚配置自检未通过：%s", err);
     ams_log_err("请修改 main/board_pins.h 后重新编译。");
     ams_log_err("（Strapping 脚当输出用会导致上电启动模式被改掉，");
     ams_log_err("  典型现象是反复重启、网页打不开、电机一直叫。）");
-    ams_log_err("========================================================");
     /* ★ 只报警不中断：让用户能连上网页、看到这条错误、再决定怎么改。
      *   直接停机反而让人无从下手（MicroPython 版就是这么做的）。 */
     return false;
@@ -237,14 +278,18 @@ void app_main(void)
     /* ---- 2. 配置 ---- */
     config_init();
 
-    /* ---- 3. 横幅 + 接线表 + 引脚自检 ---- */
+    /* ---- 3. 横幅 + 接线表 + 引脚自检 ----
+     * 详细内容走串口，网页日志里只留"开机"一行 + "接线自检"一行。 */
     print_banner();
     print_wiring_and_check();
 
     {
+        /* 业务配置（WiFi 记录 / 打印机 / 通道映射 / 参数）只打串口 ——
+         * 这些网页「设置」面板里全都能看到，塞进 48 行的日志缓冲纯属
+         * 把换料日志挤出去。 */
         char desc[640];
         config_describe(desc, sizeof(desc));
-        ams_log("%s", desc);
+        serial_block(desc);
     }
 
     /* ---- 4. 执行机构（顺序见文件头说明） ---- */

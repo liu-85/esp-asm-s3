@@ -202,6 +202,24 @@ static void pins_selfcheck(void)
     snprintf(s_pins_problem, sizeof(s_pins_problem), "%s", err);
 }
 
+/* --------------------------------------------------------------------------
+ * 接线表：由 main.c 在启动时送进来，网页「上电诊断」里可展开查看。
+ *
+ * ★ 为什么要搬到这里（2026-09-24）：接线表那段是**多行**的，直接进
+ *   48 行的日志环形缓冲，一开机就把六分之一的位置用掉，而且每次开机
+ *   内容一模一样。挪到网页上之后：日志干净了，接线表也没有丢。
+ * -------------------------------------------------------------------------- */
+static char s_pins_text[420];
+
+void web_set_pins_text(const char *text)
+{
+    if (!text) {
+        s_pins_text[0] = '\0';
+        return;
+    }
+    snprintf(s_pins_text, sizeof(s_pins_text), "%s", text);
+}
+
 /** 发一段 JSON 字符串（内容已经拼好） */
 static esp_err_t send_json_raw(httpd_req_t *req, const char *json)
 {
@@ -526,6 +544,11 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(board, "name", "ESP32-S3（42 针）");
 #endif
     cJSON_AddNumberToObject(board, "channels", BOARD_CHANNEL_COUNT);
+    /* 完整接线表（多行）。以前它只出现在开机日志里，现在日志精简掉了，
+     * 搬到这儿由「上电诊断」面板展开显示 —— 信息没丢，日志干净了。 */
+    if (s_pins_text[0]) {
+        cJSON_AddStringToObject(board, "pins_text", s_pins_text);
+    }
     cJSON *spare = cJSON_AddArrayToObject(board, "spare_pins");
     const board_spare_pin_t spares[] = BOARD_SPARE_PINS;
     for (size_t i = 0; i < sizeof(spares) / sizeof(spares[0]); i++) {
@@ -1611,16 +1634,23 @@ esp_err_t web_server_start(void)
     boot_count_bump();
     pins_selfcheck();
 
-    ams_log("本次复位原因: %s —— %s", s_reset_cause, s_reset_desc);
-    if (s_pins_ok) {
-        ams_log("引脚配置自检通过：全部输出脚都在安全引脚上");
-    } else {
-        ams_log_err("引脚配置自检**未通过**：%s", s_pins_problem);
+    /* ★ 这里**不再打日志**（2026-09-24）：main.c 的 print_wiring_and_check()
+     *   已经打过一遍"接线自检通过"，两边都打就是现场看到的
+     *   "每次开机两条一模一样的引脚配置自检通过"。
+     *   本函数只负责把结论留给 /status 给网页用。 */
+    if (!s_pins_ok) {
+        /* 失败必须留痕 —— 但只留一条，详细提示 main.c 已经说过 */
+        ams_log_err("引脚自检未通过（详情见上）：%s", s_pins_problem);
     }
+    /* 复位原因 + 启动次数合并成**一行**：原来这里是两行，
+     * 而且第 2 行是 [警告]，现场要求"精简"。 */
     if (s_boot_count > 5) {
-        ams_log_warn("这是第 %u 次启动 —— 在反复重启。"
-                     "请看「上电诊断」面板里的复位原因",
-                     (unsigned)s_boot_count);
+        ams_log("复位：%s（本次是第 %u 次启动 —— 起动次数偏高，"
+                "在「上电诊断」里看复位原因）",
+                s_reset_cause, (unsigned)s_boot_count);
+    } else {
+        ams_log("复位：%s · 第 %u 次启动", s_reset_cause,
+                (unsigned)s_boot_count);
     }
 
     httpd_config_t conf = HTTPD_DEFAULT_CONFIG();

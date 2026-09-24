@@ -2309,10 +2309,13 @@ static void handle_report(const bambu_report_t *r)
                 assist_hold_release();
                 s_assist_hold_cool_until_us =
                     now + (int64_t)ASSIST_HOLD_COOL_MS * 1000;
-                ams_log_warn("辅助送料保持已连续 %u 分钟，离合断开散热 %.1f 秒"
-                             "（保护线圈，不是故障）；若仍在辅助阶段会自动吸回",
-                             (unsigned)(ASSIST_HOLD_MAX_MS / 60000u),
-                             ASSIST_HOLD_COOL_MS / 1000.0);
+                /* ★ 这里**故意不打日志**（现场要求 2026-09-24：「像警告电磁
+                 *   吸合时间长这类的就不需要了」）。
+                 *   "到点断开散热"是**设计内的正常动作**，不是故障；而它在
+                 *   长打印里每 5 分钟就要来一次，一条 [警告] 刷一晚就把真正
+                 *   要看的换料日志全冲走了。
+                 *   想确认这个机制在工作，看 /status 的 assist_hold_ch
+                 *   （-1 = 当前没保持）就够了。 */
             }
 
             if (now < s_assist_hold_cool_until_us) {

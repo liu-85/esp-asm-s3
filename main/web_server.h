@@ -115,6 +115,18 @@ bool web_server_is_running(void);
  */
 uint32_t web_server_request_count(void);
 
+/**
+ * 把**完整接线表**（多行文本）交给网页，让「上电诊断」面板能展开查看。
+ *
+ * 由 main.c 在启动时调一次（main 里的 print_wiring_and_check）。
+ * 存在的意义：接线表这段内容只在"第一次接线上电"时有用，但它是多行的，
+ * 塞进 48 行的日志环形缓冲会把换料日志挤出去，所以日志里只留一行摘要，
+ * 完整内容搬到网页 + 串口。
+ *
+ * 必须在 web_server_start() 之前调；start() 里不会再覆盖它。
+ */
+void web_set_pins_text(const char *text);
+
 #ifdef __cplusplus
 }
 #endif
