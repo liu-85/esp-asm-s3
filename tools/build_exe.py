@@ -58,8 +58,20 @@ def main():
         "--name", "esp_ams_tool",
         "--icon", "NONE",    # 无图标（可替换为 .ico）
         "--add-data", f"esp_ams_postprocess.py;.",
-        SCRIPT,
     ]
+
+    # ★ DPI manifest：PyInstaller 默认**不带 dpiAware**，进程是 DPI-unaware 的，
+    #   在 125% / 150% 缩放的屏幕上整窗被 Windows 当位图拉伸（界面发虚，
+    #   且 GetDpiForWindow 只会回 96）。声明 PerMonitorV2 之后 Tk 才知道真实
+    #   DPI，字体按真实 DPI 渲染，代码里的 ui_px() 缩放也才对得上。
+    manifest = HERE / "esp_ams_tool.manifest"
+    if manifest.is_file():
+        cmd += ["--manifest", str(manifest)]
+    else:
+        print("警告：找不到 esp_ams_tool.manifest，"
+              "高 DPI 屏上界面会被拉伸得发虚")
+
+    cmd.append(SCRIPT)
 
     # 把当前目录作为工作目录，让 PyInstaller 找到脚本
     result = subprocess.run(cmd, cwd=str(HERE))

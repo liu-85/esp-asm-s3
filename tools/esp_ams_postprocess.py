@@ -826,7 +826,6 @@ def show_map_window(detail: List[Dict], ams_colors,
     """
     try:
         import tkinter as tk
-        from tkinter import ttk
     except Exception:
         return
 
@@ -836,85 +835,193 @@ def show_map_window(detail: List[Dict], ams_colors,
         # 无显示环境（或已经从别的 Tk 实例里起来）→ 静默跳过
         return
 
+    p = ui_build_theme(root, ui_resolve_dark(ui_load_pref()))
+    ui_apply(root, p)
     root.title("ESP-AMS 耗材丝 ↔ 料盘位 映射确认")
     root.resizable(False, False)
+    root.configure(bg=p["bg"])
 
-    ttk.Label(root, text="切片槽（切片软件里设的）  →  实际换料通道（板子上的料盘位）",
-              padding=(14, 12, 14, 6)).pack(anchor="w")
+    # ---------------- 品牌条 ----------------
+    brand = tk.Frame(root, bg=p["brand_bg"])
+    brand.pack(fill=tk.X, side=tk.TOP)
+    bi = tk.Frame(brand, bg=p["brand_bg"])
+    bi.pack(fill=tk.X, padx=ui_px(p, 16), pady=ui_px(p, 11))
+    lw, lh = ui_px(p, 32), ui_px(p, 28)
+    logo = tk.Canvas(bi, width=lw, height=lh, bg=p["brand_bg"],
+                     highlightthickness=0, bd=0)
+    logo.pack(side=tk.LEFT)
+    ui_round_rect(logo, 0, 0, lw, lh, ui_px(p, 9), fill=p["accent"], outline="")
+    logo.create_text(lw / 2, lh / 2, text="AMS", fill=p["accent_fg"],
+                     font=ui_font(p, 7, True))
+    tk.Label(bi, text="耗材丝 ↔ 料盘位 映射确认", bg=p["brand_bg"],
+             fg=p["brand_fg"], font=ui_font(p, 13, True)).pack(side=tk.LEFT,
+                                                               padx=(10, 0))
+    tk.Label(bi, text="按颜色自动对通道", bg=p["brand_bg"], fg=p["brand_sub"],
+             font=ui_font(p, 9)).pack(side=tk.RIGHT)
 
-    head = ttk.Frame(root, padding=(14, 0, 14, 2))
-    head.pack(fill=tk.X)
-    ttk.Label(head, text="文件名", width=10).grid(row=0, column=0, sticky="w")
-    ttk.Label(head, text=Path(gcode_path).name).grid(row=0, column=1, sticky="w")
-    ttk.Label(head, text="配置文件", width=10).grid(row=1, column=0, sticky="w")
-    ttk.Label(head, text=settings_path or "**没找到**（只能按通道号换料）") \
-        .grid(row=1, column=1, sticky="w")
+    # ---------------- 底部按钮条（先 pack 占住底） ----------------
+    left = tk.IntVar(value=auto_close_sec)
+    btnbar = tk.Frame(root, bg=p["bg"])
+    btnbar.pack(fill=tk.X, side=tk.BOTTOM, padx=ui_px(p, 16),
+                pady=(ui_px(p, 4), ui_px(p, 14)))
+    hint_lbl = tk.Label(btnbar, text="", bg=p["bg"], fg=p["faint"],
+                        font=ui_font(p, 9))
 
-    ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=14, pady=6)
+    # ---------------- 主体 ----------------
+    wrap = tk.Frame(root, bg=p["bg"])
+    wrap.pack(fill=tk.BOTH, expand=True, padx=ui_px(p, 16), pady=ui_px(p, 14))
 
-    cols = ttk.Frame(root, padding=(14, 0, 14, 4))
-    cols.pack(fill=tk.X)
-    for c, (txt, w) in enumerate([("切片槽", 8), ("切片里设的颜色", 20),
-                                  ("→ 实际料盘位", 22), ("结论", 20)]):
-        ttk.Label(cols, text=txt, width=w).grid(row=0, column=c, sticky="w")
+    info = tk.Frame(wrap, bg=p["bg"])
+    info.pack(fill=tk.X)
+    tk.Label(info, text="切片文件", bg=p["bg"], fg=p["faint"],
+             font=ui_font(p, 9), width=9, anchor="w") \
+        .grid(row=0, column=0, sticky="w")
+    tk.Label(info, text=Path(gcode_path).name, bg=p["bg"], fg=p["text"],
+             font=ui_font(p, 9)).grid(row=0, column=1, sticky="w")
+    tk.Label(info, text="配置文件", bg=p["bg"], fg=p["faint"],
+             font=ui_font(p, 9), width=9, anchor="w") \
+        .grid(row=1, column=0, sticky="w", pady=(3, 0))
+    tk.Label(info,
+             text=(Path(settings_path).name if settings_path
+                   else "没找到 —— 只能按通道号换料"),
+             bg=p["bg"], fg=(p["text"] if settings_path else p["danger"]),
+             font=ui_font(p, 9)).grid(row=1, column=1, sticky="w", pady=(3, 0))
+
+    # ---- 映射结果表 ----
+    c1, box = ui_card(wrap, p, title="映射结果")
+    c1.pack(fill=tk.X, pady=(ui_px(p, 12), 0))
+
+    grid = tk.Frame(box, bg=p["panel"])
+    grid.pack(fill=tk.X)
+
+    for c_, htxt in enumerate(("切片槽", "切片里设的颜色",
+                               "→ 实际料盘位", "结论")):
+        tk.Label(grid, text=htxt, bg=p["panel"], fg=p["faint"],
+                 font=ui_font(p, 9)).grid(row=0, column=c_, sticky="w",
+                                          padx=(0, ui_px(p, 16)),
+                                          pady=(0, ui_px(p, 7)))
 
     status_text = {
-        "ok": "✓ 已按颜色对上",
-        "far": "⚠ 色差太大，原样保留",
-        "none": "⚠ 项目里没有这个颜色",
-        "no_slice": "⚠ 切片没给颜色",
-        "no_cfg": "⚠ 项目未配置颜色",
+        "ok":       ("✓ 已按颜色对上", "accent"),
+        "far":      ("⚠ 色差太大，原样保留", "danger"),
+        "none":     ("⚠ 项目里没这个颜色", "danger"),
+        "no_slice": ("⚠ 切片没给颜色", "muted"),
+        "no_cfg":   ("⚠ 项目未配置颜色", "danger"),
     }
-    err_box = ttk.Frame(root, padding=(14, 0, 14, 4))
-    err_box.pack(fill=tk.X)
+    colmap = {"accent": p["accent"], "danger": p["danger"], "muted": p["muted"]}
 
-    for i, d in enumerate(detail, start=1):
-        c = d["color"] or (0, 0, 0)
-        hexs = rgb_to_hex(*c) if d["color"] else "#DDDDDD"
-        ttk.Label(err_box, text="第 %d 个" % (d["idx"] + 1), width=8) \
-            .grid(row=i, column=0, sticky="w")
-        # 颜色方块 —— TOP AMS 也是这么让人"一眼看出对不对"的
-        ttk.Label(err_box, text="", background=hexs, width=3, relief="solid",
-                  borderwidth=1).grid(row=i, column=1, sticky="w", padx=(0, 6))
-        ttk.Label(err_box, text=(rgb_to_hex(*c) if d["color"] else "（无）"),
-                  width=12).grid(row=i, column=1, sticky="w", padx=(28, 0))
-        ch_c = ams_colors.get(d["ch"])
-        ch_txt = "通道 %d" % d["ch"]
-        if ch_c:
-            ch_txt += " · %s" % rgb_to_hex(*ch_c)
-        ttk.Label(err_box, text=ch_txt, width=22).grid(row=i, column=2, sticky="w")
-        ttk.Label(err_box, text=status_text.get(d["status"], d["status"]),
-                  width=20).grid(row=i, column=3, sticky="w")
+    for r, d in enumerate(detail, start=1):
+        tk.Label(grid, text="第 %d 个" % (d["idx"] + 1), bg=p["panel"],
+                 fg=p["text"], font=ui_font(p, 9, True)) \
+            .grid(row=r, column=0, sticky="w", padx=(0, ui_px(p, 16)),
+                  pady=ui_px(p, 3))
 
+        cell = tk.Frame(grid, bg=p["panel"])
+        cell.grid(row=r, column=1, sticky="w", padx=(0, ui_px(p, 16)),
+                  pady=ui_px(p, 3))
+        sws = ui_px(p, 22)
+        sw = tk.Canvas(cell, width=sws, height=sws, bg=p["panel"],
+                       highlightthickness=0, bd=0)
+        sw.pack(side=tk.LEFT)
+        if d["color"]:
+            hexs = rgb_to_hex(*d["color"])
+            ui_round_rect(sw, 0, 0, sws, sws, ui_px(p, 6), fill=hexs,
+                          outline=ui_shade(hexs, 34 if p["dark"] else -34))
+        else:
+            ui_round_rect(sw, 0, 0, sws, sws, ui_px(p, 6), fill=p["chip"],
+                          outline=p["border"])
+        tk.Label(cell,
+                 text=(rgb_to_hex(*d["color"]) if d["color"] else "（无）"),
+                 bg=p["panel"], fg=p["text"], font=ui_font(p, 9, mono=True)) \
+            .pack(side=tk.LEFT, padx=(ui_px(p, 7), 0))
+
+        if d.get("ch"):
+            ch_txt = "通道 %d" % d["ch"]
+            ch_c = ams_colors.get(d["ch"])
+            if ch_c:
+                ch_txt += "    %s" % rgb_to_hex(*ch_c)
+        else:
+            ch_txt = "—"
+        tk.Label(grid, text=ch_txt, bg=p["panel"], fg=p["text"],
+                 font=ui_font(p, 9)).grid(row=r, column=2, sticky="w",
+                                          padx=(0, ui_px(p, 16)),
+                                          pady=ui_px(p, 3))
+
+        stxt, skind = status_text.get(d["status"], (d["status"], "muted"))
+        tk.Label(grid, text=stxt, bg=p["panel"],
+                 fg=colmap.get(skind, p["muted"]), font=ui_font(p, 9, True)) \
+            .grid(row=r, column=3, sticky="w", pady=ui_px(p, 3))
+
+    # ---- 结论条 ----
     bad = [d for d in detail if d["status"] != "ok"]
     if bad:
-        tip = ("有 %d 个切片槽没匹配上（见上面的 ⚠）。映射已经写进 G-code，"
-               "但它们**会按切片槽号原样发**——想改就点「打开配置工具改颜色」，"
-               "把料盘颜色配成和切片里一致，然后重新切片。" % len(bad))
+        tip = ("有 %d 个切片槽没匹配上（见上面的 ⚠）。映射还是写进了 G-code，"
+               "但它们会按切片槽号原样发 —— 想改就点左下角"
+               "「打开配置工具改颜色」，把料盘颜色配成和切片里一致，再重新切片。"
+               % len(bad))
+        tbg, tfg = p["danger_soft"], p["danger"]
     else:
-        tip = "全部按颜色对上，映射已写进 G-code（搜 ESP-AMS 就能看到这几行）。"
-    ttk.Label(root, text=tip, padding=(14, 2, 14, 4), wraplength=460,
-              justify="left").pack(anchor="w")
+        tip = "全部按颜色对上，映射已写进 G-code（在文件里搜 ESP-AMS 就能看到）。"
+        tbg, tfg = p["accent_soft"], p["accent"]
+    tipbox = tk.Frame(wrap, bg=tbg)
+    tipbox.pack(fill=tk.X, pady=(ui_px(p, 12), 0))
+    tk.Label(tipbox, text=tip, bg=tbg, fg=tfg, font=ui_font(p, 9),
+             justify="left", wraplength=ui_px(p, 540)).pack(
+                 anchor="w", padx=ui_px(p, 12), pady=ui_px(p, 9))
 
-    # ---- 下次还弹不弹（写回配置文件，不动其它键）----
-    pref = tk.StringVar(value=POPUP_ALWAYS if mode == POPUP_ALWAYS else mode)
-    pref_box = ttk.LabelFrame(root, text="下次切片", padding=(10, 4, 10, 6))
-    pref_box.pack(fill=tk.X, padx=14, pady=(2, 4))
-    state = "normal" if settings_path else "disabled"
-    ttk.Radiobutton(pref_box, text="还是每次都弹（和 TOP AMS 一样）",
-                    variable=pref, value=POPUP_ALWAYS, state=state) \
-        .grid(row=0, column=0, sticky="w")
-    ttk.Radiobutton(pref_box, text="只在需要拍板时弹（颜色匹配不上 / 有歧义）",
-                    variable=pref, value=POPUP_AUTO, state=state) \
-        .grid(row=1, column=0, sticky="w")
+    # ---- 下次还弹不弹（只改配置文件里的 popup 一个键）----
+    pref_var = tk.StringVar(value=mode)
+    c2, pbox = ui_card(wrap, p, title="下次切片")
+    c2.pack(fill=tk.X, pady=(ui_px(p, 12), 0))
+
+    redraws = []
+
+    def _pref_row(text, val):
+        rowf = tk.Frame(pbox, bg=p["panel"], cursor="hand2")
+        rowf.pack(fill=tk.X, pady=ui_px(p, 2))
+        ds = ui_px(p, 18)
+        dot = tk.Canvas(rowf, width=ds, height=ds, bg=p["panel"],
+                        highlightthickness=0, bd=0)
+        dot.pack(side=tk.LEFT)
+        lbl = tk.Label(rowf, text=text, bg=p["panel"], fg=p["muted"],
+                       font=ui_font(p, 9))
+        lbl.pack(side=tk.LEFT, padx=(ui_px(p, 7), 0))
+
+        def redraw():
+            sel = (pref_var.get() == val)
+            dot.delete("all")
+            if sel:
+                dot.create_oval(ui_px(p, 2), ui_px(p, 2), ds - ui_px(p, 2),
+                                ds - ui_px(p, 2), fill=p["accent"], outline="")
+                dot.create_oval(ds / 2 - ui_px(p, 2.5), ds / 2 - ui_px(p, 2.5),
+                                ds / 2 + ui_px(p, 2.5), ds / 2 + ui_px(p, 2.5),
+                                fill=p["accent_fg"], outline="")
+            else:
+                dot.create_oval(ui_px(p, 2), ui_px(p, 2), ds - ui_px(p, 2),
+                                ds - ui_px(p, 2), outline=p["border_strong"],
+                                width=ui_px(p, 2), fill="")
+            lbl.config(fg=(p["text"] if sel else p["muted"]),
+                       font=ui_font(p, 9, sel))
+
+        def pick(_e=None):
+            if not settings_path:
+                return
+            pref_var.set(val)
+            for fn in redraws:
+                fn()
+
+        for w in (rowf, dot, lbl):
+            w.bind("<Button-1>", pick)
+        redraws.append(redraw)
+        redraw()
+
+    _pref_row("还是每次都弹（和 TOP AMS 一样）", POPUP_ALWAYS)
+    _pref_row("只在需要拍板时弹（颜色匹配不上 / 有歧义）", POPUP_AUTO)
     if not settings_path:
-        ttk.Label(pref_box, text="（没找到配置文件，这一项改不了）",
-                  foreground="#888888").grid(row=2, column=0, sticky="w")
+        tk.Label(pbox, text="（没找到配置文件，这一项改不了）", bg=p["panel"],
+                 fg=p["faint"], font=ui_font(p, 9)).pack(anchor="w", pady=(5, 0))
 
-    left = tk.IntVar(value=auto_close_sec)
-    btns = ttk.Frame(root, padding=(14, 6, 14, 12))
-    btns.pack(fill=tk.X)
-
+    # ---- 按钮 ----
     def _open_tool():
         """另开一个进程启动配置 GUI —— 本进程不能自己开 Tk 主循环，
         它正处在"给切片器写文件"的关键路径上，卡住就会把切片顶住。"""
@@ -932,16 +1039,15 @@ def show_map_window(detail: List[Dict], ams_colors,
 
     def _confirm():
         # 只在用户真的改了这个选择时才写文件（免得每次切片都动配置文件）
-        if settings_path and pref.get() != mode:
-            update_settings_key(settings_path, SETTINGS_KEY_POPUP, pref.get())
+        if settings_path and pref_var.get() != mode:
+            update_settings_key(settings_path, SETTINGS_KEY_POPUP, pref_var.get())
         root.destroy()
 
-    ok_btn = ttk.Button(btns, text="确定", command=_confirm)
-    ok_btn.pack(side=tk.LEFT, padx=6)
-    ttk.Button(btns, text="打开配置工具改颜色", command=_open_tool) \
-        .pack(side=tk.LEFT, padx=6)
-    hint = ttk.Label(btns, text="")
-    hint.pack(side=tk.RIGHT)
+    ui_button(btnbar, p, "确定", _confirm, kind="accent", bold=True,
+              pad=(26, 8)).pack(side=tk.RIGHT)
+    ui_button(btnbar, p, "打开配置工具改颜色", _open_tool,
+              kind="normal").pack(side=tk.LEFT)
+    hint_lbl.pack(side=tk.RIGHT, padx=(0, 12))
 
     def _tick():
         n = left.get() - 1
@@ -951,22 +1057,32 @@ def show_map_window(detail: List[Dict], ams_colors,
                        "（%d 秒）" % auto_close_sec)
             root.destroy()
             return
-        hint.config(text="%d 秒后自动确认" % n)
+        hint_lbl.config(text="%d 秒后自动确认" % n)
         root.after(1000, _tick)
 
     if auto_close_sec > 0:
-        hint.config(text="%d 秒后自动确认" % left.get())
+        hint_lbl.config(text="%d 秒后自动确认" % left.get())
         root.after(1000, _tick)
+
+    # ---- 定宽自适应高，摆到屏幕中偏上（别挡住切片器的进度条） ----
+    try:
+        root.update_idletasks()
+        ui_refresh_scale(root, p)      # 映射后重采，锁出来的宽度才不飘
+        w = ui_px(p, 640)
+        h = max(root.winfo_reqheight(), ui_px(p, 240))
+        # ★ 光调 geometry() 是不够的：窗口还没映射时 Tk 会用**内容的请求尺寸**
+        #   覆盖它（实测宽度会随文件名长短在 735~795 之间飘）。必须同时钉住
+        #   min/max，宽度才是真的固定。
+        root.minsize(w, h)
+        root.maxsize(w, h)
+        root.geometry("%dx%d" % (w, h))
+        root.update_idletasks()
+        ui_center(root, w, h)
+    except Exception:
+        pass
 
     try:
         root.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        root.update_idletasks()
-        # 放到屏幕中间偏上，别挡住切片器的进度条
-        x = (root.winfo_screenwidth() - root.winfo_width()) // 2
-        root.geometry("+%d+%d" % (max(0, x), 120))
     except Exception:
         pass
     root.mainloop()
@@ -1078,363 +1194,1163 @@ def onBeforeWriteGCode(input_file, gcode_path, project, filename, output):
     output.write(rewritten, encoding='utf-8')
 
 
+# ============================== UI 皮肤（Tkinter 主题） ==============================
+#
+# 为什么要自己搭一套：
+#   ttk 的 `vista` / `xpnative` 主题是**系统原生绘制** —— `style.configure(bg=...)`
+#   会被整个忽略。想让按钮 / 单选 / 下拉框都吃我们的配色，只有两条路：
+#   ① 强制 `theme_use("clam")` 再把每个控件颜色显式钉死；② 干脆自绘。
+#   这里两条都用：ttk 只留 Combobox，其余（按钮、分段选择器、色块）自绘。
+#   自绘 = 只用 Canvas 画圆角矩形，**不带任何图片资源**，PyInstaller 不用多带文件。
+#
+# 明暗：默认跟随系统（winreg 读 AppsUseLightTheme），界面上可手动切，
+#       偏好写在安装目录的 `ui_theme.txt`（auto / light / dark）。
+
+UI_THEME_FILENAME = "ui_theme.txt"
+UI_PREF_AUTO, UI_PREF_LIGHT, UI_PREF_DARK = "auto", "light", "dark"
+
+# 浅色：冷灰底 + 白卡片 + 拓竹绿强调（#00AE42 是 Bambu Lab 的品牌绿）
+_UI_LIGHT = {
+    "bg":           "#EDF0F4",   # 窗口底（比卡片深一档，用来撑出层次）
+    "panel":        "#FFFFFF",   # 卡片面
+    "panel_alt":    "#F5F7FA",   # 卡片内的次级面（色块区底）
+    "border":       "#DFE4EA",
+    "border_strong": "#C6CDD5",
+    "text":         "#1A1F26",
+    "muted":        "#66707D",
+    "faint":        "#98A2B3",
+    "accent":       "#00AE42",
+    "accent_hov":   "#00953A",
+    "accent_fg":    "#FFFFFF",
+    "accent_soft":  "#E4F6EB",
+    "chip":         "#E6EAEF",
+    "chip_hov":     "#DBE0E6",
+    "danger":       "#D93025",
+    "danger_soft":  "#FCE9E7",
+    "canvas":       "#FFFFFF",
+    "brand_bg":     "#161B22",
+    "brand_fg":     "#FFFFFF",
+    "brand_sub":    "#8E9AAB",
+    "disabled_fg":  "#96A0AC",
+}
+
+# 深色：近黑底 + 面板抬高一级；强调色略微提亮，保证暗底上的对比度
+_UI_DARK = {
+    "bg":           "#131619",
+    "panel":        "#1C2025",
+    "panel_alt":    "#171B1F",
+    "border":       "#303843",   # 暗底上边框要亮一档才看得见卡片边界
+    "border_strong": "#414A56",
+    "text":         "#E7EBF0",
+    "muted":        "#96A1AF",
+    "faint":        "#6B7683",
+    "accent":       "#00C24B",
+    "accent_hov":   "#2AD763",
+    "accent_fg":    "#04150A",
+    "accent_soft":  "#123120",
+    "chip":         "#262C33",
+    "chip_hov":     "#303843",
+    "danger":       "#F0776C",
+    "danger_soft":  "#3A211F",
+    "canvas":       "#1C2025",
+    "brand_bg":     "#0C0F12",
+    "brand_fg":     "#FFFFFF",
+    "brand_sub":    "#8E9AAB",
+    "disabled_fg":  "#5A636E",
+}
+
+_UI_FONTS: Dict[str, str] = {}
+
+
+def ui_pref_path() -> Path:
+    """主题偏好的存放位置（跟 EXE / 脚本同目录，一并与安装目录进退）。"""
+    try:
+        return _app_base() / UI_THEME_FILENAME
+    except Exception:
+        return Path.home() / UI_THEME_FILENAME
+
+
+def ui_system_dark() -> bool:
+    """系统是不是深色主题。读不到一律当**浅色** —— 浅色在任何环境下都不会看不清。"""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        try:
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return int(val) == 0
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+
+def ui_load_pref() -> str:
+    try:
+        t = ui_pref_path().read_text(encoding="utf-8").strip().lower()
+        if t in (UI_PREF_AUTO, UI_PREF_LIGHT, UI_PREF_DARK):
+            return t
+    except OSError:
+        pass
+    return UI_PREF_AUTO
+
+
+def ui_save_pref(mode: str) -> None:
+    try:
+        ui_pref_path().write_text(mode, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ui_resolve_dark(pref: str) -> bool:
+    if pref == UI_PREF_DARK:
+        return True
+    if pref == UI_PREF_LIGHT:
+        return False
+    return ui_system_dark()
+
+
+def ui_fonts(root) -> Dict[str, str]:
+    """挑本机真实存在的字体。
+
+    不能直接写死 \"Microsoft YaHei UI\"：字体族不存在时 Tk 会**静默**回退到
+    一个很难看的默认字体（不是报错），界面就毁了。所以先枚举再挑。
+    """
+    if _UI_FONTS:
+        return _UI_FONTS
+    fams = set()
+    try:
+        import tkinter.font as tkfont
+        fams = set(tkfont.families(root))
+    except Exception:
+        pass
+
+    def pick(cands, fallback):
+        for c in cands:
+            if c in fams:
+                return c
+        return fallback
+
+    _UI_FONTS["ui"] = pick(
+        ["Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑",
+         "Segoe UI", "PingFang SC", "Noto Sans CJK SC"], "Arial")
+    _UI_FONTS["mono"] = pick(
+        ["Cascadia Mono", "Consolas", "JetBrains Mono",
+         "DejaVu Sans Mono", "Courier New"], "Courier")
+    return _UI_FONTS
+
+
+def _hex_to_rgb_t(h: str) -> Tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def ui_shade(h: str, amount: int) -> str:
+    """把颜色整体调亮/调暗 amount（-255..255），用来算 hover 色。"""
+    r, g, b = _hex_to_rgb_t(h)
+    f = lambda v: max(0, min(255, v + amount))
+    return "#%02X%02X%02X" % (f(r), f(g), f(b))
+
+
+def ui_mix(h1: str, h2: str, t: float) -> str:
+    """在两色之间线性插值（t=0 取 h1，t=1 取 h2）。用于把色块"洗淡"成禁用态。"""
+    a, b = _hex_to_rgb_t(h1), _hex_to_rgb_t(h2)
+    return "#%02X%02X%02X" % tuple(
+        int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def ui_disp_w(text: str) -> int:
+    """字符串在界面里占多少"格"（CJK 全角算 2 格，ASCII 算 1 格）。
+
+    ★ 为什么不能直接用 `len()`：一个中文字符的显示宽度约等于两个西文字符。
+      按 `len()` 截断时，"58 个字符的中文路径"实际占 90+ 格宽，
+      窗口照样被顶宽 —— 第一版就是这么翻车的。
+    """
+    n = 0
+    for ch in text:
+        o = ord(ch)
+        n += 2 if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF
+                   or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF
+                   or 0xFE30 <= o <= 0xFE6F or 0xFF00 <= o <= 0xFF60
+                   or 0xFFE0 <= o <= 0xFFE6) else 1
+    return n
+
+
+def ui_shorten(text: str, limit: int = 56) -> str:
+    """按显示宽度中间省略（limit 单位是"格"）。
+
+    ★ 为什么必须做：Tk 的 Label 宽度是**内容决定**的，一行完整长路径
+      （`D:\\kx\\AI提示词\\...\\tools\\filament_settings.json`）会把整个窗口
+      顶宽 —— 实测能顶到 870px，而且随目录深浅变化，窗口宽度飘忽不定。
+      完整路径仍然靠"点一下复制"给用户，不必挤在界面上。
+    """
+    if ui_disp_w(text) <= limit:
+        return text
+    left, w = [], 0
+    for ch in text:
+        cw = ui_disp_w(ch)
+        if w + cw > limit // 2:
+            break
+        left.append(ch)
+        w += cw
+    right, w2 = [], 0
+    for ch in reversed(text):
+        cw = ui_disp_w(ch)
+        if w2 + cw > max(6, limit - w - 1):
+            break
+        right.append(ch)
+        w2 += cw
+    return "".join(left) + "…" + "".join(reversed(right))
+
+
+def ui_contrast_fg(c: Tuple[int, int, int]) -> str:
+    """给一个底色，返回在上面看得清的文字色（按感知亮度分档，不是简单均值）。"""
+    r, g, b = c
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    return "#FFFFFF" if lum < 140 else "#1A1F26"
+
+
+def ui_build_theme(root, dark: bool) -> Dict[str, str]:
+    """组装一套可用的主题字典（配色 + 字体 + DPI 比例）。切换主题时重新调用即可。"""
+    p = dict(_UI_DARK if dark else _UI_LIGHT)
+    p["dark"] = dark          # type: ignore[assignment]
+    fonts = ui_fonts(root)
+    p["fui"] = fonts["ui"]
+    p["fmono"] = fonts["mono"]
+    # ★ DPI：Tk 的**字体**是按 point 算的，会自动跟着屏幕 DPI 放大；
+    #   **像素**尺寸（色块、圆角、内边距）不会。不补这一课，在 125% / 150%
+    #   缩放的屏上就是"字大格子小"——色块里的通道号和 hex 会挤成一团。
+    #   PyInstaller 打出来的 EXE 默认带 dpiAware，所以这不是小概率情况。
+    try:
+        p["scale"] = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    except Exception:
+        p["scale"] = 1.0
+    return p
+
+
+def ui_refresh_scale(root, p) -> float:
+    """重新采一次屏幕缩放。
+
+    ★ 为什么需要"再采一次"：窗口**还没映射**时 Tk 报的 DPI 可能是默认 96
+      （或者上一次查询的缓存值），按它算出来的锁定尺寸会随机飘 ——
+      实测同一个确认窗在两次运行里能差 55px。凡是**要按缩放锁死尺寸**的
+      地方，都要在 `update_idletasks()` 之后再刷一次。
+    """
+    try:
+        p["scale"] = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    except Exception:
+        pass
+    return float(p.get("scale", 1.0))
+
+
+def ui_px(p, n: float) -> int:
+    """把"设计像素"（按 96 DPI 画的稿）换算成本机物理像素。"""
+    try:
+        return int(round(n * float(p.get("scale", 1.0))))
+    except Exception:
+        return int(n)
+
+
+def ui_apply(root, p: Dict[str, str]) -> None:
+    """把主题套到 root 上（含 ttk 那一小块）。
+
+    注意：每个 ttk 控件的颜色都必须显式写死 —— clam 的继承是**逐元素**的，
+    `.` 上配了不保证子样式吃到。
+    """
+    from tkinter import ttk
+
+    root.configure(bg=p["bg"])
+
+    st = ttk.Style(root)
+    try:
+        st.theme_use("clam")
+    except Exception:
+        pass
+
+    st.configure(".", background=p["bg"], foreground=p["text"],
+                 fieldbackground=p["panel"], font=(p["fui"], 10),
+                 borderwidth=0, focuscolor=p["bg"])
+
+    # ---- Combobox（唯一保留的 ttk 控件；它的下拉列表是 tk Listbox，要另外配）----
+    st.configure("TCombobox",
+                 fieldbackground=p["panel"], background=p["chip"],
+                 foreground=p["text"], arrowcolor=p["muted"],
+                 bordercolor=p["border_strong"], lightcolor=p["panel"],
+                 darkcolor=p["panel"], selectbackground=p["panel"],
+                 selectforeground=p["text"], padding=(8, 5),
+                 relief="flat")
+    st.map("TCombobox",
+           fieldbackground=[("readonly", p["panel"]), ("disabled", p["panel_alt"])],
+           foreground=[("disabled", p["faint"])],
+           bordercolor=[("focus", p["accent"])],
+           lightcolor=[("focus", p["accent"])],
+           darkcolor=[("focus", p["accent"])],
+           arrowcolor=[("active", p["text"])])
+    # 下拉列表（原生 Listbox，ttk 管不到，只能走 option 数据库）
+    root.option_add("*TCombobox*Listbox.background", p["panel"])
+    root.option_add("*TCombobox*Listbox.foreground", p["text"])
+    root.option_add("*TCombobox*Listbox.selectBackground", p["accent"])
+    root.option_add("*TCombobox*Listbox.selectForeground", p["accent_fg"])
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
+    root.option_add("*TCombobox*Listbox.font", (p["fui"], 10))
+
+    # ---- 滚动条（G-code 预览窗里用）----
+    st.configure("Vertical.TScrollbar",
+                 background=p["chip"], troughcolor=p["panel_alt"],
+                 bordercolor=p["panel_alt"], arrowcolor=p["muted"],
+                 lightcolor=p["chip"], darkcolor=p["chip"],
+                 relief="flat", arrowsize=12)
+    st.map("Vertical.TScrollbar", background=[("active", p["chip_hov"])])
+
+
+def ui_font(p, size=10, bold=False, mono=False):
+    """取字体元组：ui_font(p, 10, True) / ui_font(p, 9, mono=True)。"""
+    fam = p["fmono"] if mono else p["fui"]
+    return (fam, size, "bold") if bold else (fam, size)
+
+
+def ui_round_rect(cv, x1, y1, x2, y2, r, **kw):
+    """在 Canvas 上画圆角矩形（用 smooth 多边形的标准做法，无需图片）。"""
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    pts = [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+def ui_center(win, width=None, height=None) -> None:
+    """把窗口摆到屏幕中偏上（不垂直居中，弹窗更贴近视觉重心）。"""
+    win.update_idletasks()
+    w = width or win.winfo_width()
+    h = height or win.winfo_height()
+    x = max(0, (win.winfo_screenwidth() - w) // 2)
+    y = max(0, int((win.winfo_screenheight() - h) * 0.32))
+    win.geometry("+%d+%d" % (x, y))
+
+
+def ui_card(parent, p, title=None, subtitle=None, pad=14):
+    """一张卡片。返回 (外框, 内容区)。
+
+    1px 边框是靠**外层 Frame 的底色**透出来的（内层四周留 1px），
+    比 tk 的 highlightthickness 在缩放时更稳定。
+    """
+    import tkinter as tk
+
+    pad = ui_px(p, pad)
+    gap8 = ui_px(p, 8)
+
+    outer = tk.Frame(parent, bg=p["border"])
+    inner = tk.Frame(outer, bg=p["panel"])
+    inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+    if title:
+        head = tk.Frame(inner, bg=p["panel"])
+        head.pack(fill=tk.X, padx=pad, pady=(pad, 0))
+        tk.Label(head, text=title, bg=p["panel"], fg=p["text"],
+                 font=ui_font(p, 10, True)).pack(side=tk.LEFT)
+        if subtitle:
+            tk.Label(head, text=subtitle, bg=p["panel"], fg=p["faint"],
+                     font=ui_font(p, 9)).pack(side=tk.LEFT, padx=(gap8, 0))
+
+    body = tk.Frame(inner, bg=p["panel"])
+    body.pack(fill=tk.BOTH, expand=True, padx=pad,
+              pady=(gap8 if title else pad, pad))
+    return outer, body
+
+
+def ui_button(parent, p, text, command, kind="normal", pad=(14, 7),
+              size=10, bold=False, width=None):
+    """扁平按钮（tk.Button + 手工 hover）。
+
+    为什么不用 ttk.Button：clam 的按钮有硬编码的内阴影和 focus 虚框，
+    想彻底压平要动 layout，还不如直接用 tk.Button 把颜色全握在手里。
+    """
+    import tkinter as tk
+
+    if kind == "accent":
+        bg, fg, hov = p["accent"], p["accent_fg"], p["accent_hov"]
+    elif kind == "danger":
+        bg, fg, hov = p["panel"], p["danger"], p["danger_soft"]
+    elif kind == "ghost":
+        bg, fg, hov = p["panel"], p["muted"], p["chip"]
+    else:
+        bg, fg, hov = p["chip"], p["text"], p["chip_hov"]
+
+    btn = tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
+                    activebackground=hov, activeforeground=fg,
+                    relief="flat", bd=0, highlightthickness=0,
+                    padx=ui_px(p, pad[0]), pady=ui_px(p, pad[1]), cursor="hand2",
+                    font=ui_font(p, size, bold), **({"width": width} if width else {}))
+    btn.bind("<Enter>", lambda e: btn.config(bg=hov))
+    btn.bind("<Leave>", lambda e: btn.config(bg=bg))
+    return btn
+
+
+def ui_segment(parent, p, options, value, on_pick,
+               item_w=64, height=32, gap=4):
+    """胶囊式分段选择器（自绘）。
+
+    返回 (canvas, set_value)。options 是 [(label, value), ...]。
+    选中的那格填强调色 + 深色字，其余透明底 + 灰字，hover 时描边。
+    """
+    import tkinter as tk
+
+    item_w = ui_px(p, item_w)
+    height = ui_px(p, height)
+    gap = ui_px(p, gap)
+    radius = ui_px(p, 8)
+
+    total_w = len(options) * item_w + (len(options) - 1) * gap
+    cv = tk.Canvas(parent, width=total_w, height=height,
+                   bg=p["panel"], highlightthickness=0, bd=0, cursor="hand2")
+    state = {"value": value, "items": []}
+
+    def draw():
+        cv.delete("all")
+        state["items"] = []
+        for i, (label, val) in enumerate(options):
+            x = i * (item_w + gap)
+            sel = (state["value"] == val)
+            if sel:
+                fill, fg, outline, ow = p["accent"], p["accent_fg"], p["accent"], 0
+            else:
+                fill, fg, outline, ow = p["panel_alt"], p["muted"], p["border"], 1
+            rid = ui_round_rect(cv, x + 0.5, 0.5, x + item_w - 0.5, height - 0.5,
+                                radius, fill=fill, outline=outline, width=ow)
+            tid = cv.create_text(x + item_w / 2, height / 2, text=label,
+                                 fill=fg, font=ui_font(p, 10, True))
+            state["items"].append((x, x + item_w, val, rid, tid, sel))
+
+    def hit(event):
+        for x1, x2, val, _r, _t, _s in state["items"]:
+            if x1 <= event.x <= x2:
+                return val
+        return None
+
+    def on_click(event):
+        val = hit(event)
+        if val is not None and val != state["value"]:
+            state["value"] = val
+            draw()
+            on_pick(val)
+
+    def on_move(event):
+        val = hit(event)
+        cv.configure(cursor="hand2" if val is not None else "arrow")
+
+    cv.bind("<Button-1>", on_click)
+    cv.bind("<Motion>", on_move)
+
+    def set_value(val):
+        state["value"] = val
+        draw()
+
+    draw()
+    return cv, set_value
+
+
+def ui_badge(parent, p, text="", kind="ok"):
+    """小圆角状态徽章。返回 (canvas, set_badge(text, kind))。
+
+    实现要点：文字**只建一次**，宽度靠 bbox 量出来再改 canvas 宽度；
+    底色用 `tags="bg"` 画在文字下面（`tag_lower`）。这样重设文字不用重建画布，
+    也不会依赖 `find_all()` 的返回顺序（那个顺序很脆）。
+    """
+    import tkinter as tk
+
+    colors = {
+        "ok":   (p["accent_soft"], p["accent"]),
+        "warn": (p["danger_soft"], p["danger"]),
+        "info": (p["chip"], p["muted"]),
+    }
+    bh = ui_px(p, 22)
+    bx = ui_px(p, 10)
+    bpad = ui_px(p, 20)
+    cv = tk.Canvas(parent, bg=p["panel"], highlightthickness=0, bd=0, height=bh)
+    tid = cv.create_text(bx, bh // 2, text=text, anchor="w",
+                         font=ui_font(p, 9, True))
+
+    def set_badge(new_text, new_kind="info"):
+        bg, fg = colors.get(new_kind, colors["info"])
+        cv.itemconfig(tid, text=new_text, fill=fg)
+        box = cv.bbox(tid) or (0, 0, 40, bh)
+        w = (box[2] - box[0]) + bpad
+        cv.config(width=w)
+        cv.delete("bg")
+        ui_round_rect(cv, 0, 0, w, bh, bh // 2, fill=bg, outline=bg, tags="bg")
+        cv.tag_lower("bg")
+
+    set_badge(text, kind)
+    return cv, set_badge
+
+
+def ui_scroll_text(parent, p, height=16):
+    """带滚动条的只读文本框（日志 / 预览用），配色跟着主题走。"""
+    import tkinter as tk
+    from tkinter import ttk
+
+    wrap = tk.Frame(parent, bg=p["border"])
+    inner = tk.Frame(wrap, bg=p["panel"])
+    inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+    txt = tk.Text(inner, wrap=tk.WORD, font=ui_font(p, 9, mono=True),
+                  bg=p["panel"], fg=p["text"], insertbackground=p["text"],
+                  relief="flat", bd=0, highlightthickness=0,
+                  height=height, padx=ui_px(p, 10), pady=ui_px(p, 8),
+                  selectbackground=p["accent"], selectforeground=p["accent_fg"])
+    sb = ttk.Scrollbar(inner, orient="vertical", command=txt.yview,
+                       style="Vertical.TScrollbar")
+    txt.configure(yscrollcommand=sb.set)
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+    txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    # 行号式的左侧留白感：给首行加一点点内边距
+    txt.tag_configure("dim", foreground=p["faint"])
+    txt.tag_configure("ok", foreground=p["accent"])
+    txt.tag_configure("warn", foreground=p["danger"])
+    return wrap, txt
+
+
 # ============================== GUI（Tkinter） ==============================
 
 def _run_gui():
-    """启动 Tkinter GUI，匹配第三方 EXE 工具界面风格"""
+    """配置界面（浅色/深色双主题，默认跟随系统）。
+
+    皮肤策略：**切换主题 = 整体重建控件**（`build()` 再跑一遍）。
+    比"遍历所有控件挨个 set 颜色"可靠得多 —— 数据都放在 `state` 里，
+    重建不丢，也不会漏掉某个控件。
+    """
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, colorchooser
 
-    # ---- 状态 ----
+    # ---------------- 状态（跨主题重建保持） ----------------
     state = {
         "data": default_settings(8),
         "ch_count": 8,
         "dir": str(Path.home() / "ESP_AMS"),
-        "filename": SETTINGS_FILENAME,
+        "pref": ui_load_pref(),
+        "config_name": SETTINGS_FILENAME,
+        "dirty": False,
+        "msg": "",
     }
+    TITLE_BASE = "ESP-AMS 换色配置工具"
 
     root = tk.Tk()
-    root.title("ESP-AMS 换色配置工具")
+    root.title(TITLE_BASE)
     root.resizable(False, False)
+    root.withdraw()            # 布局算完再显示，免得"半成品"闪一下
 
-    # ============ 顶部：通道数选择（4通道配置/6通道配置/8通道配置/16通道配置） ============
-    top_frame = ttk.Frame(root, padding=(10, 8, 10, 4))
-    top_frame.pack(fill=tk.X)
+    th = {"p": None}
+    holder = {"win": None, "status": None}
 
-    ttk.Label(top_frame, text="通道数：").pack(side=tk.LEFT)
-    ch_var = tk.IntVar(value=state["ch_count"])
-    ch_buttons = ttk.Frame(top_frame)
-    ch_buttons.pack(side=tk.LEFT, padx=5)
+    def _mark_dirty(flag=True, msg=""):
+        state["dirty"] = flag
+        state["msg"] = msg
+        root.title(TITLE_BASE + ("  •" if flag else ""))
+        if holder["status"]:
+            holder["status"]()
 
-    def _apply_channel_count(n):
-        """切换通道数，保留已有颜色"""
-        old_materials = state["data"]["materials"]
-        new_data = default_settings(n)
-        for i in range(n):
-            if i < len(old_materials):
-                new_data["materials"][i]["color"] = old_materials[i].get(
-                    "color", new_data["materials"][i]["color"])
-                new_data["materials"][i]["enabled"] = old_materials[i].get("enabled", True)
-        state["data"] = new_data
-        state["ch_count"] = n
-        ch_var.set(n)
-        _draw_colors()
+    def _set_theme(pref):
+        if pref == state["pref"]:
+            return
+        state["pref"] = pref
+        ui_save_pref(pref)
+        build()
 
-    for ch in [4, 8, 16]:
-        btn = ttk.Radiobutton(
-            ch_buttons, text=f"{ch}通道", value=ch,
-            variable=ch_var,
-            command=lambda c=ch: _apply_channel_count(c),
-        )
-        btn.pack(side=tk.LEFT, padx=4)
+    # ================= 界面构建 =================
+    def build():
+        p = ui_build_theme(root, ui_resolve_dark(state["pref"]))
+        th["p"] = p
+        ui_apply(root, p)
+        ui_refresh_scale(root, p)
 
-    # ============ 色块区域（顶部，大色块 + 编号） ============
-    color_label = ttk.Label(root, text="智能匹配下方颜色", foreground="#888")
-    color_label.pack(pady=(2, 0))
+        if holder["win"] is not None:
+            holder["win"].destroy()
+        win = tk.Frame(root, bg=p["bg"])
+        win.pack(fill=tk.BOTH, expand=True)
+        holder["win"] = win
 
-    color_frame = ttk.LabelFrame(root, text="预设耗材（左键调色，右键启禁用）", padding=8)
-    color_frame.pack(fill=tk.X, padx=10, pady=4)
+        first_var = tk.BooleanVar(value=bool(state["data"].get("first_filament", True)))
 
-    color_canvas = tk.Canvas(color_frame, bg="#F0F0F0", height=60)
-    color_canvas.pack(fill=tk.X)
-    color_items: List[dict] = []
+        # ---------- 品牌栏 ----------
+        brand = tk.Frame(win, bg=p["brand_bg"])
+        brand.pack(fill=tk.X, side=tk.TOP)
+        bi = tk.Frame(brand, bg=p["brand_bg"])
+        bi.pack(fill=tk.X, padx=ui_px(p, 16), pady=ui_px(p, 13))
 
-    def _draw_colors():
-        color_canvas.delete("all")
-        color_items.clear()
-        n = state["ch_count"]
-        cols = min(n, 8)
-        rows = (n + cols - 1) // cols
-        cell_w, cell_h = 52, 44
+        lw, lh = ui_px(p, 36), ui_px(p, 32)
+        logo = tk.Canvas(bi, width=lw, height=lh, bg=p["brand_bg"],
+                         highlightthickness=0, bd=0)
+        logo.pack(side=tk.LEFT)
+        ui_round_rect(logo, 0, 0, lw, lh, ui_px(p, 10),
+                      fill=p["accent"], outline="")
+        logo.create_text(lw / 2, lh / 2, text="AMS", fill=p["accent_fg"],
+                         font=ui_font(p, 8, True))
 
-        materials = state["data"]["materials"]
-        while len(materials) < n:
-            materials.append({"channel": len(materials) + 1,
-                              "color": [128, 128, 128], "enabled": True})
+        tb = tk.Frame(bi, bg=p["brand_bg"])
+        tb.pack(side=tk.LEFT, padx=(11, 0))
+        tk.Label(tb, text="ESP-AMS 换色配置", bg=p["brand_bg"],
+                 fg=p["brand_fg"], font=ui_font(p, 14, True)).pack(anchor="w")
+        tk.Label(tb, text="切片里颜色随便设 · 自动匹配到正确料盘通道",
+                 bg=p["brand_bg"], fg=p["brand_sub"],
+                 font=ui_font(p, 9)).pack(anchor="w", pady=(2, 0))
 
-        for i in range(n):
-            m = materials[i]
-            ch = m.get("channel", i + 1)
-            c = tuple(m.get("color", [128, 128, 128]))
-            enabled = m.get("enabled", True)
-            row, col = divmod(i, cols)
-            x = col * (cell_w + 8) + 4
-            y = row * (cell_h + 8) + 4
+        seg_wrap = tk.Frame(bi, bg=p["brand_bg"])
+        seg_wrap.pack(side=tk.RIGHT)
+        pb = dict(p)
+        pb.update({"panel": p["brand_bg"],
+                   "panel_alt": "#1B222B" if p["dark"] else "#242C36",
+                   "border": "#39424E", "muted": p["brand_sub"]})
+        cv_th, _set_th_seg = ui_segment(
+            seg_wrap, pb,
+            [("跟随系统", UI_PREF_AUTO), ("浅色", UI_PREF_LIGHT),
+             ("深色", UI_PREF_DARK)],
+            state["pref"], _set_theme, item_w=64, height=28)
+        cv_th.pack()
 
-            hex_c = rgb_to_hex(*c) if enabled else "#CCCCCC"
-            outline = "#333333" if enabled else "#999999"
-            text_fill = "white" if (enabled and _is_dark(c)) else (
-                "#666666" if not enabled else "black")
+        # ---------- 状态栏（先 pack，占住最底） ----------
+        sbar = tk.Frame(win, bg=p["panel_alt"])
+        sbar.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Frame(win, bg=p["border"], height=1).pack(fill=tk.X, side=tk.BOTTOM)
 
-            rect = color_canvas.create_rectangle(
-                x, y, x + cell_w, y + cell_h,
-                fill=hex_c, outline=outline, width=2,
-            )
-            text = color_canvas.create_text(
-                x + cell_w // 2, y + cell_h // 2,
-                text=str(ch), font=("Arial", 12, "bold"),
-                fill=text_fill,
-            )
-            item = {"ch": ch, "color": list(c), "enabled": enabled,
-                    "rect_id": rect, "text_id": text}
-            color_items.append(item)
-            color_canvas.tag_bind(rect, "<Button-1>",
-                                  lambda e, it=item: _on_color_click(e, it))
-            color_canvas.tag_bind(text, "<Button-1>",
-                                  lambda e, it=item: _on_color_click(e, it))
-            color_canvas.tag_bind(rect, "<Button-3>",
-                                  lambda e, it=item: _on_color_right_click(e, it))
+        st_var = tk.StringVar(value="就绪")
+        dir_var = tk.StringVar()
+        path_var = tk.StringVar()
 
-        total_w = cols * (cell_w + 8) + 8
-        total_h = rows * (cell_h + 8) + 8
-        color_canvas.config(width=total_w, height=max(total_h, 60))
+        def _full_path():
+            return os.path.join(state["dir"], state["config_name"])
 
-    def _on_color_click(event, item):
-        ch = item["ch"]
-        cur_hex = rgb_to_hex(*item["color"])
-        result = colorchooser.askcolor(
-            initialcolor=cur_hex,
-            parent=root,
-            title=f"选择通道 {ch} 颜色",
-        )
-        if result[1]:
-            rgb = hex_to_rgb(result[1])
-            if rgb:
-                for m in state["data"]["materials"]:
-                    if m["channel"] == ch:
-                        m["color"] = list(rgb)
-                        break
-                _draw_colors()
-
-    def _on_color_right_click(event, item):
-        """右键：切换通道启用/禁用"""
-        ch = item["ch"]
-        for m in state["data"]["materials"]:
-            if m["channel"] == ch:
-                m["enabled"] = not m.get("enabled", True)
-                break
-        _draw_colors()
-
-    # ============ 配置文件管理 ============
-    config_frame = ttk.LabelFrame(root, text="配置文件管理", padding=8)
-    config_frame.pack(fill=tk.X, padx=10, pady=4)
-
-    # 第一行：下拉框 + 新建 + 打开目录
-    row1 = ttk.Frame(config_frame)
-    row1.pack(fill=tk.X)
-
-    config_names: List[str] = []
-
-    def _refresh_config_names(combo=None):
-        """刷新配置文件列表，combo 为 None 时只更新 config_names"""
-        nonlocal config_names
-        config_names = []
-        try:
-            for f in os.listdir(state["dir"]):
-                if f.endswith(".json"):
-                    config_names.append(f)
-        except OSError:
-            pass
-        if not config_names:
-            config_names = [SETTINGS_FILENAME]
-        if combo is not None:
-            combo['values'] = config_names
-            combo.set(config_names[0])
-
-    config_var = tk.StringVar(value=SETTINGS_FILENAME)
-    config_combo = ttk.Combobox(row1, textvariable=config_var,
-                                 values=[SETTINGS_FILENAME], width=20, state="readonly")
-    config_combo.pack(side=tk.LEFT, padx=4)
-
-    # 初始化时填充
-    _refresh_config_names(config_combo)
-
-    def _new_config():
-        name = f"default_{state['ch_count']}ch.json"
-        state["data"] = default_settings(state["ch_count"])
-        path = os.path.join(state["dir"], name)
-        save_settings(state["data"], path)
-        config_var.set(name)
-        _draw_colors()
-
-    def _open_config():
-        path = filedialog.askopenfilename(
-            parent=root, title="打开配置文件",
-            filetypes=[("JSON", "*.json")],
-        )
-        if path:
-            data = load_settings(path)
-            if data:
-                state["data"] = data
-                state["ch_count"] = data.get("channel_count", 8)
-                ch_var.set(state["ch_count"])
-                state["dir"] = str(Path(path).parent)
-                config_var.set(os.path.basename(path))
-                _refresh_config_names(config_combo)
-                _draw_colors()
+        def _sync_status():
+            if state["msg"]:
+                st_var.set(ui_shorten(state["msg"], 62))
+            elif state["dirty"]:
+                st_var.set("● 有未保存的改动 —— 点右下角「保存配置」")
             else:
-                messagebox.showerror("无法打开", "文件不是有效的 AMS 配置文件")
+                st_var.set("就绪")
+            # ★ 一律截断：Label 的宽度是由内容决定的，把完整长路径贴上去
+            #   会把整个窗口顶宽（实测 573 → 760），而且随目录变浅变深。
+            dir_var.set(ui_shorten(state["dir"], 44))
+            path_var.set("存放位置（点一下复制完整路径）：%s"
+                         % ui_shorten(_full_path(), 58))
 
-    def _open_dir():
-        d = filedialog.askdirectory(parent=root, title="选择配置目录")
-        if d:
+        holder["status"] = _sync_status
+
+        tk.Label(sbar, textvariable=st_var, bg=p["panel_alt"], fg=p["muted"],
+                 font=ui_font(p, 9)).pack(side=tk.LEFT, padx=ui_px(p, 16),
+                                         pady=ui_px(p, 7))
+        tk.Label(sbar, textvariable=dir_var, bg=p["panel_alt"], fg=p["faint"],
+                 font=ui_font(p, 9)).pack(side=tk.RIGHT, padx=ui_px(p, 16))
+
+        # ---------- 底部操作条（BOTTOM，落在状态栏上面） ----------
+        foot = tk.Frame(win, bg=p["bg"])
+        foot.pack(fill=tk.X, side=tk.BOTTOM, padx=ui_px(p, 16),
+                  pady=(ui_px(p, 10), ui_px(p, 12)))
+
+        # ---------- 主体 ----------
+        body = tk.Frame(win, bg=p["bg"])
+        body.pack(fill=tk.BOTH, expand=True, side=tk.TOP, padx=ui_px(p, 16),
+                  pady=(ui_px(p, 12), 0))
+
+        # ===== 卡片 1：料盘颜色 =====
+        c1, box1 = ui_card(body, p, title="料盘颜色",
+                           subtitle="左键改色 · 右键启用/禁用")
+        c1.pack(fill=tk.X)
+
+        def _apply_channel_count(n):
+            old = state["data"]
+            nd = default_settings(n)
+            # ★ 保留与通道数无关的键（first_filament / popup / …）——
+            #   否则切一下通道数就把「每次切片弹窗」这类偏好悄悄抹掉了
+            for k, v in old.items():
+                if k not in ("channel_count", "materials"):
+                    nd[k] = v
+            old_mats = old.get("materials", [])
+            for i in range(min(n, len(old_mats))):
+                nd["materials"][i]["color"] = old_mats[i].get(
+                    "color", nd["materials"][i]["color"])
+                nd["materials"][i]["enabled"] = bool(
+                    old_mats[i].get("enabled", True))
+            state["data"] = nd
+            state["ch_count"] = n
+            _draw_colors()
+            _mark_dirty(msg="已切到 %d 通道（还没保存）" % n)
+
+        row = tk.Frame(box1, bg=p["panel"])
+        row.pack(fill=tk.X, pady=(0, 11))
+        cv_ch, set_ch = ui_segment(
+            row, p, [("4 通道", 4), ("8 通道", 8), ("16 通道", 16)],
+            state["ch_count"], _apply_channel_count)
+        cv_ch.pack(side=tk.LEFT)
+        badge, set_badge = ui_badge(row, p, "", "info")
+        badge.pack(side=tk.RIGHT, pady=ui_px(p, 3))
+
+        # ★ 像素尺寸一律过 ui_px：Tk 的**字体**按 point 走、会自己跟着屏幕
+        #   DPI 放大，**像素**尺寸不会。不补这一课，高 DPI 屏上就是
+        #   "字大格子小"，色块里的通道号和 hex 会挤成一团。
+        GAP = ui_px(p, 7)
+        CELL_W = ui_px(p, 58)
+        CELL_H = ui_px(p, 54)
+        CELL_R = ui_px(p, 11)
+        COLS = 8
+        CANVAS_W = COLS * (CELL_W + GAP) - GAP
+        cv = tk.Canvas(box1, width=CANVAS_W, height=CELL_H, bg=p["panel"],
+                       highlightthickness=0, bd=0)
+        cv.pack(anchor="w")
+
+        tk.Label(box1, text="块上的数字 = 料盘位（通道号），下面一行是它当前的颜色值",
+                 bg=p["panel"], fg=p["faint"],
+                 font=ui_font(p, 9)).pack(anchor="w", pady=(ui_px(p, 9), 0))
+
+        def _hover(rec, on):
+            cv.itemconfig(rec["poly"],
+                          outline=(p["accent"] if on else rec["edge"]),
+                          width=(2 if on else 1))
+            cv.configure(cursor="hand2" if on else "arrow")
+
+        def _pick_color(rec):
+            res = colorchooser.askcolor(initialcolor=rgb_to_hex(*rec["color"]),
+                                        parent=root,
+                                        title="通道 %d 的颜色" % rec["ch"])
+            if res and res[1]:
+                rgb = hex_to_rgb(res[1])
+                if rgb:
+                    for m in state["data"]["materials"]:
+                        if int(m.get("channel", -1)) == rec["ch"]:
+                            m["color"] = list(rgb)
+                            break
+                    _draw_colors()
+                    _mark_dirty(msg="已改通道 %d 的颜色（还没保存）" % rec["ch"])
+
+        def _toggle_enabled(rec):
+            for m in state["data"]["materials"]:
+                if int(m.get("channel", -1)) == rec["ch"]:
+                    m["enabled"] = not bool(m.get("enabled", True))
+                    break
+            _draw_colors()
+            _mark_dirty(msg="通道 %d 已%s（还没保存）"
+                            % (rec["ch"], "禁用" if rec["enabled"] else "启用"))
+
+        def _draw_colors():
+            cv.delete("all")
+            n = state["ch_count"]
+            mats = state["data"].setdefault("materials", [])
+            while len(mats) < n:
+                mats.append({"channel": len(mats) + 1,
+                             "color": [128, 128, 128], "enabled": True})
+            rows = (n + COLS - 1) // COLS
+            cv.config(height=rows * (CELL_H + GAP) - GAP)
+            n_en = 0
+
+            for i in range(n):
+                m = mats[i]
+                ch = int(m.get("channel", i + 1))
+                col = tuple(m.get("color", [128, 128, 128]))
+                en = bool(m.get("enabled", True))
+                n_en += 1 if en else 0
+                rr, cc = divmod(i, COLS)
+                x, y = cc * (CELL_W + GAP), rr * (CELL_H + GAP)
+                hexs = rgb_to_hex(*col)
+
+                if en:
+                    fill = hexs
+                    fg_main = ui_contrast_fg(col)
+                    fg_sub = ui_mix(hexs, fg_main, 0.45)
+                    edge = ui_shade(hexs, 34 if p["dark"] else -34)
+                else:
+                    fill = ui_mix(hexs, p["panel"], 0.80)
+                    fg_main = fg_sub = p["disabled_fg"]
+                    edge = p["border"]
+
+                poly = ui_round_rect(cv, x, y, x + CELL_W, y + CELL_H, CELL_R,
+                                     fill=fill, outline=edge, width=1)
+                t1 = cv.create_text(x + CELL_W / 2,
+                                    y + CELL_H / 2 - ui_px(p, 7),
+                                    text=str(ch), fill=fg_main,
+                                    font=ui_font(p, 15, True))
+                t2 = cv.create_text(x + CELL_W / 2,
+                                    y + CELL_H - ui_px(p, 12),
+                                    text=(hexs if en else "已禁用"),
+                                    fill=fg_sub, font=ui_font(p, 7))
+                if not en:
+                    pad = ui_px(p, 11)
+                    # 斜线只走色块**上半部**：压到下面那行"已禁用"就成了乱码
+                    cv.create_line(x + pad, y + CELL_H * 0.56,
+                                   x + CELL_W - pad, y + pad,
+                                   fill=ui_mix(fill, p["text"], 0.46),
+                                   width=ui_px(p, 2), capstyle="round")
+
+                rec = {"poly": poly, "edge": edge, "ch": ch,
+                       "color": col, "enabled": en}
+                for item in (poly, t1, t2):
+                    cv.tag_bind(item, "<Button-1>",
+                                lambda e, r=rec: _pick_color(r))
+                    cv.tag_bind(item, "<Button-3>",
+                                lambda e, r=rec: _toggle_enabled(r))
+                for item in (poly, t1):
+                    cv.tag_bind(item, "<Enter>",
+                                lambda e, r=rec: _hover(r, True))
+                    cv.tag_bind(item, "<Leave>",
+                                lambda e, r=rec: _hover(r, False))
+
+            set_badge("%d / %d 启用" % (n_en, n),
+                      "ok" if n_en == n else "warn")
+            _sync_status()
+
+        # ===== 卡片 2：配置文件 =====
+        c2, box2 = ui_card(body, p, title="配置文件",
+                           subtitle="后处理脚本按名字读它")
+        c2.pack(fill=tk.X, pady=(ui_px(p, 12), 0))
+
+        r2 = tk.Frame(box2, bg=p["panel"])
+        r2.pack(fill=tk.X)
+
+        cfg_var = tk.StringVar(value=state["config_name"])
+        combo = ttk.Combobox(r2, textvariable=cfg_var, width=23,
+                             state="readonly", font=ui_font(p, 10),
+                             values=[SETTINGS_FILENAME])
+        combo.pack(side=tk.LEFT)
+        combo.bind("<<ComboboxSelected>>", lambda e: _load_config(cfg_var.get()))
+
+        def _refresh_config_names():
+            names = []
+            try:
+                names = sorted(f for f in os.listdir(state["dir"])
+                               if f.lower().endswith(".json"))
+            except OSError:
+                pass
+            if not names:
+                names = [SETTINGS_FILENAME]
+            combo["values"] = names
+            if state["config_name"] not in names:
+                state["config_name"] = names[0]
+            cfg_var.set(state["config_name"])
+
+        def _load_config(name):
+            if not name:
+                return
+            data = load_settings(os.path.join(state["dir"], name))
+            if not data:
+                messagebox.showerror("无法打开",
+                                     "文件不是有效的 AMS 配置文件", parent=root)
+                return
+            state["data"] = data
+            state["ch_count"] = int(data.get("channel_count", 8))
+            state["config_name"] = name
+            set_ch(state["ch_count"])
+            first_var.set(bool(data.get("first_filament", True)))
+            _sync_first()
+            _draw_colors()
+            _mark_dirty(False, msg="已载入 %s" % name)
+
+        def _new_config():
+            name = "default_%dch.json" % state["ch_count"]
+            state["data"] = default_settings(state["ch_count"])
+            state["config_name"] = name
+            _refresh_config_names()
+            _draw_colors()
+            _mark_dirty(True, msg="已新建 %s（点「保存配置」写盘）" % name)
+
+        def _open_config():
+            path = filedialog.askopenfilename(
+                parent=root, title="打开配置文件",
+                filetypes=[("JSON", "*.json"), ("所有文件", "*.*")])
+            if not path:
+                return
+            state["dir"] = str(Path(path).parent)
+            state["config_name"] = os.path.basename(path)
+            _refresh_config_names()
+            _load_config(state["config_name"])
+
+        def _open_dir():
+            d = filedialog.askdirectory(parent=root, title="选择配置目录")
+            if not d:
+                return
             state["dir"] = d
-            _refresh_config_names(config_combo)
+            _refresh_config_names()
+            _draw_colors()
+            _sync_status()
 
-    ttk.Button(row1, text="新建", command=_new_config).pack(side=tk.LEFT, padx=4)
-    ttk.Button(row1, text="打开目录", command=_open_dir).pack(side=tk.LEFT, padx=4)
+        ui_button(r2, p, "打开…", _open_config).pack(side=tk.LEFT,
+                                                     padx=(ui_px(p, 8), 0))
+        ui_button(r2, p, "新建", _new_config).pack(side=tk.LEFT,
+                                                   padx=(ui_px(p, 6), 0))
+        ui_button(r2, p, "换目录", _open_dir).pack(side=tk.LEFT,
+                                                     padx=(ui_px(p, 6), 0))
 
-    # ============ 底部按钮区域 ============
-    btn_frame = ttk.Frame(root, padding=(10, 6, 10, 10))
-    btn_frame.pack(fill=tk.X)
+        path_lbl = tk.Label(box2, textvariable=path_var, bg=p["panel"],
+                            fg=p["faint"], font=ui_font(p, 9), cursor="hand2")
+        path_lbl.pack(anchor="w", pady=(ui_px(p, 9), 0))
 
-    # 首次换料开关
-    first_var = tk.BooleanVar(value=True)
+        def _copy_path(_e=None):
+            try:
+                root.clipboard_clear()
+                root.clipboard_append(_full_path())
+                _mark_dirty(state["dirty"],
+                            msg="已复制完整路径：%s" % _full_path())
+            except Exception:
+                pass
 
-    def _on_first_toggle():
-        state["data"]["first_filament"] = first_var.get()
-        first_btn.config(
-            text=f"首次换料：{'开' if first_var.get() else '关'}",
-            background="#4CAF50" if first_var.get() else "#999999",
-        )
+        path_lbl.bind("<Button-1>", _copy_path)
+        path_lbl.bind("<Enter>", lambda e: path_lbl.config(fg=p["muted"]))
+        path_lbl.bind("<Leave>", lambda e: path_lbl.config(fg=p["faint"]))
 
-    first_btn = ttk.Button(btn_frame, text="首次换料：开", command=_on_first_toggle)
-    first_btn.pack(side=tk.LEFT, padx=8)
-    first_btn.configure(style="Green.TButton")
+        # ===== 对话框 =====
+        def _show_export_dialog(path):
+            p2 = th["p"]
+            dlg = tk.Toplevel(root)
+            dlg.title("配置已保存")
+            dlg.configure(bg=p2["bg"])
+            dlg.resizable(False, False)
+            dlg.transient(root)
 
-    # 自定义绿色按钮样式
-    style = ttk.Style()
-    style.configure("Green.TButton", font=("Arial", 10, "bold"))
+            wrap = tk.Frame(dlg, bg=p2["bg"])
+            wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
 
-    # 确定按钮
-    def _do_confirm():
-        state["data"]["channel_count"] = state["ch_count"]
-        state["data"]["first_filament"] = first_var.get()
-        name = config_var.get()
-        export_path = os.path.join(state["dir"], name)
-        if save_settings(state["data"], export_path):
-            _show_export_dialog(export_path)
-        else:
-            messagebox.showerror("保存失败", f"无法写入：{export_path}")
+            top = tk.Frame(wrap, bg=p2["bg"])
+            top.pack(fill=tk.X)
+            tick = tk.Canvas(top, width=36, height=36, bg=p2["bg"],
+                             highlightthickness=0, bd=0)
+            tick.pack(side=tk.LEFT)
+            tick.create_oval(1, 1, 35, 35, fill=p2["accent_soft"], outline="")
+            tick.create_text(18, 18, text="✓", fill=p2["accent"],
+                             font=ui_font(p2, 15, True))
+            tt = tk.Frame(top, bg=p2["bg"])
+            tt.pack(side=tk.LEFT, padx=(10, 0))
+            tk.Label(tt, text="配置已保存", bg=p2["bg"], fg=p2["text"],
+                     font=ui_font(p2, 12, True)).pack(anchor="w")
+            tk.Label(tt, text=Path(path).name, bg=p2["bg"], fg=p2["faint"],
+                     font=ui_font(p2, 9)).pack(anchor="w")
 
-    confirm_btn = ttk.Button(btn_frame, text="确定", command=_do_confirm)
-    confirm_btn.pack(side=tk.LEFT, padx=8)
+            ams = get_ams_colors(state["data"])
+            en_map = {int(m.get("channel", -1)): bool(m.get("enabled", True))
+                      for m in state["data"].get("materials", [])}
+            keys = sorted(ams.keys())
+            if keys:
+                c3, box3 = ui_card(wrap, p2, title="已写入的通道颜色")
+                c3.pack(fill=tk.X, pady=(ui_px(p2, 14), 0))
+                SW, SG = ui_px(p2, 40), ui_px(p2, 6)
+                cvv = tk.Canvas(box3, width=len(keys) * (SW + SG) - SG,
+                                height=SW, bg=p2["panel"],
+                                highlightthickness=0, bd=0)
+                cvv.pack(anchor="w")
+                for i, ch in enumerate(keys):
+                    col = ams[ch]
+                    en = en_map.get(ch, True)
+                    x = i * (SW + SG)
+                    hexs = rgb_to_hex(*col)
+                    fill = hexs if en else ui_mix(hexs, p2["panel"], 0.80)
+                    ui_round_rect(cvv, x, 0, x + SW, SW, ui_px(p2, 9), fill=fill,
+                                  outline=(ui_shade(fill, 34 if p2["dark"] else -34)
+                                           if en else p2["border"]), width=1)
+                    cvv.create_text(x + SW / 2, SW / 2, text=str(ch),
+                                    fill=(ui_contrast_fg(col) if en
+                                          else p2["disabled_fg"]),
+                                    font=ui_font(p2, 11, True))
+                    if not en:
+                        p2s = ui_px(p2, 7)
+                        cvv.create_line(x + p2s, SW - p2s, x + SW - p2s, p2s,
+                                        fill=ui_mix(fill, p2["text"], 0.46),
+                                        width=ui_px(p2, 2), capstyle="round")
+                n_en = sum(1 for k in keys if en_map.get(k, True))
+                tk.Label(box3,
+                         text="共 %d 个通道，%d 个启用（禁用的不会被自动匹配选中）"
+                              % (len(keys), n_en),
+                         bg=p2["panel"], fg=p2["muted"],
+                         font=ui_font(p2, 9)).pack(anchor="w", pady=(9, 0))
 
-    # G-code 匹配预览
-    def _do_match_preview():
-        gcode_path = filedialog.askopenfilename(
-            parent=root, title="选择 G-code 文件",
-            filetypes=[
-                ("G-code", "*.gcode"),
-                ("TXT", "*.txt"),
-                ("所有文件", "*.*"),
-            ],
-        )
-        if not gcode_path:
-            return
-        ams_colors = get_ams_colors(state["data"])
-        first_fil = state["data"].get("first_filament", True)
-        try:
-            with open(gcode_path, 'r', encoding='utf-8', errors='replace') as f:
-                gcode_content = f.read()
-        except OSError as e:
-            messagebox.showerror("读取失败", f"无法读取：{e}")
-            return
-        slice_colors = parse_slice_colors(gcode_content)
-        _, log_lines, _s, _d = rewrite_gcode(gcode_content, ams_colors,
-                                             slice_colors, first_fil)
-        _show_match_result_dialog(log_lines, gcode_path)
+            tk.Label(wrap, text="把这个文件和切片 G-code 放在同一目录，"
+                                "后处理脚本会自动读它。",
+                     bg=p2["bg"], fg=p2["muted"], font=ui_font(p2, 9),
+                     wraplength=CANVAS_W, justify="left").pack(
+                         anchor="w", pady=(ui_px(p2, 12), 0))
 
-    ttk.Button(btn_frame, text="G-code 匹配预览", command=_do_match_preview).pack(side=tk.LEFT, padx=8)
+            bar = tk.Frame(wrap, bg=p2["bg"])
+            bar.pack(fill=tk.X, pady=(ui_px(p2, 14), 0))
+            ui_button(bar, p2, "知道了", dlg.destroy, kind="accent",
+                      bold=True, pad=(20, 7)).pack(side=tk.RIGHT)
 
-    def _do_setup_help():
-        """把「切片器里该填哪一行」原样展示出来 —— 现场就是在这里填错的。"""
-        text, _entry = _setup_text()
-        out = None
-        try:
-            out = _setup_file_path()
-            out.write_text(text + "\n", encoding="utf-8")
-        except OSError:
+            dlg.update_idletasks()
+            ui_center(dlg)
+            try:
+                dlg.attributes("-topmost", True)
+            except Exception:
+                pass
+            dlg.grab_set()
+
+        def _show_match_result(gcode_path):
+            p2 = th["p"]
+            ams_colors = get_ams_colors(state["data"])
+            first_fil = bool(state["data"].get("first_filament", True))
+            try:
+                with open(gcode_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError as e:
+                messagebox.showerror("读取失败", "无法读取：%s" % e, parent=root)
+                return
+            slice_colors = parse_slice_colors(content)
+            _, log_lines, _s, detail = rewrite_gcode(
+                content, ams_colors, slice_colors, first_fil)
+
+            dlg = tk.Toplevel(root)
+            dlg.title("匹配预览 - %s" % Path(gcode_path).name)
+            dlg.configure(bg=p2["bg"])
+            dlg.transient(root)
+            wrap = tk.Frame(dlg, bg=p2["bg"])
+            wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+            tk.Label(wrap, text="切片槽 → 物理通道", bg=p2["bg"], fg=p2["text"],
+                     font=ui_font(p2, 12, True)).pack(anchor="w")
+            tk.Label(wrap, text="以下结果不会写进文件，只是预览",
+                     bg=p2["bg"], fg=p2["faint"],
+                     font=ui_font(p2, 9)).pack(anchor="w", pady=(2, 10))
+
+            if detail:
+                SW, SG = ui_px(p2, 46), ui_px(p2, 8)
+                cols = min(len(detail), 8)
+                rows = (len(detail) + cols - 1) // cols
+                cvv = tk.Canvas(wrap, width=cols * (SW + SG) - SG,
+                                height=rows * (SW + ui_px(p2, 20) + SG) - SG,
+                                bg=p2["bg"], highlightthickness=0, bd=0)
+                cvv.pack(anchor="w")
+                st_col = {"ok": p2["accent"], "far": p2["danger"],
+                          "none": p2["danger"], "no_slice": p2["muted"],
+                          "no_cfg": p2["danger"]}
+                for i, d in enumerate(detail):
+                    rr, cc = divmod(i, cols)
+                    x = rr * 0 + cc * (SW + SG)
+                    y = rr * (SW + ui_px(p2, 20) + SG)
+                    col = d["color"] or (128, 128, 128)
+                    hexs = rgb_to_hex(*col)
+                    ui_round_rect(cvv, x, y, x + SW, y + SW, ui_px(p2, 10), fill=hexs,
+                                  outline=ui_shade(hexs, 34 if p2["dark"] else -34),
+                                  width=1)
+                    cvv.create_text(x + SW / 2, y + SW / 2,
+                                    text=str(d["idx"] + 1),
+                                    fill=ui_contrast_fg(col),
+                                    font=ui_font(p2, 12, True))
+                    cvv.create_text(x + SW / 2, y + SW + ui_px(p2, 9),
+                                    text=("→ %d" % d["ch"]) if d["status"] == "ok"
+                                         else "—",
+                                    fill=st_col.get(d["status"], p2["muted"]),
+                                    font=ui_font(p2, 9, True))
+
+            scroll, txt = ui_scroll_text(wrap, p2, height=14)
+            scroll.pack(fill=tk.BOTH, expand=True, pady=(ui_px(p2, 12), 0))
+            txt.insert("1.0", "\n".join(log_lines))
+            txt.config(state=tk.DISABLED)
+            dlg.geometry("640x540")
+            ui_center(dlg)
+            dlg.grab_set()
+
+        def _do_match_preview():
+            path = filedialog.askopenfilename(
+                parent=root, title="选择 G-code 文件",
+                filetypes=[("G-code", "*.gcode"), ("TXT", "*.txt"),
+                           ("所有文件", "*.*")])
+            if path:
+                _show_match_result(path)
+
+        def _do_setup_help():
+            text, _entry = _setup_text()
             out = None
-        if out:
-            text = text + "\n\n（同样内容已存成文件：%s）" % out
-        _show_text_window("ESP-AMS：后处理脚本该填什么", text, parent=root)
+            try:
+                out = _setup_file_path()
+                out.write_text(text + "\n", encoding="utf-8")
+            except OSError:
+                out = None
+            if out:
+                text += "\n\n（同样内容已存成文件：%s）" % out
+            _show_text_window("ESP-AMS：后处理脚本该填什么", text, parent=root)
 
-    ttk.Button(btn_frame, text="后处理脚本该填什么",
-               command=_do_setup_help).pack(side=tk.LEFT, padx=8)
+        def _do_confirm():
+            state["data"]["channel_count"] = state["ch_count"]
+            state["data"]["first_filament"] = bool(first_var.get())
+            path = os.path.join(state["dir"], state["config_name"])
+            if save_settings(state["data"], path):
+                _mark_dirty(False, msg="已保存 %s" % state["config_name"])
+                _show_export_dialog(path)
+            else:
+                messagebox.showerror("保存失败", "无法写入：%s" % path, parent=root)
 
-    def _show_export_dialog(export_path):
-        """导出后弹窗确认，显示通道颜色配置（第二个截图的效果）"""
-        ams_colors = get_ams_colors(state["data"])
-        enabled_map = {m.get("channel"): m.get("enabled", True)
-                       for m in state["data"]["materials"]}
+        # ===== 底部操作条内容 =====
+        first_btn = ui_button(foot, p, "", lambda: _toggle_first())
 
-        info_lines = [
-            f"通道数：{state['ch_count']}",
-            f"首次换料：{'开' if state['data'].get('first_filament') else '关'}",
-            f"配置路径：{export_path}",
-            "",
-            "已配置颜色：",
-        ]
-        for ch, c in sorted(ams_colors.items()):
-            mark = "✓ 启用" if enabled_map.get(ch, True) else "✗ 禁用"
-            info_lines.append(f"  通道 {ch}: {rgb_to_hex(*c)}  {mark}")
-        info_lines.append("")
-        info_lines.append("请将配置文件与切片 G-code 放在同一目录")
-        info_lines.append("Bambu Studio 后处理脚本会自动加载并匹配换色指令")
-        info_lines.append(f"匹配日志写入：{Path(export_path).parent / 'xxx.ams.log'}")
+        def _sync_first():
+            on = bool(first_var.get())
+            if on:
+                bg, fg = p["accent"], p["accent_fg"]
+                hov, fgh = p["accent_hov"], p["accent_fg"]
+            else:
+                bg, fg = p["chip"], p["muted"]
+                hov, fgh = p["chip_hov"], p["text"]
+            first_btn.config(text="首次换料：开" if on else "首次换料：关",
+                             bg=bg, fg=fg, activebackground=hov,
+                             activeforeground=fgh)
+            first_btn.bind("<Enter>", lambda e: first_btn.config(bg=hov, fg=fgh))
+            first_btn.bind("<Leave>", lambda e: first_btn.config(bg=bg, fg=fg))
 
-        messagebox.showinfo("导出成功", "\n".join(info_lines))
+        def _toggle_first():
+            first_var.set(not first_var.get())
+            state["data"]["first_filament"] = bool(first_var.get())
+            _sync_first()
+            _mark_dirty(msg="首次换料已%s（还没保存）"
+                            % ("开" if first_var.get() else "关"))
 
-    def _show_match_result_dialog(log_lines, gcode_path):
-        """显示 G-code 匹配结果弹窗（第二个截图的效果）"""
-        win = tk.Toplevel(root)
-        win.title(f"匹配结果 - {Path(gcode_path).name}")
-        win.geometry("560x400")
-        win.transient(root)
-        win.grab_set()
+        first_btn.pack(side=tk.LEFT)
+        _sync_first()
 
-        ttk.Label(win, text="G-code 匹配预览", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 0))
-        text = "\n".join(log_lines)
-        txt = tk.Text(win, wrap=tk.WORD, font=("Consolas", 9), bg="#FAFAFA")
-        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        txt.insert("1.0", text)
-        txt.config(state=tk.DISABLED)
+        ui_button(foot, p, "匹配预览", _do_match_preview,
+                  kind="ghost").pack(side=tk.LEFT, padx=(ui_px(p, 9), 0))
+        ui_button(foot, p, "切片器该填什么", _do_setup_help,
+                  kind="ghost").pack(side=tk.LEFT, padx=(ui_px(p, 4), 0))
+        ui_button(foot, p, "保存配置", _do_confirm, kind="accent",
+                  bold=True, pad=(22, 7)).pack(side=tk.RIGHT)
 
-        ttk.Button(win, text="关闭", command=win.destroy).pack(anchor=tk.E, padx=8, pady=8)
+        # ===== 首次绘制 =====
+        _refresh_config_names()
+        _draw_colors()
 
-    # 提示文字
-    ttk.Label(root, text="右键点击上方耗材色块可切换边框禁用通道",
-              font=("Arial", 8), foreground="#888").pack(pady=(0, 6))
-
-    # ============ 初始化 ============
-    _draw_colors()
-
-    # 尝试自动加载同目录已有的配置文件
-    script_dir = Path(__file__).parent
-    # EXE 编译后 __file__ 是临时目录，改用 sys.executable 所在目录
+    # ---------------- 启动时自动找一份已有配置 ----------------
     if getattr(sys, "frozen", False):
         base_dir = Path(sys.executable).parent
     else:
-        base_dir = script_dir
+        base_dir = Path(__file__).parent
 
-    # 优先加载当前脚本目录下的 filament_settings.json
-    auto_settings = base_dir / SETTINGS_FILENAME
-    if not auto_settings.is_file():
-        # 再尝试 state 目录
-        auto_settings = Path(state["dir"]) / SETTINGS_FILENAME
-    if auto_settings.is_file():
-        loaded = load_settings(str(auto_settings))
+    auto = None
+    for cand in (base_dir / SETTINGS_FILENAME,                    # EXE/脚本同目录
+                 base_dir / "ams_profiles" / SETTINGS_FILENAME,   # 本工具自己的配置目录
+                 Path(state["dir"]) / SETTINGS_FILENAME):         # ~/ESP_AMS
+        if cand.is_file():
+            auto = cand
+            break
+    if auto is None:
+        ext = find_settings_extended()                            # 系统 Bambu 配置目录
+        if ext:
+            auto = Path(ext)
+
+    if auto is not None:
+        loaded = load_settings(str(auto))
         if loaded:
             state["data"] = loaded
-            state["ch_count"] = loaded.get("channel_count", 8)
-            ch_var.set(state["ch_count"])
-            state["dir"] = str(auto_settings.parent)
-            config_var.set(auto_settings.name)
-            _refresh_config_names(config_combo)
-            first_var.set(state["data"].get("first_filament", True))
-            _draw_colors()
+            state["ch_count"] = int(loaded.get("channel_count", 8))
+            state["dir"] = str(auto.parent)
+            state["config_name"] = auto.name
 
+    build()
+
+    root.deiconify()
+    root.update_idletasks()
+    ui_center(root)
+    try:
+        root.attributes("-topmost", True)
+        root.after(260, lambda: root.attributes("-topmost", False))
+    except Exception:
+        pass
     root.mainloop()
 
 
@@ -1620,41 +2536,62 @@ def _show_text_window(title: str, text: str, parent=None) -> None:
     """
     try:
         import tkinter as tk
-        from tkinter import ttk
     except Exception:
         return
     try:
         win = tk.Toplevel(parent) if parent is not None else tk.Tk()
     except Exception:
         return
-    win.title(title)
-    ttk.Label(win, text="把「就填这一行」那一段整行复制到 "
-                        "Bambu Studio → 偏好设置 → 其他 → 后处理脚本",
-              padding=(12, 10, 12, 4)).pack(anchor="w")
-    frame = ttk.Frame(win, padding=(12, 0, 12, 6))
-    frame.pack(fill=tk.BOTH, expand=True)
-    sb = ttk.Scrollbar(frame, orient="vertical")
-    txt = tk.Text(frame, width=96, height=26, wrap="none",
-                  yscrollcommand=sb.set, font=("Consolas", 9))
-    sb.config(command=txt.yview)
-    sb.pack(side=tk.RIGHT, fill=tk.Y)
-    txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    txt.insert("1.0", text)
-    txt.config(state="disabled")
 
-    bar = ttk.Frame(win, padding=(12, 0, 12, 12))
-    bar.pack(fill=tk.X)
+    p = ui_build_theme(win, ui_resolve_dark(ui_load_pref()))
+    ui_apply(win, p)
+    win.title(title)
+    win.configure(bg=p["bg"])
+    win.resizable(False, False)
+
+    wrap = tk.Frame(win, bg=p["bg"])
+    wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+    tk.Label(wrap, text="把「就填这一行」那一段整行复制到："
+                        "Bambu Studio → 偏好设置 → 其他 → 后处理脚本",
+             bg=p["bg"], fg=p["text"], font=ui_font(p, 10, True),
+             justify="left").pack(anchor="w")
+    tk.Label(wrap, text="框里只能有这一行；不要带 <尖括号>、不要写 setup、不要粘说明文字。",
+             bg=p["bg"], fg=p["muted"], font=ui_font(p, 9),
+             justify="left").pack(anchor="w", pady=(4, 10))
+
+    scroll, txt = ui_scroll_text(wrap, p, height=20)
+    scroll.pack(fill=tk.BOTH, expand=True)
+    txt.insert("1.0", text)
+    txt.config(state=tk.DISABLED)
+
+    bar = tk.Frame(wrap, bg=p["bg"])
+    bar.pack(fill=tk.X, pady=(ui_px(p, 12), 0))
+    tip = tk.Label(bar, text="", bg=p["bg"], fg=p["accent"],
+                   font=ui_font(p, 9))
+    tip.pack(side=tk.LEFT)
 
     def _copy():
         try:
             win.clipboard_clear()
             win.clipboard_append(text)
-            ttk.Label(bar, text="已复制").pack(side=tk.LEFT, padx=6)
+            tip.config(text="已复制到剪贴板 ✓")
         except Exception:
-            pass
+            tip.config(text="复制失败，请手动选中复制", fg=p["danger"])
 
-    ttk.Button(bar, text="复制全部", command=_copy).pack(side=tk.LEFT)
-    ttk.Button(bar, text="关闭", command=win.destroy).pack(side=tk.LEFT, padx=6)
+    ui_button(bar, p, "复制全部", _copy, kind="accent", bold=True,
+              pad=(18, 7)).pack(side=tk.RIGHT)
+    ui_button(bar, p, "关闭", win.destroy,
+              kind="normal").pack(side=tk.RIGHT, padx=(0, 8))
+
+    win.update_idletasks()
+    ui_refresh_scale(win, p)
+    TW, TH = ui_px(p, 780), ui_px(p, 620)
+    win.minsize(TW, TH)          # 同 show_map_window：不钉住 min/max，
+    win.maxsize(TW, TH)          # 窗口宽度会被内容顶开
+    win.geometry("%dx%d" % (TW, TH))
+    win.update_idletasks()
+    ui_center(win, TW, TH)
     try:
         win.attributes("-topmost", True)
     except Exception:

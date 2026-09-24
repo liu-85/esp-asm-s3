@@ -27,3 +27,7 @@ tools/dist/
 tools/*.spec
 tools/esp_ams_tool.spec
 tools/后处理脚本该填什么.txt
+# 配置工具运行时生成的（主题偏好 / 界面里的「保存配置」）
+tools/ui_theme.txt
+tools/filament_settings.json
+tools/.esp_ams_last_dir
