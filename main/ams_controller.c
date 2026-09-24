@@ -1903,7 +1903,12 @@ static bool do_exchange(int printer_channel)
          *   通道号不能用 config_get_filament_current() —— 上一行
          *   config_set_filament_current() 刚把它改成新通道，那样会打印成
          *   "通道3→通道3"。源通道是 current。 */
-        char from_lbl[16];
+        /* ⚠️ 缓冲必须 ≥ 18 字节，别改小：GCC 算 `%d` 的最坏长度按
+         *   -2147483648 取 11 字符，加上字面量 "通道" 的 6 字节 = 17，
+         *   再留 NUL 就是 18。原来的 16 字节正好差一点，被
+         *   -Werror=format-truncation 判死（CI #60 就是挂在这行）。
+         *   实际通道号只有 1~4，但编译器不知道，所以这里按最坏情况给。 */
+        char from_lbl[24];
         if (current > 0) {
             snprintf(from_lbl, sizeof(from_lbl), "通道%d", current);
         } else {
